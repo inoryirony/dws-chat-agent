@@ -1,0 +1,50 @@
+prompts/front.md
+  879316cd6f7cb321 10-13,19
+  db71929d6ffa6e15 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "65073c4b4fe8cbd3e5c028bda4d094ab1887ae0f",
+  "prompts": {
+    "879316cd6f7cb321": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f84ff-09eb-7491-9703-0dfdb37e5221",
+        "model": "unknown"
+      },
+      "human_author": "Codex",
+      "messages": [],
+      "total_additions": 9,
+      "total_deletions": 0,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    },
+    "db71929d6ffa6e15": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f84ff-d5e9-7fb3-8128-03798397dd4c",
+        "model": "unknown"
+      },
+      "human_author": "Codex",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 0,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    },
+    "ded408e5b1d268b3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8511-45bc-7cb1-97ba-f075083e3804",
+        "model": "unknown"
+      },
+      "human_author": "Codex",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 0,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    }
+  }
+}
