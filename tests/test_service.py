@@ -972,6 +972,59 @@ class PlainAgentFlowTests(unittest.TestCase):
         self.assertIn("最终只输出", worker)
         self.assertNotIn("最终输出严格符合提供的 JSON Schema", worker)
 
+    def test_streaming_card_binds_when_dingtalk_rewrites_markdown(self) -> None:
+        """钉钉历史会把卡片里的 `x` 改成 **x**、吞掉列表项前的换行，
+        绑定只能靠处理编号，不能靠全文相等。"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = AuditStore(Path(directory) / "audit.sqlite3")
+            content = "代码在 `feature/x` 分支；\n- 第一条\n- 第二条"
+            rewritten = HistoryMessage(
+                "card-message",
+                "conversation-1",
+                "Operator",
+                "self-open-id",
+                "代码在 **feature/x** 分支；- 第一条- 第二条\n\n处理编号：cardtoke",
+                datetime.now(TZ),
+            )
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ,
+                self_open_id="self-open-id",
+            )
+            service.store = store
+            service.dws = SimpleNamespace(
+                send_card=AsyncMock(return_value=("card-biz", None, {})),
+                update_card=AsyncMock(),
+                history=AsyncMock(side_effect=[[], [rewritten]]),
+            )
+
+            with (
+                patch(
+                    "dws_dm_agent.service.asyncio.sleep", new_callable=AsyncMock
+                ),
+                patch(
+                    "dws_dm_agent.service.uuid.uuid4",
+                    return_value="cardtoken",
+                ),
+            ):
+                card_id = asyncio.run(
+                    service._start_streaming_card(
+                        CONTACT, "conversation-1", content, "reply-session"
+                    )
+                )
+
+            self.assertEqual(card_id, "card-biz")
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT message_id FROM outgoing WHERE send_uuid = 'cardtoken'"
+                ).fetchone()[0],
+                "card-message",
+            )
+            final_update = service.dws.update_card.await_args_list[-1]
+            self.assertEqual(final_update.args, ("card-biz", content, 2))
+            store.close()
+
     def test_streaming_card_content_is_recognized_during_progress_updates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = AuditStore(Path(directory) / "audit.sqlite3")
