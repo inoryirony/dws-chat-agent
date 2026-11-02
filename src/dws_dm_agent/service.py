@@ -1897,7 +1897,8 @@ class AgentService:
             return ""
         sent_at = datetime.now(self.settings.timezone)
         send_uuid = str(uuid.uuid4())
-        marked_content = f"{content}\n\n处理编号：{send_uuid[:8]}"
+        card_marker = f"处理编号：{send_uuid[:8]}"
+        marked_content = f"{content}\n\n{card_marker}"
         biz_id, message_id, _ = await self.dws.send_card(contact)
         self.store.record_outgoing(
             send_uuid,
@@ -1938,11 +1939,14 @@ class AgentService:
                         and message.sender_open_dingtalk_id
                         == self.settings.self_open_id
                     }
+                    # 只认处理编号，不比对全文：钉钉历史里卡片正文会被改写
+                    # （行内代码 `x` 变成 **x**、列表项前的换行被吞掉），全文
+                    # 相等在带 Markdown 的回复上几乎必失败，卡片随即被标成
+                    # "卡片识别失败"并退回纯文本。
                     marked_candidates = [
                         message
                         for message in new_messages.values()
-                        if canonical_message_text(message.content)
-                        == canonical_message_text(marked_content)
+                        if card_marker in message.content
                     ]
                     if (
                         len(marked_candidates) == 1
