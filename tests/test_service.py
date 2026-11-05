@@ -969,8 +969,13 @@ class PlainAgentFlowTests(unittest.TestCase):
 
         self.assertIn("零参数工具 `escalate()`", front)
         self.assertIn("`escalate()` 没有参数", front)
-        self.assertIn("最终只输出", worker)
+        # 终段输出契约移入 shared.md，worker 靠组装前置获得；两份模板
+        # 都不再含 JSON Schema 时代的指令。
+        shared = (root / "prompts" / "shared.md").read_text(encoding="utf-8")
+        self.assertIn("终段输出契约", shared)
+        self.assertIn("一字不差发给联系人", shared)
         self.assertNotIn("最终输出严格符合提供的 JSON Schema", worker)
+        self.assertNotIn("最终输出严格符合提供的 JSON Schema", shared)
 
     def test_streaming_card_binds_when_dingtalk_rewrites_markdown(self) -> None:
         """钉钉历史会把卡片里的 `x` 改成 **x**、吞掉列表项前的换行，
@@ -2509,6 +2514,90 @@ class TaskToolsRequestTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "task_context_missing_message_times")
 
+    def test_empty_coverage_allows_updates_and_anchorless_facts(self) -> None:
+        # 纯 wake/面板轮：message_times 为空映射，仍可登记状态、等待与
+        # 资源；facts 只能无锚写入，source 落 'agent'。
+        wake_context = {**self.context, "message_times": {}}
+        result = task_tools.execute_request(
+            {
+                "tool": "task_record",
+                "tool_call_id": "tool-wake-1",
+                "args": {
+                    "goal": "到点验证支付回调",
+                    "status": "waiting",
+                    "waiting_on": "@2026-11-08 09:00",
+                    "resources": ["repo:dws-chat-agent"],
+                    "facts": [
+                        {"text": "约定周三前只观察不重启", "anchor_message_id": ""}
+                    ],
+                },
+            },
+            wake_context,
+        )
+
+        self.assertTrue(result["ok"])
+        store = AuditStore(self.db_path)
+        try:
+            facts = store.facts_for_task(result["task"]["id"])
+            self.assertEqual(len(facts), 1)
+            self.assertEqual(facts[0]["anchor_message_id"], "")
+            self.assertEqual(facts[0]["source"], "agent")
+            task = store.lookup_tasks(
+                scope=TaskScope("self-open", CONTACT.identity, "conversation-1"),
+                include_archived=True,
+            )[0]
+            self.assertEqual(task["resources"], ["repo:dws-chat-agent"])
+        finally:
+            store.close()
+
+    def test_empty_coverage_still_rejects_evidence_and_anchored_facts(self) -> None:
+        wake_context = {**self.context, "message_times": {}}
+        anchored = task_tools.execute_request(
+            {
+                "tool": "task_record",
+                "tool_call_id": "tool-wake-2",
+                "args": {
+                    "goal": "带锚事实",
+                    "facts": [
+                        {"text": "无覆盖消息可锚", "anchor_message_id": "message-1"}
+                    ],
+                },
+            },
+            wake_context,
+        )
+        cited = task_tools.execute_request(
+            {
+                "tool": "task_record",
+                "tool_call_id": "tool-wake-3",
+                "args": {
+                    "goal": "带证据引用",
+                    "evidence_message_ids": ["message-1"],
+                },
+            },
+            wake_context,
+        )
+
+        self.assertFalse(anchored["ok"])
+        self.assertIn("unknown_evidence_message_id", anchored["error"])
+        self.assertFalse(cited["ok"])
+        self.assertIn("unknown_evidence_message_id", cited["error"])
+
+    def test_nonempty_coverage_still_rejects_anchorless_facts(self) -> None:
+        result = task_tools.execute_request(
+            {
+                "tool": "task_record",
+                "tool_call_id": "tool-1",
+                "args": {
+                    "goal": "覆盖集非空时的空锚事实",
+                    "facts": [{"text": "有消息却不锚", "anchor_message_id": ""}],
+                },
+            },
+            self.context,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("unknown_evidence_message_id", result["error"])
+
     def test_same_summary_with_unrelated_batch_does_not_renew(self) -> None:
         created = task_tools.execute_request(
             {
@@ -3511,9 +3600,14 @@ class TaskSnapshotTests(unittest.TestCase):
             timezone=TZ,
             self_open_id="self-open-id",
             self_name="Operator",
-            raw={"recent_context_messages": 6, "task_memory": {"inactive_days": 2}},
+            raw={
+                "recent_context_messages": 6,
+                "recent_context_chars": 12000,
+                "task_memory": {"inactive_days": 2},
+            },
             workspace_root=root,
             worktree_root=root,
+            state_dir=root,
         )
         service.store = AuditStore(root / "audit.sqlite3")
         service.agent_runtime = SimpleNamespace(
@@ -3756,6 +3850,11 @@ class SteerContextRefreshTests(unittest.TestCase):
                 render=Mock(return_value="prompt"),
                 render_supplement=Mock(return_value="steer prompt"),
                 supplement_strategy="steer",
+                _stage=Mock(
+                    return_value=SimpleNamespace(
+                        prompt_path=root / "prompts" / "worker.md"
+                    )
+                ),
                 resolve_stage=Mock(
                     return_value=SimpleNamespace(
                         profile=SimpleNamespace(
@@ -3797,6 +3896,319 @@ class SteerContextRefreshTests(unittest.TestCase):
             self.assertTrue(lease["revoked_at"])
             self.assertEqual(lease["revoke_reason"], "run_finished")
             service.store.close()
+
+
+class _ScriptedSession:
+    """按脚本收口的会话替身：每个元素描述一轮结束时的状态。
+
+    done 由内部完成事件派生（与真实 AgentSession 同构，turn-stopping
+    的重开路径要清这个事件）；steer 消费下一段脚本模拟补打后的新一轮。
+    steer_mode: apply=补打后按下一脚本收口；hang=补打成功但永不收口
+    （验证超时兜底）；reject=进程已死，steer 直接失败。
+    """
+
+    def __init__(
+        self,
+        prepared: SimpleNamespace,
+        session_id: str,
+        outcomes: list[dict[str, Any]],
+        *,
+        steer_mode: str = "apply",
+    ) -> None:
+        self.prepared = prepared
+        self.session_id = session_id
+        self._outcomes = [dict(item) for item in outcomes]
+        self._steer_mode = steer_mode
+        self._complete = asyncio.Event()
+        self._reply = ""
+        self.error = ""
+        self.silent = False
+        self.escalated = False
+        self.blocked = False
+        self.exit_code = 0
+        self.steer_prompts: list[str] = []
+
+    @property
+    def done(self) -> bool:
+        return self._complete.is_set()
+
+    def _apply(self, outcome: dict[str, Any]) -> None:
+        self.error = str(outcome.get("error") or "")
+        self.silent = bool(outcome.get("silent"))
+        self._reply = str(outcome.get("reply") or "")
+        self._complete.set()
+
+    async def start(self) -> None:
+        # 与真实会话同构：done 由事件驱动，首轮结束发生在监控循环的
+        # wait_for_update 里，nudge 钩子才能在循环内被触发。
+        return None
+
+    async def wait_for_update(self, timeout: float | None = None) -> None:
+        if self._outcomes:
+            self._apply(self._outcomes.pop(0))
+            return
+        await asyncio.sleep(0.005)
+
+    async def steer(self, prompt: str) -> bool:
+        self.steer_prompts.append(prompt)
+        if self._steer_mode == "reject":
+            return False
+        if self._steer_mode == "hang":
+            return True
+        if self._outcomes:
+            self._apply(self._outcomes.pop(0))
+            return True
+        return False
+
+    def result(self) -> str:
+        return self._reply
+
+    async def abort(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+class TurnNudgeTests(unittest.TestCase):
+    """turn-stopping（§18 P3）：空终稿先补打一轮，仍无结果才走兜底。"""
+
+    def _service(self, root: Path) -> AgentService:
+        service = AgentService.__new__(AgentService)
+        service.mode = "live"
+        service.settings = SimpleNamespace(
+            timezone=TZ,
+            self_open_id="self-open-id",
+            self_name="Operator",
+            cooldown=0,
+            quiet_window=0.01,
+            state_dir=root,
+            workspace_root=root,
+            worktree_root=root,
+            raw={
+                "monitor_interval_seconds": 0.01,
+                "max_replans": 5,
+                "task_memory": {"inactive_days": 2},
+            },
+        )
+        service.store = AuditStore(root / "audit.sqlite3")
+        service.dws = SimpleNamespace(history=AsyncMock(return_value=[]))
+        service.runtime_states = {}
+        service.live_sessions = {}
+        service.progress_card_seqs = {}
+        service._write_runtime = Mock()
+        return service
+
+    def _batch(self) -> list[IncomingEvent]:
+        return [
+            IncomingEvent(
+                "event-1", "message-1", "conversation-1", CONTACT,
+                "帮我看下回调为什么失败", datetime(2026, 11, 6, 10, 0, tzinfo=TZ),
+            )
+        ]
+
+    def _run(
+        self,
+        root: Path,
+        outcomes: list[dict[str, Any]],
+        *,
+        steer_mode: str = "apply",
+        timeout_seconds: float = 30,
+    ) -> tuple[AgentResult, _ScriptedSession]:
+        service = self._service(root)
+        prepared = SimpleNamespace(timeout_seconds=timeout_seconds)
+        holder: dict[str, _ScriptedSession] = {}
+        service.agent_runtime = SimpleNamespace(
+            profile_name=Mock(return_value="pi-worker"),
+            render=Mock(return_value="prompt"),
+            render_supplement=Mock(return_value="steer prompt"),
+            supplement_strategy="steer",
+            _stage=Mock(
+                return_value=SimpleNamespace(
+                    prompt_path=root / "prompts" / "worker.md"
+                )
+            ),
+            resolve_stage=Mock(
+                return_value=SimpleNamespace(
+                    profile=SimpleNamespace(protocol="pi-rpc", options={})
+                )
+            ),
+            open_session=Mock(
+                side_effect=lambda stage, session_id, *args, **kwargs: (
+                    holder.setdefault(
+                        session_id,
+                        _ScriptedSession(
+                            prepared, session_id, outcomes,
+                            steer_mode=steer_mode,
+                        ),
+                    )
+                )
+            ),
+        )
+        try:
+            result = asyncio.run(service._run_agent(self._batch(), ""))
+        finally:
+            service.store.close()
+        return result, holder[result.session_id]
+
+    def test_empty_final_turn_gets_one_nudge_then_recovers_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result, session = self._run(
+                Path(directory),
+                [{"error": "agent_result_missing"}, {"reply": "补打后给出的正文"}],
+            )
+
+            self.assertEqual(result.reply, "补打后给出的正文")
+            self.assertEqual(result.error, "")
+            self.assertEqual(len(session.steer_prompts), 1)
+            self.assertIn("report(final/blocked)", session.steer_prompts[0])
+            self.assertIn("no_reply()", session.steer_prompts[0])
+
+    def test_nudge_to_silent_is_a_success_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = self._run(
+                Path(directory),
+                [{"error": "agent_result_missing"}, {"silent": True}],
+            )
+
+            self.assertTrue(result.silent)
+            self.assertIsNone(result.reply)
+            self.assertEqual(result.error, "")
+
+    def test_nudge_fires_at_most_once_per_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result, session = self._run(
+                Path(directory),
+                [
+                    {"error": "agent_result_missing"},
+                    {"error": "agent_result_missing"},
+                ],
+            )
+
+            # 第二轮仍空：不再补打，按原 error 路径交给 fallback 兜底。
+            self.assertIsNone(result.reply)
+            self.assertEqual(result.error, "agent_result_missing")
+            self.assertEqual(len(session.steer_prompts), 1)
+
+    def test_failed_reopen_keeps_original_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = self._run(
+                Path(directory),
+                [{"error": "agent_result_missing"}],
+                steer_mode="reject",
+            )
+
+            self.assertIsNone(result.reply)
+            self.assertEqual(result.error, "agent_result_missing")
+
+    def test_nudge_turn_is_still_bound_by_session_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = self._run(
+                Path(directory),
+                [{"error": "agent_result_missing"}],
+                steer_mode="hang",
+                timeout_seconds=0.2,
+            )
+
+            # 补打成功但模型不再收口：整场运行仍受原超时约束，不无限等。
+            self.assertIsNone(result.reply)
+            self.assertEqual(result.error, "agent_timeout")
+
+
+class RecentContextBudgetTests(unittest.TestCase):
+    """recent_context 双层预算：条数封顶 100，字符窗从最旧条目开始丢。"""
+
+    def _service(self, root: Path, raw: dict[str, Any]) -> AgentService:
+        service = AgentService.__new__(AgentService)
+        service.settings = SimpleNamespace(
+            timezone=TZ,
+            self_open_id="self-open-id",
+            self_name="Operator",
+            raw=raw,
+            workspace_root=root,
+            worktree_root=root,
+            state_dir=root,
+        )
+        service.store = AuditStore(root / "audit.sqlite3")
+        return service
+
+    def _history(self, texts: list[str]) -> list[HistoryMessage]:
+        base = datetime(2026, 11, 6, 10, 0, tzinfo=TZ)
+        return [
+            HistoryMessage(
+                f"message-{index}",
+                "conversation-1",
+                CONTACT.display_name,
+                CONTACT.open_dingtalk_id,
+                text,
+                base + timedelta(minutes=index),
+            )
+            for index, text in enumerate(texts)
+        ]
+
+    def _batch(self, minutes: int) -> list[IncomingEvent]:
+        current = datetime(2026, 11, 6, 10, 0, tzinfo=TZ) + timedelta(
+            minutes=minutes
+        )
+        return [
+            IncomingEvent(
+                "event-current",
+                "message-current",
+                "conversation-1",
+                CONTACT,
+                "现在怎么样了",
+                current,
+            )
+        ]
+
+    def test_char_budget_drops_oldest_entries_until_within_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self._service(
+                root,
+                {"recent_context_messages": 100, "recent_context_chars": 12000},
+            )
+            texts = ["甲" * 5000, "乙" * 5000, "丙" * 5000]
+
+            recent, _ = service._recent_context(self._history(texts), self._batch(3))
+            service.store.close()
+
+            self.assertEqual(
+                [item["message_id"] for item in recent],
+                ["message-1", "message-2"],
+            )
+            self.assertLessEqual(
+                sum(len(item["text"]) for item in recent), 12000
+            )
+
+    def test_message_count_ceiling_stays_at_one_hundred(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self._service(
+                root,
+                {"recent_context_messages": 500, "recent_context_chars": 120000},
+            )
+            history = self._history([f"消息{index}" for index in range(150)])
+
+            recent, _ = service._recent_context(history, self._batch(151))
+            service.store.close()
+
+            self.assertEqual(len(recent), 100)
+            self.assertEqual(recent[-1]["message_id"], "message-149")
+
+    def test_zero_budget_disables_char_trimming(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self._service(
+                root,
+                {"recent_context_messages": 3, "recent_context_chars": 0},
+            )
+            texts = ["甲" * 5000, "乙" * 5000, "丙" * 5000]
+
+            recent, _ = service._recent_context(self._history(texts), self._batch(3))
+            service.store.close()
+
+            self.assertEqual(len(recent), 3)
 
 
 if __name__ == "__main__":

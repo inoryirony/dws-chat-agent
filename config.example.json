@@ -13,11 +13,12 @@
   "event_reconcile_interval_seconds": 60,
   "event_reconcile_lookback_seconds": 7200,
   "open_id_poll_interval_seconds": 5,
-  "recent_context_messages": 6,
+  "recent_context_messages": 100,
+  "recent_context_chars": 12000,
   "monitor_interval_seconds": 5,
   "max_replans": 5,
   "max_parallel_conversations": 2,
-  "max_reply_chars": 16000,
+  "max_reply_chars": 4000,
   "rate_limit": {
     "per_contact_per_hour": 12,
     "global_per_hour": 40
@@ -27,6 +28,11 @@
   "state_dir": "state",
   "task_memory": {
     "inactive_days": 2
+  },
+  "skills": {
+    "humanizer_zh": "~/.agents/skills/humanizer-zh/SKILL.md",
+    "answer_me_with_html": "~/.agents/skills/answer-me-with-html/SKILL.md",
+    "answer_me_script": "~/.agents/skills/answer-me-with-html/scripts/am.mjs"
   },
   "agents": {
     "pi-front": {

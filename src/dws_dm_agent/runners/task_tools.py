@@ -63,11 +63,12 @@ def _context_from_env() -> dict[str, Any]:
 def _message_time_map(context: Mapping[str, Any]) -> dict[str, datetime] | str:
     """解析上下文的 message_times（消息 id -> 时间戳）。
 
-    返回错误字符串表示上下文不可用；时间戳必须可解析且带时区，
-    后续 max 比较才有意义。
+    返回错误字符串表示上下文不可用；映射可以为空（纯 wake/面板轮没有
+    覆盖任何联系人消息，调用方按空覆盖集放宽锚定）。时间戳必须可解析
+    且带时区，后续 max 比较才有意义。
     """
     raw = context.get("message_times")
-    if not isinstance(raw, Mapping) or not raw:
+    if not isinstance(raw, Mapping):
         return "task_context_missing_message_times"
     mapping: dict[str, datetime] = {}
     for key, value in raw.items():
@@ -189,11 +190,15 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                 item for item in evidence_ids if item not in message_times
             ]
             if facts is not None:
-                unknown.extend(
-                    fact["anchor_message_id"]
-                    for fact in facts
-                    if fact["anchor_message_id"] not in message_times
-                )
+                for fact in facts:
+                    anchor = fact["anchor_message_id"]
+                    # 覆盖集为空（纯 wake/面板轮）：只放行无锚事实，锚非空
+                    # 即未知。覆盖集非空：锚必须落在覆盖消息上，空锚同样
+                    # 按未知拒绝（照旧严格）。
+                    if anchor and anchor not in message_times:
+                        unknown.append(anchor)
+                    elif not anchor and message_times:
+                        unknown.append(anchor)
             if unknown:
                 # 未知 ID 一律拒绝，绝不带着“当前时间”兜底落库：那会把
                 # 无法核实的引用伪装成最新证据，让事项凭空调新。facts
@@ -207,11 +212,13 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                 }
             # 证据时间取被引用消息自身的最新时间戳：引用旧消息，时间就
             # 是旧时间；未引用时才用本运行已覆盖消息的最新时间（新建
-            # 事项的触发消息就是当前输入）。
-            evidence_at = max(
-                (message_times[item] for item in evidence_ids),
-                default=max(message_times.values()),
-            )
+            # 事项的触发消息就是当前输入）。覆盖集为空（纯唤醒/面板轮）
+            # 没有可引用的消息，证据时间退回当前时刻。
+            if message_times:
+                evidence_at = max(
+                    (message_times[item] for item in evidence_ids),
+                    default=max(message_times.values()),
+                )
         if tool == "task_lookup":
             # 黑板读：跨联系人查整块黑板；include_done 含 completed/cancelled。
             response = store.apply_task_lookup(
