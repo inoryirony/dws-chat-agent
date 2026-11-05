@@ -185,12 +185,40 @@
         <div><div class="eyebrow">DIAMOND Network / Metropolis</div><h1>PROJECT D.I.A.M.O.N.D.</h1></div>
       </div>
       <div class="header-actions">
+        <button id="newSessionBtn" class="icon-btn" type="button" aria-label="开启会话" title="开启会话">＋</button>
+        <div class="bell-wrap">
+          <button id="bellBtn" class="icon-btn" type="button" aria-label="通知" title="通知">🔔<span id="bellBadge" class="bell-badge" hidden></span></button>
+          <div id="bellDropdown" class="bell-dropdown" hidden></div>
+        </div>
         <div class="service-state"><span id="pulse" class="pulse"></span><span id="serviceText">正在连接本地代理…</span></div>
         <a class="settings-link" href="/settings" aria-label="打开 DIAMOND Settings" title="DIAMOND Settings">⚙</a>
       </div>
     </header>
 
     <section id="metrics" class="metrics"></section>
+
+    <section id="verdictPanel" class="panel board-panel board-verdicts" hidden>
+      <div class="panel-head"><h2><span class="dot dot-danger" aria-hidden="true"></span>等我裁决</h2><span class="hint">一句话作答，✓ 为同意</span></div>
+      <div id="verdictRows" class="verdict-rows"></div>
+    </section>
+
+    <section class="panel board-panel">
+      <div class="panel-head"><h2><span class="mini-spinner" aria-hidden="true"></span>在跑会话</h2><span id="runningCount" class="hint"></span></div>
+      <div id="boardRuns" class="board-run-rows"></div>
+    </section>
+
+    <section class="panel board-panel">
+      <div class="panel-head"><h2>任务</h2><span class="hint">点开看事实与触碰会话</span></div>
+      <div class="board-cols">
+        <div class="board-col"><div class="board-col-head" role="heading" aria-label="进行中">▶</div><div id="colOpen" class="board-cards"></div></div>
+        <div class="board-col"><div class="board-col-head" role="heading" aria-label="等待">⏸</div><div id="colWait" class="board-cards"></div></div>
+        <div class="board-col board-col-done"><div class="board-col-head" role="heading" aria-label="完成">✅</div><div id="colDone" class="board-cards"></div></div>
+      </div>
+      <details id="doneStrip" class="board-done-strip" hidden>
+        <summary><span aria-hidden="true">✅</span><span id="doneStripCount" class="hint"></span></summary>
+        <div id="doneStripCards" class="board-cards"></div>
+      </details>
+    </section>
 
     <section class="workbench">
       <article class="panel">
@@ -213,8 +241,30 @@
       </div>
       <div id="recent" class="recent-list"></div>
     </section>
-    <footer><span>DIAMOND Network · 仅监听 127.0.0.1 · 状态每 3 秒刷新</span><span id="updated"></span></footer>
+    <footer><span>DIAMOND Network · 仅监听 127.0.0.1 · 黑板每 2 秒 · 状态每 3 秒刷新</span><span id="updated"></span></footer>
   </main>
+
+  <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+  <aside id="boardDrawer" class="board-drawer" hidden aria-label="任务详情">
+    <button id="drawerClose" class="icon-btn drawer-close" type="button" aria-label="关闭">✕</button>
+    <div id="drawerGoal" class="drawer-goal"></div>
+    <div id="drawerPeople" class="drawer-people"></div>
+    <div id="drawerFacts" class="drawer-facts"></div>
+  </aside>
+
+  <div id="newSessionOverlay" class="modal-overlay" hidden>
+    <div class="modal-card" role="dialog" aria-label="开启会话">
+      <textarea id="newSessionText" rows="4" placeholder="要它做什么？"></textarea>
+      <select id="newSessionContact" aria-label="联系人"></select>
+      <div class="modal-actions">
+        <span id="newSessionError" class="modal-error" hidden></span>
+        <button id="newSessionCancel" class="ghost-btn" type="button">取消</button>
+        <button id="newSessionSend" type="button">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
 
   <script>
     const PHASES = [
@@ -359,6 +409,415 @@
     document.getElementById("contactFilter").addEventListener("change", () => renderRecent(true));
     document.getElementById("statusFilter").addEventListener("change", () => renderRecent(true));
     refresh(); setInterval(refresh, 3000); setInterval(() => snapshot && renderActive(snapshot.active), 1000);
+
+    // ---- 黑板（§18）：投影 + 回写，icon-first，2s 轮询 ----
+    let board = null;
+    let boardContacts = {};
+    let boardAliasesLoaded = false;
+    let toastTimer = 0;
+
+    const boardList = value => Array.isArray(value) ? value : [];
+    const taskFacts = task => boardList(task.facts ?? task.recent_facts);
+    const mmss = start => {
+      const seconds = Math.max(0, Math.floor((Date.now() - new Date(start).getTime()) / 1000));
+      return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+    };
+    const within24h = value => {
+      const at = new Date(value).getTime();
+      return Number.isFinite(at) && Date.now() - at < 86400000;
+    };
+    const contactName = id => boardContacts[id] || (id ? String(id) : "?");
+
+    function reconcile(container, items, keyOf, makeRow, updateRow) {
+      const keep = new Set(items.map(keyOf));
+      [...container.children].forEach(el => { if (el.dataset.key && !keep.has(el.dataset.key)) el.remove(); });
+      const byKey = new Map([...container.children].filter(el => el.dataset.key).map(el => [el.dataset.key, el]));
+      let anchor = null;
+      items.forEach(item => {
+        const key = keyOf(item);
+        let el = byKey.get(key);
+        if (!el) { el = makeRow(item); el.dataset.key = key; }
+        if (updateRow) updateRow(el, item);
+        const expected = anchor ? anchor.nextSibling : container.firstChild;
+        if (el !== expected) container.insertBefore(el, expected);
+        anchor = el;
+      });
+    }
+
+    async function postBoard(url, body) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      return data;
+    }
+
+    function showToast(message, danger = false) {
+      const toast = document.getElementById("toast");
+      toast.textContent = message;
+      toast.classList.toggle("danger", danger);
+      toast.hidden = false;
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { toast.hidden = true; }, 4000);
+    }
+
+    async function loadBoardContacts() {
+      try {
+        const response = await fetch("/api/config", {cache: "no-store"});
+        if (!response.ok) return;
+        const data = await response.json();
+        boardContacts = {};
+        (data.contacts || []).forEach(contact => {
+          ["user_id", "open_dingtalk_id", "alias", "display_name"].forEach(key => {
+            if (contact[key]) boardContacts[contact[key]] = contact.display_name || contact.alias;
+          });
+        });
+      } catch (error) { boardContacts = {}; }
+    }
+
+    const avatar = (id, cls) => {
+      const el = node("span", `avatar ${cls || ""}`);
+      const name = contactName(id);
+      el.textContent = Array.from(name.trim())[0] || "?";
+      el.title = name;
+      return el;
+    };
+
+    // 通知铃：红点=等你，红字=失败，同任务聚一行。
+    function renderBell(data) {
+      const waiting = boardList(data.waiting_operator);
+      const failed = [];
+      const seenFailed = new Set();
+      [...boardList(data.runs), ...boardList(data.recent_done), ...boardList(data.recent_failed)].forEach(run => {
+        if (run.status !== "failed" && run.outcome !== "failed") return;
+        if (seenFailed.has(run.session_id)) return;
+        seenFailed.add(run.session_id);
+        if (within24h(run.ended_at || run.updated_at)) failed.push(run);
+      });
+      const badge = document.getElementById("bellBadge");
+      badge.textContent = String(waiting.length + failed.length);
+      badge.hidden = waiting.length + failed.length === 0;
+      const dropdown = document.getElementById("bellDropdown");
+      if (dropdown.hidden) return;
+      clear(dropdown);
+      if (!waiting.length && !failed.length) {
+        dropdown.append(node("div", "bell-empty", "没有需要你注意的事"));
+        return;
+      }
+      const rows = new Map();
+      waiting.forEach(task => rows.set(task.id ?? task.task_id ?? task.goal, {task, mine: true}));
+      failed.forEach(run => {
+        const key = run.task_id || `run-${run.session_id}`;
+        if (rows.has(key)) return;
+        rows.set(key, {run, mine: false});
+      });
+      rows.forEach(({task, run, mine}) => {
+        const row = node("button", "bell-row");
+        row.type = "button";
+        row.append(avatar((task || run).contact_id, ""));
+        const text = node("span", mine ? "bell-mine" : "bell-fail", (task || run).goal || (task || run).headline || "");
+        if (mine) row.prepend(node("span", "dot dot-danger"));
+        row.append(text);
+        row.addEventListener("click", () => {
+          dropdown.hidden = true;
+          if (mine) document.getElementById("verdictPanel")?.scrollIntoView({behavior: "smooth"});
+          else if ((task || run).id) openDrawer(board?.tasks?.find(item => item.id === (task || run).id) || task || run);
+        });
+        dropdown.append(row);
+      });
+    }
+
+    // 等我裁决：红条 + 头像 + 一句话 + 行内作答。
+    function renderVerdicts(data) {
+      const items = boardList(data.waiting_operator);
+      const panel = document.getElementById("verdictPanel");
+      panel.hidden = !items.length;
+      if (!items.length) return;
+      const rows = document.getElementById("verdictRows");
+
+      const send = (task, answer, input, button) => {
+        button.disabled = true;
+        postBoard("/api/task/answer", {task_id: task.id, answer})
+          .then(() => { if (input) input.value = ""; boardRefresh(); })
+          .catch(error => { showToast(error.message, true); button.disabled = false; });
+      };
+
+      reconcile(rows, items, task => task.id, task => {
+        const row = node("article", "verdict-row");
+        row.append(avatar(task.contact_id, ""));
+        const goal = node("span", "board-goal");
+        const input = document.createElement("input");
+        input.className = "board-input";
+        input.type = "text";
+        input.placeholder = "一句话作答";
+        const ok = node("button", "icon-btn ok-btn");
+        ok.type = "button"; ok.textContent = "✓"; ok.title = "同意"; ok.setAttribute("aria-label", "同意");
+        ok.addEventListener("click", () => send(task, "同意", input, ok));
+        const sendBtn = node("button", "icon-btn send-btn");
+        sendBtn.type = "button"; sendBtn.textContent = "➤"; sendBtn.title = "作答"; sendBtn.setAttribute("aria-label", "作答");
+        sendBtn.addEventListener("click", () => {
+          const answer = input.value.trim();
+          if (!answer) return;
+          send(task, answer, input, sendBtn);
+        });
+        input.addEventListener("keydown", event => {
+          if (event.key === "Enter" && input.value.trim()) send(task, input.value.trim(), input, sendBtn);
+        });
+        row.append(goal, input, ok, sendBtn);
+        row._goal = goal; row._avatar = row.firstChild;
+        return row;
+      }, (row, task) => {
+        row._goal.textContent = task.goal || "";
+        row._goal.title = task.goal || "";
+        row._avatar.title = contactName(task.contact_id);
+      });
+    }
+
+    // 在跑会话：头像 + spinner + 模型写的 headline + mm:ss + 最近 3 条进度小圆点 + 💬 介入。
+    function renderRunning(data) {
+      const runs = boardList(data.runs)
+        .filter(run => run.status === "running" || run.status === "waiting")
+        .sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
+      document.getElementById("runningCount").textContent = runs.length ? `${runs.length}` : "";
+      const box = document.getElementById("boardRuns");
+
+      const steer = (run, input, box2, button) => {
+        button.disabled = true;
+        postBoard(`/api/run/${encodeURIComponent(run.session_id)}/steer`, {text: input.value.trim()})
+          .then(() => { box2.hidden = true; boardRefresh(); })
+          .catch(error => { showToast(error.message, true); button.disabled = false; });
+      };
+
+      reconcile(box, runs, run => run.session_id, run => {
+        const row = node("article", "board-run-row");
+        row.append(avatar(run.contact_id, ""));
+        const main = node("div", "run-main");
+        const line = node("div", "run-line");
+        const spinner = node("span", "spinner");
+        const headline = node("span", "run-headline");
+        const elapsed = node("span", "elapsed run-elapsed");
+        line.append(spinner, headline, elapsed);
+        const dots = node("div", "pdots");
+        const steerBox = node("div", "steer-box");
+        steerBox.hidden = true;
+        const input = document.createElement("input");
+        input.className = "board-input";
+        input.type = "text"; input.placeholder = "对它说";
+        const sendBtn = node("button", "icon-btn send-btn");
+        sendBtn.type = "button"; sendBtn.textContent = "➤"; sendBtn.title = "送出"; sendBtn.setAttribute("aria-label", "送出");
+        sendBtn.addEventListener("click", () => { if (input.value.trim()) steer(run, input, steerBox, sendBtn); });
+        input.addEventListener("keydown", event => {
+          if (event.key === "Enter" && input.value.trim()) steer(run, input, steerBox, sendBtn);
+        });
+        steerBox.append(input, sendBtn);
+        main.append(line, dots, steerBox);
+        const chat = node("button", "icon-btn steer-btn");
+        chat.type = "button"; chat.textContent = "💬"; chat.title = "介入"; chat.setAttribute("aria-label", "介入");
+        chat.addEventListener("click", () => { steerBox.hidden = !steerBox.hidden; if (!steerBox.hidden) input.focus(); });
+        row.append(main, chat);
+        row._spinner = spinner; row._headline = headline; row._elapsed = elapsed; row._dots = dots; row._avatar = row.firstChild;
+        return row;
+      }, (row, run) => {
+        row._spinner.classList.toggle("paused", run.status === "waiting");
+        row.classList.toggle("waiting", run.status === "waiting");
+        if (row._headline.textContent !== (run.headline || "")) row._headline.textContent = run.headline || "";
+        row._headline.title = run.headline || "";
+        row._elapsed.dataset.started = run.started_at || "";
+        row._elapsed.textContent = run.started_at ? mmss(run.started_at) : "";
+        row._avatar.title = contactName(run.contact_id);
+        const entries = boardList(run.recent_progress ?? run.progress).slice(-3);
+        clear(row._dots);
+        entries.forEach((entry, index) => {
+          const dot = node("span", `pdot ${index === entries.length - 1 ? "latest" : ""}`);
+          dot.title = `${time(entry.created_at)} ${entry.text || ""}`;
+          row._dots.append(dot);
+        });
+      });
+      if (!runs.length && !box.querySelector(".empty")) box.append(node("div", "empty", "现在没有在跑的会话"));
+      else if (runs.length) [...box.children].forEach(el => { if (!el.dataset.key) el.remove(); });
+    }
+
+    // 任务看板：▶ ⏸ ✅ 三列，卡片点开右侧抽屉（facts 时间线 + 触碰会话头像）。
+    const taskColumn = task => {
+      if (task.status === "open") return "open";
+      if (task.status === "waiting") return "wait";
+      return "done";
+    };
+
+    function makeCard(openWith) {
+      return task => {
+        const card = node("button", "board-card");
+        card.type = "button";
+        card.append(avatar(task.contact_id, ""));
+        const goal = node("span", "board-goal");
+        card.append(goal);
+        card._goal = goal; card._avatar = card.firstChild;
+        card.addEventListener("click", () => openWith(task));
+        return card;
+      };
+    }
+
+    const updateCard = (card, task, operatorIds) => {
+      card._goal.textContent = task.goal || "";
+      card._goal.title = task.goal || "";
+      card._avatar.title = contactName(task.contact_id);
+      card.classList.toggle("is-done", taskColumn(task) === "done");
+      card.classList.toggle("is-cancelled", task.status === "cancelled");
+      card.classList.toggle("is-mine", operatorIds.has(task.id));
+    };
+
+    function renderTasks(data) {
+      const tasks = boardList(data.tasks);
+      const operatorIds = new Set(boardList(data.waiting_operator).map(task => task.id));
+      const columns = {open: [], wait: [], done: []};
+      tasks.forEach(task => columns[taskColumn(task)].push(task));
+      columns.done.sort((a, b) => (a.status === "cancelled") - (b.status === "cancelled")
+        || String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+      const openDrawerByTask = task => openDrawer(task);
+      const maker = makeCard(openDrawerByTask);
+      Object.entries(columns).forEach(([kind, items]) => {
+        const box = document.getElementById(kind === "open" ? "colOpen" : kind === "wait" ? "colWait" : "colDone");
+        reconcile(box, items, task => task.id, maker, (card, task) => updateCard(card, task, operatorIds));
+        if (!items.length && !box.querySelector(".board-col-empty")) box.append(node("div", "board-col-empty", "—"));
+        if (items.length) [...box.children].forEach(el => { if (!el.dataset.key) el.remove(); });
+      });
+
+      const strip = document.getElementById("doneStrip");
+      const recentDone = boardList(data.recent_done).filter(task =>
+        within24h(task.updated_at || task.last_evidence_at || task.ended_at || task.created_at));
+      strip.hidden = !recentDone.length;
+      if (recentDone.length) {
+        document.getElementById("doneStripCount").textContent = `${recentDone.length}`;
+        const cards = document.getElementById("doneStripCards");
+        reconcile(cards, recentDone, task => task.id, maker, (card, task) => updateCard(card, task, operatorIds));
+      }
+    }
+
+    function openDrawer(task) {
+      if (!task) return;
+      document.getElementById("drawerGoal").textContent = task.goal || "";
+      const people = document.getElementById("drawerPeople");
+      clear(people);
+      [...new Set([task.contact_id, ...boardList(task.contact_ids)])].filter(Boolean).forEach(id => people.append(avatar(id, "")));
+      const factsBox = document.getElementById("drawerFacts");
+      clear(factsBox);
+      taskFacts(task).forEach(fact => {
+        const row = node("div", "fact-row");
+        row.append(node("span", `fact-dot ${fact.source === "human" ? "human" : fact.source === "contact" ? "contact" : "agent"}`));
+        const text = node("span", "fact-text", fact.text || "");
+        row.append(text, node("span", "fact-time", time(fact.created_at)));
+        factsBox.append(row);
+      });
+      if (!taskFacts(task).length) factsBox.append(node("div", "empty", "还没有留下事实"));
+      document.getElementById("drawerBackdrop").hidden = false;
+      document.getElementById("boardDrawer").hidden = false;
+    }
+
+    function closeDrawer() {
+      document.getElementById("drawerBackdrop").hidden = true;
+      document.getElementById("boardDrawer").hidden = true;
+    }
+
+    // ＝ 开新会话：文本 + 联系人（内部任务可空）。
+    function openNewSession() {
+      const overlay = document.getElementById("newSessionOverlay");
+      overlay.hidden = false;
+      document.getElementById("newSessionError").hidden = true;
+      const select = document.getElementById("newSessionContact");
+      if (!boardAliasesLoaded) {
+        boardAliasesLoaded = true;
+        clear(select);
+        select.append(new Option("内部任务", ""));
+        fetch("/api/config", {cache: "no-store"})
+          .then(response => response.ok ? response.json() : {contacts: []})
+          .then(data => {
+            clear(select);
+            select.append(new Option("内部任务", ""));
+            (data.contacts || []).forEach(contact => select.append(new Option(contact.display_name || contact.alias, contact.alias)));
+          })
+          .catch(() => {});
+      }
+      document.getElementById("newSessionText").focus();
+    }
+
+    function closeNewSession() {
+      document.getElementById("newSessionOverlay").hidden = true;
+      document.getElementById("newSessionText").value = "";
+    }
+
+    function sendNewSession() {
+      const text = document.getElementById("newSessionText").value.trim();
+      const error = document.getElementById("newSessionError");
+      if (!text) { error.textContent = "请输入内容"; error.hidden = false; return; }
+      const button = document.getElementById("newSessionSend");
+      button.disabled = true;
+      postBoard("/api/session/new", {
+        text,
+        contact_alias: document.getElementById("newSessionContact").value || null
+      })
+        .then(data => {
+          closeNewSession();
+          showToast(`已开启 ${String(data.sessionId || "").slice(0, 8)}`);
+          boardRefresh();
+        })
+        .catch(exc => { error.textContent = exc.message; error.hidden = false; })
+        .finally(() => { button.disabled = false; });
+    }
+
+    function renderBoard() {
+      if (!board) return;
+      renderBell(board);
+      renderVerdicts(board);
+      renderRunning(board);
+      renderTasks(board);
+    }
+
+    async function boardRefresh() {
+      try {
+        const response = await fetch("/api/board", {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        board = await response.json();
+        renderBoard();
+      } catch (error) {
+        // 轮询失败保持上一帧，铃铛与各区不动。
+      }
+    }
+
+    document.getElementById("newSessionBtn").addEventListener("click", openNewSession);
+    document.getElementById("newSessionCancel").addEventListener("click", closeNewSession);
+    document.getElementById("newSessionSend").addEventListener("click", sendNewSession);
+    document.getElementById("newSessionText").addEventListener("keydown", event => {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) sendNewSession();
+    });
+    document.getElementById("bellBtn").addEventListener("click", () => {
+      const dropdown = document.getElementById("bellDropdown");
+      dropdown.hidden = !dropdown.hidden;
+      if (!dropdown.hidden) renderBell(board || {});
+    });
+    document.addEventListener("click", event => {
+      const wrap = document.querySelector(".bell-wrap");
+      if (!document.getElementById("bellDropdown").hidden && wrap && !wrap.contains(event.target)) {
+        document.getElementById("bellDropdown").hidden = true;
+      }
+    });
+    document.getElementById("drawerClose").addEventListener("click", closeDrawer);
+    document.getElementById("drawerBackdrop").addEventListener("click", closeDrawer);
+    document.addEventListener("keydown", event => {
+      if (event.key !== "Escape") return;
+      if (!document.getElementById("newSessionOverlay").hidden) closeNewSession();
+      else if (!document.getElementById("boardDrawer").hidden) closeDrawer();
+      else document.getElementById("bellDropdown").hidden = true;
+    });
+    setInterval(() => {
+      document.querySelectorAll(".elapsed[data-started]").forEach(el => {
+        if (el.dataset.started) el.textContent = mmss(el.dataset.started);
+      });
+    }, 1000);
+    loadBoardContacts().then(boardRefresh);
+    setInterval(boardRefresh, 2000);
   </script>
 </body>
 </html>
