@@ -8,7 +8,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import timezone
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -1615,11 +1616,12 @@ class WorkerWorktreeIsolationTests(unittest.IsolatedAsyncioTestCase):
             _git_repo(root / "repo")
             runtime = self._worktree_runtime(root)
 
+            session_id = "sess-abcdef1234567890"
             prepared = runtime.prepare(
-                "worker", "sess-abcdef1234567890", "prompt", root / "run"
+                "worker", session_id, "prompt", root / "run"
             )
 
-            target = root / "wt" / "repo-sess-abcde"
+            target = root / "wt" / f"repo-{session_id[-12:]}"
             self.assertEqual(prepared.cwd, target)
             self.assertEqual(prepared.worktree_source, root / "repo")
             self.assertEqual(prepared.environment["DWS_WORKTREE"], str(target))
@@ -1634,6 +1636,30 @@ class WorkerWorktreeIsolationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 (target / "README.md").read_text(encoding="utf-8"), "hello"
             )
+
+    def test_two_service_format_sessions_never_share_a_worktree(self) -> None:
+        # 真实服务格式的会话 id 同日同 profile 只差末尾随机段：
+        # worktree 名取该随机尾段，连续两次创建绝不互撞。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _git_repo(root / "repo")
+            runtime = self._worktree_runtime(root)
+            day = datetime(2026, 11, 6)
+
+            def service_session_id() -> str:
+                return (
+                    f"dm-{day:%Y%m%d}-pi-worker-deepseek-"
+                    f"{uuid.uuid4().hex[:10]}"
+                )
+
+            first_id, second_id = service_session_id(), service_session_id()
+            self.assertEqual(first_id[:10], second_id[:10])
+            first = runtime.prepare("worker", first_id, "p", root / "run-1")
+            second = runtime.prepare("worker", second_id, "p", root / "run-2")
+
+            self.assertNotEqual(first.worktree_path, second.worktree_path)
+            self.assertTrue(first.worktree_path and first.worktree_path.exists())
+            self.assertTrue(second.worktree_path and second.worktree_path.exists())
 
     def test_front_stage_never_gets_a_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1671,13 +1697,14 @@ class WorkerWorktreeIsolationTests(unittest.IsolatedAsyncioTestCase):
             emitter.write_text(_WAIT_EMITTER, encoding="utf-8")
             runtime = self._worktree_runtime(root, command=[sys.executable, str(emitter)])
 
+            session_id = "sess-abort12345"
             session = AgentSession(
                 runtime.prepare(
-                    "worker", "sess-abort12345", "prompt", root / "run"
+                    "worker", session_id, "prompt", root / "run"
                 ),
-                "sess-abort12345",
+                session_id,
             )
-            target = root / "wt" / "repo-sess-abort"
+            target = root / "wt" / f"repo-{session_id[-12:]}"
             await session.start()
             try:
                 self.assertTrue(target.exists())

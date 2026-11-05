@@ -401,7 +401,10 @@ class RunProgressLifecycleTests(BoardStoreTests):
 
         swept = self.store.abort_stale_runs(NOW + timedelta(hours=1))
 
-        self.assertEqual(swept, 1)
+        # 返回被扫尾的运行行：调用方据此回收崩溃遗留的 worktree。
+        self.assertEqual(
+            [row["session_id"] for row in swept], ["session-live"]
+        )
         statuses = {
             row["session_id"]: (row["status"], row["outcome"])
             for row in self.store.connection.execute(
