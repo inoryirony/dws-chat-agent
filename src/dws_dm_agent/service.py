@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone as fixed_timezone, tzinfo
+from datetime import datetime, time, timedelta, timezone as fixed_timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -70,6 +70,50 @@ _STREAM_CARD_BIND_TIMEOUT_SECONDS = 6.0
 _TASK_SNAPSHOT_LIMIT = 8
 # 事项无实质更新后的归档天数（task_memory.inactive_days 可覆盖）。
 _TASK_INACTIVE_DAYS_DEFAULT = 2
+# 唤醒循环扫描间隔（wake_interval_seconds 可覆盖）与给人消息的可打扰窗口。
+_WAKE_INTERVAL_SECONDS_DEFAULT = 5.0
+_WAKE_WINDOW_OPEN = time(9, 0)
+_WAKE_WINDOW_CLOSE = time(19, 0)
+# 相1 卡片最多渲染的里程碑条数（§18：3~7 行短句）。
+_PROGRESS_CARD_LIMIT = 7
+# 合成输入（wake/面板指令）的 message_id 前缀与 prompt 内的系统唤醒块。
+_SYNTHETIC_PREFIXES = ("wake-", "panel-")
+_SYSTEM_WAKE_DISCLAIMER = "这不是联系人的新消息，不含新授权。"
+_TIME_WAITING_PATTERN = re.compile(r"^@(.+)$")
+
+
+def _is_synthetic_message_id(message_id: str) -> bool:
+    return message_id.startswith(_SYNTHETIC_PREFIXES)
+
+
+def _system_wake_block(entries: Sequence[tuple[str, str]]) -> str:
+    """把合成输入渲染成 prompt 内独立块；标签区分系统唤醒与操作者指令。"""
+    lines = ["<system_wake>"]
+    for label, text in entries:
+        lines.append(f"{label}：{text}")
+        lines.append(_SYSTEM_WAKE_DISCLAIMER)
+    lines.append("</system_wake>")
+    return "\n".join(lines)
+
+
+def _parse_waiting_moment(value: str, timezone: tzinfo) -> datetime | None:
+    """解析 waiting_on 的 "@时刻" 写法；解析失败返回 None（不唤醒）。"""
+    try:
+        moment = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone)
+
+
+def _roll_into_wake_window(moment: datetime) -> datetime:
+    """把窗外时刻顺延到下一个 09:00（窗口 09:00-19:00，含头不含尾）。"""
+    if moment.time() < _WAKE_WINDOW_OPEN:
+        return moment.replace(hour=9, minute=0, second=0, microsecond=0)
+    if moment.time() >= _WAKE_WINDOW_CLOSE:
+        return (moment + timedelta(days=1)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+    return moment
 
 
 def _event_consume_command(
@@ -244,6 +288,7 @@ class AgentService:
         self.runtime_heartbeat: asyncio.Task[None] | None = None
         self.history_reconciler: asyncio.Task[None] | None = None
         self.outbox_dispatcher: asyncio.Task[None] | None = None
+        self.wake_dispatcher: asyncio.Task[None] | None = None
         self.outbox_wakeup = asyncio.Event()
         self.listener_processes: set[asyncio.subprocess.Process] = set()
         self.stop_event = asyncio.Event()
@@ -252,6 +297,9 @@ class AgentService:
         self.runtime_path = settings.state_dir / "runtime.json"
         self.runtime_states: dict[str, dict[str, Any]] = {}
         self.streaming_card_send_uuids: dict[str, str] = {}
+        # 在跑会话注册表（steer_run 用）与相1卡片的里程碑水位。
+        self.live_sessions: dict[str, AgentSession] = {}
+        self.progress_card_seqs: dict[str, int] = {}
         # Ponytail ceiling: this lock only covers idle-check/config-swap/enqueue;
         # move config application onto the event loop if those operations grow.
         self.configuration_lock = threading.RLock()
@@ -320,6 +368,9 @@ class AgentService:
         self.outbox_dispatcher = asyncio.create_task(
             self._dispatch_outbox(), name="outbox-dispatcher"
         )
+        self.wake_dispatcher = asyncio.create_task(
+            self._consume_wakes(), name="wake-dispatcher"
+        )
         self.runtime_heartbeat = asyncio.create_task(
             self._keep_runtime_alive(), name="runtime-heartbeat"
         )
@@ -331,12 +382,14 @@ class AgentService:
             task.cancel()
         self.history_reconciler.cancel()
         self.outbox_dispatcher.cancel()
+        self.wake_dispatcher.cancel()
         self.runtime_heartbeat.cancel()
         await asyncio.gather(
             *self.listeners,
             *self.workers.values(),
             self.history_reconciler,
             self.outbox_dispatcher,
+            self.wake_dispatcher,
             self.runtime_heartbeat,
             return_exceptions=True,
         )
@@ -799,6 +852,9 @@ class AgentService:
         if not callable(operation):
             return
         for item in batch:
+            if _is_synthetic_message_id(item.message_id):
+                # 合成输入没有对应的钉钉消息，表情回应无从挂载。
+                continue
             try:
                 await operation(item.conversation_id, item.message_id, "专注")
             except Exception as exc:
@@ -1223,6 +1279,9 @@ class AgentService:
         """
         if not getattr(getattr(self, "dws", None), "streaming_cards", False):
             return ""
+        if batch[0].conversation_id.startswith("panel:"):
+            # 面板内部轮没有对外会话，卡片创建只可能失败，直接回退。
+            return ""
         content = self.agent_runtime.render_auto_message(
             "ack",
             {
@@ -1268,6 +1327,44 @@ class AgentService:
             card_send_uuids = self.streaming_card_send_uuids = {}
         card_send_uuids.setdefault(biz_id, send_uuid)
         await self._safe_update_streaming_card(biz_id, content, 5)
+
+    async def _sync_progress_card(
+        self, batch: Sequence[IncomingEvent], session_id: str
+    ) -> None:
+        """相1：运行中卡片正文 = 里程碑全量幂等渲染（"- " 前缀纯文本）。
+
+        只在里程碑水位上涨时动作：首个里程碑创建卡片（silent 前仍零输出），
+        后续里程碑整表重发。无里程碑不建卡，模型 delta 永不进正文。
+        """
+        if not getattr(getattr(self, "dws", None), "streaming_cards", False):
+            return
+        entries = self.store.recent_progress(
+            session_id, limit=_PROGRESS_CARD_LIMIT
+        )
+        if not entries:
+            return
+        top_seq = entries[-1]["seq"]
+        if top_seq <= self.progress_card_seqs.get(session_id, 0):
+            return
+        body = "\n".join(f"- {entry['text']}" for entry in entries)
+        conversation_id = batch[0].conversation_id
+        try:
+            active = self.store.active_streaming_card(conversation_id)
+            if active:
+                biz_id, send_uuid = active
+                self.streaming_card_send_uuids.setdefault(biz_id, send_uuid)
+                await self._safe_update_streaming_card(biz_id, body, 2)
+            else:
+                await self._start_streaming_card(
+                    batch[0].contact, conversation_id, body, session_id
+                )
+            self.progress_card_seqs[session_id] = top_seq
+        except Exception as exc:
+            LOG.warning(
+                "progress card sync failed session=%s error=%s",
+                session_id,
+                sanitize_text(str(exc), 300),
+            )
 
     def _record_without_agent(
         self,
@@ -1393,9 +1490,11 @@ class AgentService:
             "contact_id": batch[0].contact.identity,
             "conversation_id": batch[0].conversation_id,
             "run_id": run_id,
+            # 合成输入（wake/面板指令）不是联系人消息，不得进入证据覆盖集。
             "message_times": {
                 item.message_id: item.created_at.isoformat()
                 for item in covered
+                if not _is_synthetic_message_id(item.message_id)
             },
         }
 
@@ -1431,17 +1530,21 @@ class AgentService:
         recent_context: Sequence[Mapping[str, str]],
     ) -> dict[str, Any]:
         contact = batch[0].contact
-        messages = [
-            {
-                "time": item.created_at.isoformat(),
-                "sender": item.contact.display_name,
-                "role": "contact",
-                "conversation_id": item.conversation_id,
-                "message_id": item.message_id,
-                "text": item.content,
-            }
-            for item in batch
-        ]
+        messages = []
+        for item in batch:
+            # 合成输入不进"联系人消息"清单：它在 prompt 的 <system_wake> 块里。
+            if _is_synthetic_message_id(item.message_id):
+                continue
+            messages.append(
+                {
+                    "time": item.created_at.isoformat(),
+                    "sender": item.contact.display_name,
+                    "role": "contact",
+                    "conversation_id": item.conversation_id,
+                    "message_id": item.message_id,
+                    "text": item.content,
+                }
+            )
         return {
             "self_name": self.settings.self_name,
             "agent_name": self.agent_runtime.profile_name(stage),
@@ -1545,6 +1648,16 @@ class AgentService:
                 recent_context,
             ),
         )
+        synthetic_inputs = [
+            (
+                "系统唤醒" if item.message_id.startswith("wake-") else "操作者指令",
+                item.content,
+            )
+            for item in batch
+            if _is_synthetic_message_id(item.message_id)
+        ]
+        if synthetic_inputs:
+            prompt += "\n\n" + _system_wake_block(synthetic_inputs)
         try:
             stage_profile = self.agent_runtime.resolve_stage(stage, agent_override)
             local_images = (
@@ -1584,13 +1697,24 @@ class AgentService:
                 )
             # 黑板运行随会话开启登记（front/worker 都登）；headline 先以
             # 请求摘要占位，report(progress) 会换成模型写的一句话进度。
+            # origin 标记输入来源：wake 合成轮记 synthetic，终态不反向
+            # 触发新 wake（回声切断）；面板指令轮按 live 记，其结果照常
+            # 传播给等待方。
             self.store.register_run(
                 session_id,
                 contact_id=batch[0].contact.identity,
                 stage=stage,
                 headline=self._request_preview(batch)[:80],
                 now=datetime.now(self.settings.timezone),
+                origin=(
+                    "synthetic"
+                    if any(
+                        item.message_id.startswith("wake-") for item in batch
+                    )
+                    else "live"
+                ),
             )
+            self.live_sessions[session_id] = session
         except WorktreeError as exc:
             shutil.rmtree(session_dir, ignore_errors=True)
             return AgentResult(
@@ -1633,12 +1757,14 @@ class AgentService:
             next_history_at = now_monotonic + interval
             known_ids = {item.message_id for item in batch}
             earliest = min(item.created_at for item in batch)
-            # 运行内不对外展示进度/思考：卡片要等非 silent 结果决定后才创建。
+            # 运行内不流式模型 delta：卡片只承载 report(progress) 的里程碑
+            # 全量列表（相1）；最终正文在投递时点整体覆盖（相2）。
             while not session.done:
                 self._touch_runtime(batch[0].conversation_id)
                 self.store.touch_run(
                     session_id, now=datetime.now(self.settings.timezone)
                 )
+                await self._sync_progress_card(batch, session_id)
                 remaining = (
                     deadline - asyncio.get_running_loop().time()
                     if deadline is not None
@@ -1828,6 +1954,8 @@ class AgentService:
             # 会话收尾兜底吊销租约（幂等）：成功/失败/静默路径同样不允许
             # 迟到的子进程写入；此前已按具体原因吊销时这里是 no-op。
             revoke_run_lease("run_finished")
+            self.live_sessions.pop(session_id, None)
+            self.progress_card_seqs.pop(session_id, None)
             await session.close()
             if session_dir_keep:
                 LOG.warning(
@@ -2101,6 +2229,14 @@ class AgentService:
         )
         if not content:
             raise ValueError("refusing to send an empty reply")
+        if batch[0].conversation_id.startswith("panel:"):
+            # 面板内部轮的回复只进 panel_replies，不进发送队列、不外发。
+            self.store.record_panel_reply(
+                session_id or batch[0].message_id,
+                content,
+                now=datetime.now(self.settings.timezone),
+            )
+            return "panel"
         self._set_runtime(batch, "sending")
         if self.mode == "shadow":
             LOG.info(
@@ -2245,6 +2381,235 @@ class AgentService:
                 sanitize_text(str(exc), 300),
             )
         return True
+
+    # ------------------------------------------------------------------
+    # 唤醒（§18 唤醒 2 条）：任务终态唤醒等待方 + waiting_on=@时刻到点唤醒。
+    # 循环只做三件事：扫时刻、排空终态事件、把到点 wake 合成输入进联系人
+    # 队列；合成轮复用 _handle_batch 全链，message_id 带 wake- 前缀标记。
+    # ------------------------------------------------------------------
+
+    async def _consume_wakes(self) -> None:
+        interval = float(
+            self.settings.raw.get(
+                "wake_interval_seconds", _WAKE_INTERVAL_SECONDS_DEFAULT
+            )
+        )
+        LOG.info("wake dispatcher ready interval=%ss", interval)
+        while not self.stop_event.is_set():
+            await asyncio.sleep(interval)
+            try:
+                now = datetime.now(self.settings.timezone)
+                self._scan_time_wakes(now)
+                self._drain_terminal_events(now)
+                for wake in self.store.due_wakes(now):
+                    self._dispatch_wake(wake, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("wake dispatcher iteration failed")
+
+    def _scan_time_wakes(self, now: datetime) -> None:
+        """扫 waiting_on=@时刻 的事项：到点（顺延入窗）唤醒主联系人。"""
+        for task in self.store.board_tasks(status="waiting"):
+            match = _TIME_WAITING_PATTERN.fullmatch(task["waiting_on"])
+            if not match:
+                continue
+            moment = _parse_waiting_moment(
+                match.group(1), self.settings.timezone
+            )
+            if moment is None:
+                continue
+            effective = _roll_into_wake_window(moment)
+            if now < effective:
+                continue
+            text = f"到点检查：{task['goal']}"
+            if self.store.wake_exists(task["id"], text):
+                continue
+            contact_ids = task["contact_ids"] or [task["contact_id"]]
+            self.store.enqueue_wake(
+                contact_ids[0],
+                text,
+                origin_task_id=task["id"],
+                due_at=now,
+                now=now,
+            )
+
+    def _drain_terminal_events(self, now: datetime) -> None:
+        """把任务终态事件换成等待方的 wake；synthetic 轮终态不再传（回声切断）。"""
+        for event in self.store.pending_terminal_events():
+            try:
+                if self.store.run_origin(str(event["run_id"])) == "synthetic":
+                    continue
+                verb = (
+                    "任务完成" if event["status"] == "completed" else "任务取消"
+                )
+                text = f"{verb}：{event['goal']}，结果见 board"
+                for waiter in self.store.tasks_waiting_on(
+                    f"task:{event['task_id']}"
+                ):
+                    for contact_id in waiter["contact_ids"] or [
+                        waiter["contact_id"]
+                    ]:
+                        self.store.enqueue_wake(
+                            contact_id,
+                            text,
+                            origin_task_id=str(event["task_id"]),
+                            due_at=now,
+                            now=now,
+                        )
+            finally:
+                self.store.mark_terminal_event_handled(int(event["id"]), now=now)
+
+    def _dispatch_wake(self, wake: Mapping[str, Any], now: datetime) -> None:
+        """把到点 wake 变成合成输入，进该联系人真实会话的队列。"""
+        wake_id = int(wake["id"])
+        if not self.store.consume_wake(wake_id, now=now):
+            return
+        contact = next(
+            (
+                item
+                for item in self.settings.contacts
+                if item.identity == str(wake["contact_id"])
+            ),
+            None,
+        )
+        if contact is None:
+            LOG.warning(
+                "wake dropped: contact not whitelisted contact=%s",
+                wake["contact_id"],
+            )
+            return
+        event = IncomingEvent(
+            event_id=f"wake-{wake_id}",
+            message_id=f"wake-{wake_id}",
+            conversation_id=(
+                self.store.latest_conversation_id(contact.identity)
+                or f"dm:{contact.identity}"
+            ),
+            contact=contact,
+            content=str(wake["text"]),
+            created_at=now,
+        )
+        self.store.claim_event(event)
+        self._enqueue(event)
+        LOG.info(
+            "wake dispatched contact=%s origin_task=%s",
+            contact.alias,
+            wake.get("origin_task_id") or "-",
+        )
+
+    # ------------------------------------------------------------------
+    # 操作者面板服务契约（§18 面板写2）：面板直调，钉死签名。
+    # 面板 steer = 操作者指令：不终止会话、不写 manual 记录、不冷却。
+    # ------------------------------------------------------------------
+
+    async def open_operator_session(
+        self, text: str, contact_alias: str | None
+    ) -> str:
+        """以操作者身份合成一轮输入，返回面板消息 id（panel-<uuid>）。
+
+        无 contact：contact_id 用 'operator' 的内部轮，回复只落
+        panel_replies 不外发；有 contact：进该联系人真实会话队列走全链路。
+        """
+        now = datetime.now(self.settings.timezone)
+        panel_id = f"panel-{uuid.uuid4().hex[:12]}"
+        contact = None
+        if contact_alias:
+            contact = next(
+                (
+                    item
+                    for item in self.settings.contacts
+                    if item.alias == contact_alias
+                ),
+                None,
+            )
+            if contact is None:
+                raise ValueError(f"unknown contact alias: {contact_alias}")
+        if contact is None:
+            contact = Contact(
+                alias="operator",
+                display_name=self.settings.self_name,
+                user_id="",
+                open_dingtalk_id=self.settings.self_open_id,
+            )
+            conversation_id = f"panel:{panel_id}"
+        else:
+            conversation_id = (
+                self.store.latest_conversation_id(contact.identity)
+                or f"dm:{contact.identity}"
+            )
+        event = IncomingEvent(
+            event_id=panel_id,
+            message_id=panel_id,
+            conversation_id=conversation_id,
+            contact=contact,
+            content=text,
+            created_at=now,
+        )
+        self.store.claim_event(event)
+        self._enqueue(event)
+        return panel_id
+
+    async def steer_run(self, session_id: str, text: str) -> bool:
+        """给在跑会话注入操作者指令；会话不在跑返回 False。绝不写 manual。"""
+        session = self.live_sessions.get(session_id)
+        if session is None or getattr(session, "done", True):
+            return False
+        return bool(
+            await session.steer(_system_wake_block([("操作者指令", text)]))
+        )
+
+    async def answer_task(self, task_id: int | str, answer: str) -> bool:
+        """给 waiting_on=本人名字 的任务作答：落 human 事实、恢复 open、唤醒联系人。"""
+        answer = sanitize_text(answer, 2000).strip()
+        if not answer:
+            return False
+        now = datetime.now(self.settings.timezone)
+        resolved = self.store.answer_waiting_task(
+            str(task_id), self.settings.self_name, answer, now=now
+        )
+        if not resolved.get("ok"):
+            return False
+        task = resolved["task"]
+        text = f"操作者已答复：{answer}"
+        for contact_id in task["contact_ids"] or [task["contact_id"]]:
+            self.store.enqueue_wake(
+                contact_id,
+                text,
+                origin_task_id=str(task["id"]),
+                due_at=now,
+                now=now,
+            )
+        return True
+
+    def board_snapshot(self) -> dict[str, Any]:
+        """黑板投影快照：在跑会话（含里程碑）、任务、等我裁决、近 24h 完成、
+        面板内部轮回复。"""
+        now = datetime.now(self.settings.timezone)
+        runs = []
+        for run in self.store.active_runs():
+            entry = dict(run)
+            entry["recent_progress"] = self.store.recent_progress(
+                entry["session_id"], limit=5
+            )
+            runs.append(entry)
+        day_ago = now - timedelta(hours=24)
+        recent_done = []
+        for task in self.store.board_tasks(status="completed", limit=50):
+            with suppress(ValueError):
+                if datetime.fromisoformat(task["updated_at"]) >= day_ago:
+                    recent_done.append(task)
+        return {
+            "runs": runs,
+            "tasks": self.store.board_tasks(include_done=False),
+            "waiting_operator": [
+                task
+                for task in self.store.board_tasks(status="waiting")
+                if task["waiting_on"] == self.settings.self_name
+            ],
+            "recent_done": recent_done,
+            "panel_replies": self.store.recent_panel_replies(limit=20),
+        }
 
 
 def _validate_configuration(settings: Settings) -> list[str]:
