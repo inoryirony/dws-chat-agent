@@ -3748,6 +3748,8 @@ class SteerContextRefreshTests(unittest.TestCase):
             )
             fake_session_holder: dict[str, _SteerableFakeSession] = {}
             service.runtime_states = {}
+            service.live_sessions = {}
+            service.progress_card_seqs = {}
             service._write_runtime = Mock()
             service.agent_runtime = SimpleNamespace(
                 profile_name=Mock(return_value="pi-worker"),
