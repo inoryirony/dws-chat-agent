@@ -720,7 +720,7 @@ class OperatorPanelTests(unittest.TestCase):
                 ["已完成事项"],
             )
             goals = {task["goal"] for task in snapshot["tasks"]}
-            self.assertEqual(goals, {"等我拍板", "等对方"})
+            self.assertEqual(goals, {"等我拍板", "等对方", "已完成事项"})
             service.store.close()
 
 

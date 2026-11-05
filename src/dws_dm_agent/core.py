@@ -1786,6 +1786,19 @@ class AuditStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def recent_failed_runs(self, *, since: datetime) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM board_runs
+            WHERE outcome IN ('failed', 'error', 'timeout', 'manual_takeover')
+              AND ended_at IS NOT NULL AND ended_at >= ?
+            ORDER BY ended_at DESC
+            LIMIT 20
+            """,
+            (since.isoformat(),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def add_progress(self, session_id: str, text: str, *, now: datetime) -> int:
         """给运行追加一条流水；seq 在会话内自增，仅给人看不触发通知。"""
         clean = sanitize_text(text, 2000)
