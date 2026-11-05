@@ -326,6 +326,7 @@ class AgentService:
                 ],
             ),
             contact_search=self._search_dingtalk_contacts,
+            service=self,
         )
     def close(self) -> None:
         self.dashboard.stop()
@@ -2601,7 +2602,8 @@ class AgentService:
                     recent_done.append(task)
         return {
             "runs": runs,
-            "tasks": self.store.board_tasks(include_done=False),
+            "tasks": self.store.board_tasks(include_done=True),
+            "recent_failed": self.store.recent_failed_runs(since=day_ago),
             "waiting_operator": [
                 task
                 for task in self.store.board_tasks(status="waiting")
