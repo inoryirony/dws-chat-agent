@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -57,6 +59,23 @@ _AUTO_FIELDS = {
 _ACK_VARIABLES = frozenset(
     {"request_count", "contact_name", "contact_alias", "self_name"}
 )
+_BOARD_STEER_PATH = re.compile(r"^/api/run/([A-Za-z0-9._:-]{1,128})/steer$")
+_BOARD_TEXT_LIMIT = 12000
+
+
+class _BoardTargetMissing(LookupError):
+    pass
+
+
+def _board_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("请输入内容")
+    text = value.strip()
+    if len(text) > _BOARD_TEXT_LIMIT:
+        raise ValueError(f"内容超过 {_BOARD_TEXT_LIMIT} 字上限")
+    if any(ord(char) < 32 and char not in "\n\t" for char in text):
+        raise ValueError("内容包含非法控制字符")
+    return text
 
 
 class AgentConfigStore:
@@ -502,6 +521,7 @@ class DashboardServer:
         port: int = 8765,
         config_store: AgentConfigStore | None = None,
         contact_search: Callable[[str], list[dict[str, Any]]] | None = None,
+        service: Any = None,
     ) -> None:
         self.database = database.resolve()
         self.runtime_state = runtime_state.resolve()
@@ -519,6 +539,8 @@ class DashboardServer:
         self.port = port
         self.config_store = config_store
         self.contact_search = contact_search
+        self.service = service
+        self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.server: LocalThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -526,7 +548,28 @@ class DashboardServer:
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    def board_service(self) -> Any | None:
+        """Resolve the AgentService backing the board endpoints.
+
+        service.py 构造本对象时未传 service；contact_search / on_apply 是
+        AgentService 的绑定方法，从 __self__ 运行时找回，直到 service.py
+        显式接线为止。显式注入（测试/未来接线）永远优先。
+        """
+        if self.service is not None:
+            return self.service
+        for probe in (self.contact_search, getattr(self.config_store, "on_apply", None)):
+            candidate = getattr(probe, "__self__", None)
+            if candidate is not None and hasattr(candidate, "board_snapshot"):
+                return candidate
+        return None
+
     def start(self) -> None:
+        try:
+            # 生产路径在 AgentService.run() 协程内启动，这里拿到的是服务事件循环，
+            # 看板写回经 run_coroutine_threadsafe 排回该循环。
+            self.asyncio_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.asyncio_loop = None
         dashboard = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -613,6 +656,18 @@ class DashboardServer:
                     ).encode("utf-8")
                     self._send(payload, "application/json; charset=utf-8")
                     return
+                if path == "/api/board":
+                    service = dashboard.board_service()
+                    if service is None:
+                        self._send_json({"error": "黑板服务未接入"}, status=503)
+                        return
+                    try:
+                        payload_obj = service.board_snapshot()
+                    except Exception as exc:
+                        self._send_json({"error": f"读取黑板失败：{exc}"}, status=500)
+                        return
+                    self._send_json(payload_obj)
+                    return
                 if path == "/api/config" and dashboard.config_store is not None:
                     try:
                         payload = json.dumps(
@@ -646,15 +701,34 @@ class DashboardServer:
 
             def do_POST(self) -> None:
                 path = self.path.split("?", 1)[0]
-                if path != "/api/config" or dashboard.config_store is None:
-                    self.send_error(404)
+                if path == "/api/config":
+                    if dashboard.config_store is None:
+                        self.send_error(404)
+                        return
+                    self._handle_config_post()
                     return
+                if path == "/api/session/new":
+                    self._handle_open_session()
+                    return
+                steer_match = _BOARD_STEER_PATH.match(path)
+                if steer_match:
+                    self._handle_steer(steer_match.group(1))
+                    return
+                if path == "/api/task/answer":
+                    self._handle_answer()
+                    return
+                self.send_error(404)
+
+            def _origin_allowed(self) -> bool:
                 origin = self.headers.get("Origin")
                 allowed_origins = {
                     dashboard.url,
                     f"http://localhost:{dashboard.port}",
                 }
-                if origin and origin not in allowed_origins:
+                return not origin or origin in allowed_origins
+
+            def _handle_config_post(self) -> None:
+                if not self._origin_allowed():
                     self._send_json({"error": "不允许的请求来源"}, status=403)
                     return
                 try:
@@ -682,6 +756,97 @@ class DashboardServer:
                     self._send_json({"error": f"保存配置失败：{exc}"}, status=500)
                     return
                 self._send_json(saved)
+
+            def _read_json_object(self, *, limit: int = 200_000) -> Mapping[str, Any]:
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                if length <= 0 or length > limit:
+                    raise ValueError("请求内容为空或超过大小限制")
+                value = json.loads(self.rfile.read(length))
+                if not isinstance(value, Mapping):
+                    raise ValueError("请求必须是 JSON object")
+                return value
+
+            def _resolve_maybe_coroutine(self, value: Any) -> Any:
+                if not inspect.iscoroutine(value):
+                    return value
+                loop = dashboard.asyncio_loop
+                if loop is not None:
+                    return asyncio.run_coroutine_threadsafe(
+                        value, loop
+                    ).result(timeout=60)
+                return asyncio.run(value)
+
+            def _board_write(
+                self, invoke: Callable[[Any, Mapping[str, Any]], Any]
+            ) -> None:
+                if not self._origin_allowed():
+                    self._send_json({"error": "不允许的请求来源"}, status=403)
+                    return
+                service = dashboard.board_service()
+                if service is None:
+                    self._send_json({"error": "黑板服务未接入"}, status=503)
+                    return
+                try:
+                    body = self._read_json_object()
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    self._send_json({"error": str(exc)}, status=400)
+                    return
+                try:
+                    result = self._resolve_maybe_coroutine(invoke(service, body))
+                except _BoardTargetMissing as exc:
+                    self._send_json({"error": str(exc)}, status=404)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=400)
+                    return
+                except Exception as exc:
+                    self._send_json({"error": f"写入失败：{exc}"}, status=500)
+                    return
+                self._send_json(result)
+
+            def _handle_open_session(self) -> None:
+                def invoke(service: Any, body: Mapping[str, Any]) -> dict[str, Any]:
+                    text = _board_text(body.get("text"))
+                    raw_alias = body.get("contact_alias", body.get("contact"))
+                    alias: str | None = None
+                    if raw_alias is not None:
+                        if not isinstance(raw_alias, str):
+                            raise ValueError("联系人无效")
+                        alias = raw_alias.strip() or None
+                        if alias and (len(alias) > 200 or "\n" in alias):
+                            raise ValueError("联系人无效")
+                    session_id = service.open_operator_session(text, alias)
+                    return {"sessionId": self._resolve_maybe_coroutine(session_id)}
+
+                self._board_write(invoke)
+
+            def _handle_steer(self, session_id: str) -> None:
+                def invoke(service: Any, body: Mapping[str, Any]) -> dict[str, Any]:
+                    steered = service.steer_run(
+                        session_id, _board_text(body.get("text"))
+                    )
+                    if self._resolve_maybe_coroutine(steered) is False:
+                        raise _BoardTargetMissing("会话不在可介入状态")
+                    return {"ok": True}
+
+                self._board_write(invoke)
+
+            def _handle_answer(self) -> None:
+                def invoke(service: Any, body: Mapping[str, Any]) -> dict[str, Any]:
+                    task_id = body.get("task_id")
+                    if isinstance(task_id, bool) or not isinstance(task_id, (str, int)):
+                        raise ValueError("事项无效")
+                    answered = service.answer_task(
+                        task_id, _board_text(body.get("answer"))
+                    )
+                    if self._resolve_maybe_coroutine(answered) is False:
+                        raise _BoardTargetMissing("该事项已不在等待")
+                    return {"ok": True}
+
+                self._board_write(invoke)
 
             def _send_json(self, value: Mapping[str, Any], status: int = 200) -> None:
                 self._send(
