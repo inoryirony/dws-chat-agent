@@ -4,11 +4,15 @@
  *     terminate 结束本轮；真正的 silent 结果由服务在 tool_execution_end 捕获。
  *   - task_record / task_lookup：事项记忆读写，按次拉起 task_tools.py
  *     （复用审计 SQLite），作用域与运行信息经 DWS_TASK_CONTEXT 注入。
+ *   - report(progress|final|blocked)：progress 落进度流水不结束会话；
+ *     final/blocked 把正文写入 DWS_REPORT_FILE 并 terminate，runtime 在
+ *     tool_execution_end 读文件收口（与 no_reply 的 silent 同一通路）。
  */
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
 
 /** 单次 task 工具调用的兜底超时（毫秒），避免 SQLite 挂起拖住整轮。 */
 const TASK_TOOL_TIMEOUT_MS = 20_000;
@@ -127,6 +131,28 @@ const taskRecord = defineTool({
 						"ids are rejected",
 				}),
 			),
+			resources: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+						"Resource tags this task touches (e.g. \"repo:lucid\", " +
+						"\"tool:lxs-report\"); replaces the whole list",
+				}),
+			),
+			facts: Type.Optional(
+				Type.Array(
+					Type.Object({
+						text: Type.String({
+							description: "Durable fact worth remembering across runs",
+						}),
+						anchor_message_id: Type.String({
+							description:
+								"Id of the covered message this fact is anchored " +
+								"to; unknown ids are rejected",
+						}),
+					}),
+					{ description: "Append-only task facts (long-term memory)" },
+				),
+			),
 			expected_version: Type.Optional(
 				Type.Integer({
 					description: "Current version of the task; required for updates",
@@ -151,13 +177,20 @@ const taskRecord = defineTool({
 
 const taskLookup = defineTool({
 	name: "task_lookup",
-	label: "Lookup tasks",
+	label: "Read the board",
 	description:
-		"Look up tasks in the current contact scope, active by default or " +
-		"archived with include_archived=true. Looking up does not extend a " +
-		"task's lifetime and never revives an archived task.",
+		"Read the task board across contacts: open/waiting tasks by default, " +
+		"completed/cancelled with include_done=true (for later follow-ups). " +
+		"Filter by a contact_id from a previous result to see one contact's " +
+		"tasks. Each task carries its latest facts; looking up does not " +
+		"extend a task's lifetime.",
 	parameters: Type.Object(
 		{
+			contact: Type.Optional(
+				Type.String({
+					description: "Only tasks touched by this contact_id",
+				}),
+			),
 			status: Type.Optional(
 				Type.Union([
 					Type.Literal("open"),
@@ -166,7 +199,12 @@ const taskLookup = defineTool({
 					Type.Literal("cancelled"),
 				]),
 			),
-			include_archived: Type.Optional(Type.Boolean()),
+			include_done: Type.Optional(
+				Type.Boolean({
+					description:
+						"Include completed/cancelled tasks; default false",
+				}),
+			),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
 		},
 		{ additionalProperties: false },
@@ -182,8 +220,69 @@ const taskLookup = defineTool({
 	},
 });
 
+const report = defineTool({
+	name: "report",
+	label: "Report progress or finish",
+	description:
+		"kind=progress: report a short milestone (one line, human-readable); " +
+		"the run continues. kind=final: deliver text as the final answer to " +
+		"the contact and end the run. kind=blocked: deliver text and end the " +
+		"run as blocked (cannot proceed without something external). " +
+		"After final/blocked the run ends immediately; write nothing else.",
+	parameters: Type.Object(
+		{
+			kind: Type.Union([
+				Type.Literal("progress"),
+				Type.Literal("final"),
+				Type.Literal("blocked"),
+			]),
+			text: Type.String({
+				description:
+					"progress: one-line milestone; final/blocked: the message " +
+					"the contact will receive",
+			}),
+		},
+		{ additionalProperties: false },
+	),
+	async execute(toolCallId: string, params: Record<string, unknown>) {
+		const kind = String(params.kind || "");
+		const text = String(params.text || "").trim();
+		if (!text) {
+			return textResult({ ok: false, error: "report_text_required" });
+		}
+		if (kind === "progress") {
+			return textResult(
+				await callTaskTool({
+					tool: "report",
+					tool_call_id: toolCallId,
+					args: { kind, text },
+				}),
+			);
+		}
+		const reportFile = process.env.DWS_REPORT_FILE;
+		if (!reportFile) {
+			throw new Error("dws report tool is not configured for this session");
+		}
+		writeFileSync(reportFile, JSON.stringify({ kind, text }), "utf-8");
+		return {
+			content: [
+				{
+					type: "text" as const,
+					text:
+						kind === "final"
+							? "最终正文已登记，本次运行结束。"
+							: "已登记阻塞说明，本次运行结束。",
+				},
+			],
+			details: {},
+			terminate: true,
+		};
+	},
+});
+
 export default function (pi: ExtensionAPI) {
 	pi.registerTool(noReply);
 	pi.registerTool(taskRecord);
 	pi.registerTool(taskLookup);
+	pi.registerTool(report);
 }

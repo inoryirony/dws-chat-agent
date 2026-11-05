@@ -1875,6 +1875,30 @@ class WorkerFallbackTests(unittest.TestCase):
         self.assertTrue(result.manual_takeover)
         self.assertEqual(calls, [None])
 
+    def test_worker_does_not_fallback_on_fatal_worktree_failure(self) -> None:
+        # worktree 隔离建立失败时整场 failed：fallback 会在未隔离的主仓上
+        # 重试同一段写操作，必须被拦下。
+        service = self._service_with_chain(("backup-a",))
+        calls: list[str | None] = []
+
+        async def fake_run_agent(batch, prior_attempt, *, recent_context=(),
+                                 agent_override=None):
+            calls.append(agent_override)
+            return AgentResult(
+                "session", None, None,
+                datetime.now(TZ), datetime.now(TZ),
+                error="WorktreeError: git worktree add failed",
+                fatal=True,
+            )
+
+        with patch.object(AgentService, "_run_agent", side_effect=fake_run_agent):
+            result = asyncio.run(
+                service._run_worker_with_fallback([self._event()], "")
+            )
+
+        self.assertTrue(result.fatal)
+        self.assertEqual(calls, [None])
+
 
 
 class TaskMemoryStoreTests(unittest.TestCase):
@@ -3635,6 +3659,7 @@ class _SteerableFakeSession:
         self.silent = False
         self.error = ""
         self.escalated = False
+        self.blocked = False
         self.exit_code = 0
         self.steer_prompts: list[str] = []
 

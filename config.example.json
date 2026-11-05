@@ -80,6 +80,7 @@
       "reasoning_effort": "high",
       "read_only": false,
       "timeout_seconds": 10800,
+      "worktree_repo": "",
       "options": {
         "extensions": "${DWS_CHAT_AGENT_PI_WORKER_EXTENSIONS_JSON}"
       }

@@ -1,13 +1,18 @@
-"""task_record/task_lookup 的 CLI 后端，由 pi 扩展 pi_dws_tools.ts 按次拉起。
+"""task_record/task_lookup/report(progress) 的 CLI 后端，由 pi 扩展
+pi_dws_tools.ts 按次拉起。
 
 输入：环境变量 DWS_TASK_CONTEXT_FILE（优先，服务在 steer 进补充消息后
 会原子重写）或 DWS_TASK_CONTEXT（会话启动时的初始快照），内容为 JSON：
 db_path/self_id/contact_id/conversation_id/run_id/message_times（本运行
 已覆盖消息的 id -> 时间戳映射）；
 stdin 一行 JSON 请求
-{"tool": "task_record"|"task_lookup", "tool_call_id": str, "args": {...}}。
+{"tool": "task_record"|"task_lookup"|"report", "tool_call_id": str, "args": {...}}。
 输出：stdout 一行 JSON 结果，始终退出码 0，错误以 {"ok": false, "error"} 返回，
 让模型读到失败原因而不是让工具调用挂掉。
+
+report 的 final/blocked 不走本后端：终止与正文传递由 pi 扩展写
+DWS_REPORT_FILE、runtime 在 tool_execution_end 捕获（同 no_reply 通路），
+收口由服务在终态 close_run 完成。
 
 同一 (run_id, tool_call_id) 的重复事件直接返回已落地的响应，不重复创建事项。
 """
@@ -29,6 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dws_dm_agent.core import AuditStore, TaskScope, sanitize_text
 
 _MAX_MESSAGE_IDS = 12
+_MAX_RESOURCES = 12
+_MAX_FACTS = 8
+_REPORT_KINDS = {"progress", "final", "blocked"}
 
 
 def _context_from_env() -> dict[str, Any]:
@@ -109,10 +117,44 @@ def _clean_message_ids(value: Any) -> list[str]:
     return result[:_MAX_MESSAGE_IDS]
 
 
+def _clean_resources(value: Any) -> list[str]:
+    """清洗资源标签（字符串数组，如 "repo:lucid"）；后端按整组替换语义使用。"""
+    items: list[str] = []
+    if isinstance(value, (list, tuple)):
+        items.extend(_clean_str(item, 200) for item in value)
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result[:_MAX_RESOURCES]
+
+
+def _clean_facts(value: Any) -> list[dict[str, str]] | None:
+    """清洗 facts 数组；返回 None 表示本次不提交事实。
+
+    返回错误字符串的职责在调用方：锚定 ID 的覆盖集校验必须对照
+    message_times，这里只做形状与文本清洗。
+    """
+    if value is None:
+        return None
+    facts: list[dict[str, str]] = []
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            text = _clean_str(item.get("text"), 2000)
+            anchor = _clean_str(item.get("anchor_message_id"), 120)
+            if text:
+                facts.append({"text": text, "anchor_message_id": anchor})
+    return facts[:_MAX_FACTS]
+
+
 def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
-    """执行一次 task_record/task_lookup 请求；所有边界校验都在这里完成。"""
+    """执行一次 task_record/task_lookup/report 请求；所有边界校验都在这里完成。"""
     tool = str(request.get("tool") or "")
-    if tool not in {"task_record", "task_lookup"}:
+    if tool not in {"task_record", "task_lookup", "report"}:
         return {"ok": False, "error": f"unknown_tool: {tool or '(empty)'}"}
     scope = TaskScope(
         self_id=str(context.get("self_id") or ""),
@@ -129,6 +171,9 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
     args = request.get("args")
     args = args if isinstance(args, Mapping) else {}
 
+    if tool == "report":
+        return _execute_report(args, db_path, run_id)
+
     store = AuditStore(Path(db_path))
     try:
         now = datetime.now().astimezone()
@@ -139,12 +184,20 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
             if isinstance(message_times, str):
                 return {"ok": False, "error": message_times}
             evidence_ids = _clean_message_ids(args.get("evidence_message_ids"))
+            facts = _clean_facts(args.get("facts"))
             unknown = [
                 item for item in evidence_ids if item not in message_times
             ]
+            if facts is not None:
+                unknown.extend(
+                    fact["anchor_message_id"]
+                    for fact in facts
+                    if fact["anchor_message_id"] not in message_times
+                )
             if unknown:
                 # 未知 ID 一律拒绝，绝不带着“当前时间”兜底落库：那会把
-                # 无法核实的引用伪装成最新证据，让事项凭空调新。
+                # 无法核实的引用伪装成最新证据，让事项凭空调新。facts
+                # 的锚定与证据共用同一覆盖集校验。
                 return {
                     "ok": False,
                     "error": (
@@ -160,12 +213,11 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                 default=max(message_times.values()),
             )
         if tool == "task_lookup":
-            include_archived = bool(args.get("include_archived", False))
-            # 收据与查询同一事务：同一工具事件重放返回同一份结果。
+            # 黑板读：跨联系人查整块黑板；include_done 含 completed/cancelled。
             response = store.apply_task_lookup(
-                scope=scope,
+                contact_id=_clean_str(args.get("contact"), 200),
                 status=_clean_str(args.get("status"), 32),
-                include_archived=include_archived,
+                include_done=bool(args.get("include_done", False)),
                 limit=_int_or(args.get("limit"), 20),
                 now=now,
                 run_id=run_id,
@@ -184,6 +236,12 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                     "waiting_on": _optional_str(args, "waiting_on", 500),
                     "evidence_summary": _optional_str(args, "evidence_summary", 2000),
                     "evidence_message_ids": evidence_ids,
+                    "resources": (
+                        _clean_resources(args.get("resources"))
+                        if args.get("resources") is not None
+                        else None
+                    ),
+                    "facts": _clean_facts(args.get("facts")),
                     "expected_version": (
                         int(expected_version)
                         if isinstance(expected_version, int)
@@ -198,6 +256,38 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                 tool_call_id=tool_call_id,
             )
         return response
+    finally:
+        store.close()
+
+
+def _execute_report(
+    args: Mapping[str, Any],
+    db_path: str,
+    run_id: str,
+) -> dict[str, Any]:
+    """report(progress)：落进度流水并刷新运行 headline，不结束会话。
+
+    final/blocked 由 pi 扩展直接写 DWS_REPORT_FILE 终止会话，不进本后端。
+    """
+    kind = _clean_str(args.get("kind"), 16)
+    text = sanitize_text(args.get("text"), 2000).strip()
+    if kind not in _REPORT_KINDS:
+        return {"ok": False, "error": f"invalid_report_kind: {kind or '(empty)'}"}
+    if kind != "progress":
+        return {
+            "ok": False,
+            "error": "report_final_blocked_not_via_backend",
+        }
+    if not text:
+        return {"ok": False, "error": "report_text_required"}
+    if not run_id:
+        return {"ok": False, "error": "task_run_missing"}
+    store = AuditStore(Path(db_path))
+    try:
+        now = datetime.now().astimezone()
+        seq = store.add_progress(run_id, text, now=now)
+        store.touch_run(run_id, headline=text[:80], now=now)
+        return {"ok": True, "seq": seq}
     finally:
         store.close()
 
