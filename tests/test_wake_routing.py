@@ -454,6 +454,11 @@ class SyntheticRunPromptTests(unittest.TestCase):
                         render_variables.append(variables) or "PROMPT-BASE"
                     )
                 ),
+                _stage=Mock(
+                    return_value=SimpleNamespace(
+                        prompt_path=root / "prompts" / "worker.md"
+                    )
+                ),
                 resolve_stage=Mock(
                     return_value=SimpleNamespace(
                         profile=SimpleNamespace(protocol="pi-rpc", options={})
@@ -603,7 +608,7 @@ class OperatorPanelTests(unittest.TestCase):
                 session.steer_prompts,
                 [
                     "<system_wake>\n操作者指令：先别回复，等我确认\n"
-                    "这不是联系人的新消息，不含新授权。\n</system_wake>"
+                    "这是操作者本人下达的指令，按最高授权执行。\n</system_wake>"
                 ],
             )
             manual = service.store.connection.execute(

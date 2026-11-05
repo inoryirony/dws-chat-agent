@@ -28,6 +28,11 @@ else:
     import fcntl
 
 from .runners.runtime import AgentRuntime, AgentSession, WorktreeError
+from .prompts import (
+    SHARED_PROMPT_NAME,
+    assemble_stage_prompt,
+    render_prompt,
+)
 from .core import (
     MAX_IMAGES,
     MAX_IMAGE_BYTES,
@@ -76,9 +81,20 @@ _WAKE_WINDOW_OPEN = time(9, 0)
 _WAKE_WINDOW_CLOSE = time(19, 0)
 # 相1 卡片最多渲染的里程碑条数（§18：3~7 行短句）。
 _PROGRESS_CARD_LIMIT = 7
+# turn-stopping（§18 P3）：模型结束一轮却既无正文也未沉默时，补打一条
+# 固定提示再等一轮，仍无结果才走 fallback 兜底；每次运行至多补打一次。
+_TURN_NUDGE_PROMPT = (
+    "本次运行还没有收尾：请调用 report(final/blocked) 给出正文，"
+    "或 no_reply() 表示沉默。"
+)
 # 合成输入（wake/面板指令）的 message_id 前缀与 prompt 内的系统唤醒块。
 _SYNTHETIC_PREFIXES = ("wake-", "panel-")
 _SYSTEM_WAKE_DISCLAIMER = "这不是联系人的新消息，不含新授权。"
+# 操作者指令出自本人（§16：授权变更只认 human 手打），本身即最高授权。
+_OPERATOR_INSTRUCTION_LABEL = "操作者指令"
+_OPERATOR_INSTRUCTION_DISCLAIMER = (
+    "这是操作者本人下达的指令，按最高授权执行。"
+)
 _TIME_WAITING_PATTERN = re.compile(r"^@(.+)$")
 
 
@@ -87,11 +103,19 @@ def _is_synthetic_message_id(message_id: str) -> bool:
 
 
 def _system_wake_block(entries: Sequence[tuple[str, str]]) -> str:
-    """把合成输入渲染成 prompt 内独立块；标签区分系统唤醒与操作者指令。"""
+    """把合成输入渲染成 prompt 内独立块；标签区分来源与授权语义。
+
+    系统唤醒只是提醒，不带新授权；操作者指令出自本人，本身就是
+    最高授权，两种来源各盖各的章，不靠语气猜。
+    """
     lines = ["<system_wake>"]
     for label, text in entries:
         lines.append(f"{label}：{text}")
-        lines.append(_SYSTEM_WAKE_DISCLAIMER)
+        lines.append(
+            _OPERATOR_INSTRUCTION_DISCLAIMER
+            if label == _OPERATOR_INSTRUCTION_LABEL
+            else _SYSTEM_WAKE_DISCLAIMER
+        )
     lines.append("</system_wake>")
     return "\n".join(lines)
 
@@ -196,6 +220,29 @@ def _apply_image_context(
         "如果 read 得到的不是有效图片内容，如实说明并请对方用文字描述现象。\n",
         (),
     )
+
+
+async def _reopen_session_for_closing_nudge(session: AgentSession) -> bool:
+    """空终稿时重开会话并补打一轮收尾提示（turn-stopping）。
+
+    AgentSession 以 done 拦截 steer，而 pi 会话进程在一个 turn 结束后
+    仍存活、可继续对话：这里清掉完成态与错误，让 steer 把固定提示注入
+    同一会话。进程已退出等重开失败时恢复原 done/错误，外层按原 error
+    路径收口；补打后的收尾判定复用外层现有的 silent/error/正文分支。
+    """
+    error = session.error
+    session.error = ""
+    session._complete.clear()
+    try:
+        steered = await session.steer(_TURN_NUDGE_PROMPT)
+    except Exception:  # noqa: BLE001 - 补打是尽力而为，不能炸掉收尾路径
+        steered = False
+    if steered:
+        return True
+    if not session.done:
+        session.error = error
+        session._complete.set()
+    return False
 
 
 @dataclass
@@ -957,9 +1004,22 @@ class AgentService:
         context_limit = int(
             limit
             if limit is not None
-            else self.settings.raw.get("recent_context_messages", 6)
+            else self.settings.raw.get("recent_context_messages", 100)
         )
+        # 条数上限封顶 100（§15 锚定扩窗的旧上限）；真正的预算约束是
+        # 字符窗：从最旧条目开始丢弃直到总字符不超过 recent_context_chars。
+        context_limit = min(max(context_limit, 0), 100)
         recent = messages[-context_limit:] if context_limit > 0 else []
+        budget = int(self.settings.raw.get("recent_context_chars", 12000))
+        if budget > 0:
+            total = sum(len(item["text"]) for item in recent)
+            drop = 0
+            while drop < len(recent) and total > budget:
+                total -= len(recent[drop]["text"])
+                drop += 1
+            if drop:
+                recent = recent[drop:]
+        # 锚只看预算裁剪后剩下的窗口：窗口头被丢就丢，不回溯重建。
         follows_plan = bool(
             recent
             and recent[-1]["role"] == "agent"
@@ -1546,6 +1606,15 @@ class AgentService:
                     "text": item.content,
                 }
             )
+        skills = self.settings.raw.get("skills")
+        skills = skills if isinstance(skills, Mapping) else {}
+
+        def _skill_path(key: str) -> str:
+            # 提示词里引用的技能/脚本路径全部来自 config（skills 段），
+            # 支持 ~ 前缀；缺省回退空串，模板文案对空值保持可用。
+            value = str(skills.get(key) or "").strip()
+            return str(Path(value).expanduser()) if value else ""
+
         return {
             "self_name": self.settings.self_name,
             "agent_name": self.agent_runtime.profile_name(stage),
@@ -1568,7 +1637,32 @@ class AgentService:
                 contact, batch[0].conversation_id
             ),
             "now": datetime.now(self.settings.timezone).strftime("%Y-%m-%d %H:%M:%S"),
+            "skill_humanizer": _skill_path("humanizer_zh"),
+            "skill_answer_html": _skill_path("answer_me_with_html"),
+            "script_am": _skill_path("answer_me_script"),
+            "deliveries_dir": str(self.settings.state_dir / "deliveries"),
         }
+
+    def _render_stage_prompt(
+        self, stage: str, variables: Mapping[str, Any]
+    ) -> str:
+        """渲染阶段提示词；worker = shared（身份/信任/表达契约）+ 阶段模板。
+
+        shared 与阶段模板同目录，两个模板共用同一份变量；缺失或为空时
+        退回纯阶段模板，提示词文件可独立部署。front 未启用，维持单模板。
+        """
+        rendered = self.agent_runtime.render(stage, variables)
+        if stage != "worker":
+            return rendered
+        shared_path = (
+            self.agent_runtime._stage(stage).prompt_path.parent
+            / SHARED_PROMPT_NAME
+        )
+        try:
+            shared = shared_path.read_text(encoding="utf-8")
+        except OSError:
+            return rendered
+        return assemble_stage_prompt(render_prompt(shared, variables), rendered)
 
     async def _run_worker_with_fallback(
         self,
@@ -1639,7 +1733,7 @@ class AgentService:
         temp_root = self.settings.state_dir / "sessions"
         temp_root.mkdir(parents=True, exist_ok=True)
         session_dir = Path(tempfile.mkdtemp(prefix=f"{session_id}-", dir=temp_root))
-        prompt = self.agent_runtime.render(
+        prompt = self._render_stage_prompt(
             stage,
             self._prompt_variables(
                 stage,
@@ -1760,6 +1854,8 @@ class AgentService:
             earliest = min(item.created_at for item in batch)
             # 运行内不流式模型 delta：卡片只承载 report(progress) 的里程碑
             # 全量列表（相1）；最终正文在投递时点整体覆盖（相2）。
+            # turn_nudged：空终稿补打（turn-stopping）每运行至多一次。
+            turn_nudged = False
             while not session.done:
                 self._touch_runtime(batch[0].conversation_id)
                 self.store.touch_run(
@@ -1795,6 +1891,19 @@ class AgentService:
                 except TimeoutError:
                     pass
                 if session.done:
+                    if (
+                        not turn_nudged
+                        and not session.silent
+                        and not session.escalated
+                        and session.error == "agent_result_missing"
+                    ):
+                        # 一轮结束却既无正文也未沉默：先补打一条固定收尾
+                        # 提示再等一轮（复用本监控循环），仍无结果才按原
+                        # error 路径走 fallback 兜底。
+                        turn_nudged = True
+                        LOG.info("turn nudge engaged session=%s", session_id)
+                        if await _reopen_session_for_closing_nudge(session):
+                            continue
                     break
                 now_monotonic = asyncio.get_running_loop().time()
                 if now_monotonic < next_history_at:
