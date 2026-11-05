@@ -31,6 +31,9 @@ BOARD_RUN_OUTCOME_STATUS = {
     "escalate": "done",
     "blocked": "waiting",
     "error": "failed",
+    "failed": "failed",
+    "timeout": "failed",
+    "manual_takeover": "aborted",
     "aborted": "aborted",
 }
 FACT_SOURCES = ("human", "agent", "contact")
@@ -410,7 +413,8 @@ class AuditStore:
                 updated_at TEXT NOT NULL,
                 ended_at TEXT,
                 outcome TEXT,
-                origin TEXT
+                origin TEXT,
+                worktree_path TEXT
             );
             CREATE INDEX IF NOT EXISTS board_runs_status
                 ON board_runs(status, started_at);
@@ -430,9 +434,16 @@ class AuditStore:
                 run_session_id TEXT,
                 due_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                consumed_at TEXT
+                consumed_at TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                claimed_at TEXT,
+                error TEXT NOT NULL DEFAULT '',
+                waiting_task_id TEXT NOT NULL DEFAULT '',
+                waiting_on TEXT NOT NULL DEFAULT ''
             );
-            CREATE INDEX IF NOT EXISTS wakes_due ON wakes(consumed_at, due_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS wakes_fanout_dedup
+                ON wakes(origin_task_id, waiting_task_id, contact_id)
+                WHERE waiting_task_id != '';
             CREATE TABLE IF NOT EXISTS task_terminal_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_id TEXT NOT NULL,
@@ -468,7 +479,14 @@ class AuditStore:
                 "event_ids_json": "event_ids_json TEXT NOT NULL DEFAULT '[]'",
                 "source_received_at": "source_received_at TEXT NOT NULL DEFAULT ''",
             },
-            "board_runs": {"origin": "origin TEXT"},
+            "board_runs": {"origin": "origin TEXT", "worktree_path": "worktree_path TEXT"},
+            "wakes": {
+                "status": "status TEXT NOT NULL DEFAULT 'pending'",
+                "claimed_at": "claimed_at TEXT",
+                "error": "error TEXT NOT NULL DEFAULT ''",
+                "waiting_task_id": "waiting_task_id TEXT NOT NULL DEFAULT ''",
+                "waiting_on": "waiting_on TEXT NOT NULL DEFAULT ''",
+            },
         }
         for table, columns in migrations.items():
             names = {
@@ -480,6 +498,18 @@ class AuditStore:
                     self.connection.execute(
                         f"ALTER TABLE {table} ADD COLUMN {definition}"
                     )
+        self.connection.execute(
+            """
+            UPDATE wakes SET status = 'done'
+            WHERE consumed_at IS NOT NULL AND status = 'pending'
+            """
+        )
+        # wakes_due 的旧定义挂在 consumed_at 上；claim 语义改造后统一按
+        # status 过滤，旧库上的同名索引用新定义重建。
+        self.connection.execute("DROP INDEX IF EXISTS wakes_due")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS wakes_due ON wakes(status, due_at)"
+        )
         self.connection.execute(
             """
             UPDATE outgoing
@@ -1185,6 +1215,11 @@ class AuditStore:
                 if replayed is not None:
                     self.connection.commit()
                     return replayed
+            if run_id and record.get("run_id") != run_id:
+                # run_id 以参数为准并入 record：task_tools 的调用方不带它，
+                # 缺了会让 task_terminal_events.run_id 恒空，synthetic
+                # 回声切断随之失效（run_origin 对空 id 一律视为 live）。
+                record = {**record, "run_id": run_id}
             response = self._record_task_tx(
                 scope=scope, record=record, evidence_at=evidence_at, now=now
             )
@@ -1761,10 +1796,38 @@ class AuditStore:
         )
         self.connection.commit()
 
-    def abort_stale_runs(self, now: datetime) -> int:
+    def set_run_worktree(self, session_id: str, worktree_path: Path | str) -> None:
+        """记录本次运行的 worktree 路径（prepare 成功后写回）。
+
+        崩溃回收靠它定位孤儿 worktree；只写未收口的运行。
+        """
+        if not session_id:
+            return
+        self.connection.execute(
+            """
+            UPDATE board_runs SET worktree_path = ?
+            WHERE session_id = ? AND ended_at IS NULL
+            """,
+            (str(worktree_path), session_id),
+        )
+        self.connection.commit()
+
+    def abort_stale_runs(self, now: datetime) -> list[dict[str, Any]]:
         """把重启后仍处于未收口状态的运行标记为 aborted（单实例服务的
-        启动扫尾：进程不在了，running 一定是上次未收口的遗留）。"""
-        cursor = self.connection.execute(
+        启动扫尾：进程不在了，running 一定是上次未收口的遗留）。
+
+        返回被扫尾的运行行（含 worktree_path），调用方据此回收崩溃
+        遗留的 worktree。
+        """
+        stale = self.connection.execute(
+            """
+            SELECT * FROM board_runs
+            WHERE status IN ('running', 'waiting') AND ended_at IS NULL
+            """
+        ).fetchall()
+        if not stale:
+            return []
+        self.connection.execute(
             """
             UPDATE board_runs
             SET status = 'aborted', outcome = 'aborted', ended_at = ?,
@@ -1774,7 +1837,7 @@ class AuditStore:
             (now.isoformat(), now.isoformat()),
         )
         self.connection.commit()
-        return cursor.rowcount
+        return [dict(row) for row in stale]
 
     def active_runs(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
@@ -1840,7 +1903,9 @@ class AuditStore:
     # ------------------------------------------------------------------
     # 唤醒（§18 唤醒 2 条）：wakes 是"延迟送达的合成输入"队列。任务终态
     # 与到点时刻产生 wake，服务后台循环消费后对联系人合成一轮处理；
-    # 回声切断（synthetic 轮终态不再触发 wake）在服务侧判定。
+    # 回声切断（synthetic 轮终态不再触发 wake）在 fan_out 内判定。
+    # 生命周期 pending -> claimed -> done：claim 之后崩溃的 wake 由启动
+    # 扫尾回置 pending 重放，先确认后执行不再等于丢失。
     # ------------------------------------------------------------------
 
     def enqueue_wake(
@@ -1852,13 +1917,15 @@ class AuditStore:
         now: datetime,
         origin_task_id: str = "",
         run_session_id: str = "",
+        waiting_task_id: str = "",
+        waiting_on: str = "",
     ) -> int:
         cursor = self.connection.execute(
             """
             INSERT INTO wakes(
                 contact_id, text, origin_task_id, run_session_id,
-                due_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                due_at, created_at, waiting_task_id, waiting_on
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 contact_id,
@@ -1867,47 +1934,133 @@ class AuditStore:
                 run_session_id or None,
                 due_at.isoformat(),
                 now.isoformat(),
+                waiting_task_id,
+                waiting_on,
             ),
         )
         self.connection.commit()
         return int(cursor.lastrowid or 0)
 
+    def enqueue_fanout_wake_tx(
+        self,
+        contact_id: str,
+        text: str,
+        *,
+        now: datetime,
+        origin_task_id: str,
+        waiting_task_id: str,
+    ) -> int:
+        """在当前事务内落终态 fan-out wake；(origin, waiter, contact) 去重。
+
+        唯一索引只覆盖 waiting_task_id 非空的行：时刻唤醒与操作者答复
+        不参与该去重（它们各自有独立语义，重复入队不是重试路径）。
+        """
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO wakes(
+                contact_id, text, origin_task_id,
+                due_at, created_at, status, waiting_task_id
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                contact_id,
+                sanitize_text(text, 2000),
+                origin_task_id or None,
+                now.isoformat(),
+                now.isoformat(),
+                waiting_task_id,
+            ),
+        )
+        return int(cursor.rowcount)
+
     def due_wakes(self, now: datetime) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """
             SELECT * FROM wakes
-            WHERE consumed_at IS NULL AND due_at <= ?
+            WHERE status = 'pending' AND due_at <= ?
             ORDER BY due_at, id
             """,
             (now.isoformat(),),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def consume_wake(
-        self, wake_id: int, *, now: datetime, run_session_id: str = ""
-    ) -> bool:
-        """认领一条 wake；首次认领生效，重复消费是 no-op。"""
+    def claim_wake(self, wake_id: int, *, now: datetime) -> bool:
+        """认领一条 pending wake（pending -> claimed）；重复或已认领是 no-op。"""
         cursor = self.connection.execute(
             """
-            UPDATE wakes
-            SET consumed_at = ?, run_session_id = COALESCE(NULLIF(?, ''), run_session_id)
-            WHERE id = ? AND consumed_at IS NULL
+            UPDATE wakes SET status = 'claimed', claimed_at = ?
+            WHERE id = ? AND status = 'pending'
             """,
-            (now.isoformat(), run_session_id, wake_id),
+            (now.isoformat(), wake_id),
         )
         self.connection.commit()
         return cursor.rowcount == 1
 
-    def wake_exists(self, origin_task_id: str, text: str) -> bool:
-        """同源同文的 wake 是否已入过队（含已消费）：时刻唤醒的去重键。"""
+    def finish_wake(
+        self, wake_id: int, *, now: datetime, error: str = ""
+    ) -> None:
+        """结束一条已认领的 wake（claimed -> done）。
+
+        派发成功与失败都置 done：失败带 error 字段留痕（面板可见），
+        不无限重试同一条；重放只发生在启动扫尾的 claimed 回收。
+        """
+        self.connection.execute(
+            """
+            UPDATE wakes
+            SET status = 'done', consumed_at = ?, error = ?
+            WHERE id = ? AND status IN ('claimed', 'pending')
+            """,
+            (now.isoformat(), sanitize_text(error, 500), wake_id),
+        )
+        self.connection.commit()
+
+    def recover_stale_wakes(
+        self, now: datetime, *, max_claim_age: timedelta = timedelta(minutes=30)
+    ) -> int:
+        """把认领后长时间未收口的 wake 回置 pending（崩溃重放）。"""
+        cursor = self.connection.execute(
+            """
+            UPDATE wakes SET status = 'pending', claimed_at = ''
+            WHERE status = 'claimed' AND claimed_at != ''
+              AND claimed_at <= ?
+            """,
+            ((now - max_claim_age).isoformat(),),
+        )
+        self.connection.commit()
+        return cursor.rowcount
+
+    def wake_exists(self, origin_task_id: str, waiting_on: str) -> bool:
+        """同任务同一 waiting_on 值是否已有未派发 wake（时刻唤醒去重键）。
+
+        只看 pending/claimed：已派发（done）的 wake 不再挡住新的入队，
+        改约时间（waiting_on 变化）或再次到点都能重新唤醒。
+        """
         row = self.connection.execute(
             """
             SELECT 1 FROM wakes
-            WHERE origin_task_id = ? AND text = ? LIMIT 1
+            WHERE origin_task_id = ? AND waiting_on = ?
+              AND status IN ('pending', 'claimed')
+            LIMIT 1
             """,
-            (origin_task_id, sanitize_text(text, 2000)),
+            (origin_task_id, waiting_on),
         ).fetchone()
         return row is not None
+
+    def time_waiting_tasks(self) -> list[dict[str, Any]]:
+        """全部 waiting_on=@时刻 的未归档 waiting 事项，不设条数上限。
+
+        到点扫描专用查询：board_tasks 的 50 条截断会让排位靠后的
+        等待事项永远轮不到检查。
+        """
+        rows = self.connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE waiting_on LIKE '@%' AND status = 'waiting'
+              AND archived_at = ''
+            ORDER BY last_evidence_at DESC
+            """
+        ).fetchall()
+        return [self._task_row_to_dict(row) for row in rows]
 
     def pending_terminal_events(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
@@ -1915,10 +2068,68 @@ class AuditStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def mark_terminal_event_handled(self, event_id: int, *, now: datetime) -> None:
+    def fan_out_terminal_event(self, event_id: int, *, now: datetime) -> bool:
+        """单事务处理一条终态事件：回声判定 + 等待方 wake 生成 + 标记已处理。
+
+        崩溃后要么 wakes 与 handled_at 都不落地（整体回滚，事件仍
+        pending，下轮重试），要么都落地（重试时 handled_at 非空直接
+        no-op）；(origin, waiter, contact) 唯一键保证重试不重复生成。
+        synthetic 轮的终态只标记 handled，不产生 wake（回声切断）。
+        """
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM task_terminal_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if row is None or str(row["handled_at"]):
+                self.connection.commit()
+                return False
+            if self.run_origin(str(row["run_id"])) != "synthetic":
+                verb = "任务完成" if str(row["status"]) == "completed" else "任务取消"
+                text = f"{verb}：{row['goal']}，结果见 board"
+                for waiter in self.tasks_waiting_on(f"task:{row['task_id']}"):
+                    for contact_id in waiter["contact_ids"] or [
+                        waiter["contact_id"]
+                    ]:
+                        self.enqueue_fanout_wake_tx(
+                            contact_id,
+                            text,
+                            now=now,
+                            origin_task_id=str(row["task_id"]),
+                            waiting_task_id=str(waiter["id"]),
+                        )
+            self.connection.execute(
+                "UPDATE task_terminal_events SET handled_at = ? WHERE id = ?",
+                (now.isoformat(), event_id),
+            )
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def record_operator_action(
+        self, text: str, *, run_session_id: str, now: datetime
+    ) -> None:
+        """操作者动作审计行（steer/开内部轮），复用 wakes 表不加新表。
+
+        contact_id='operator'、status='done'：只作留痕，不进派发队列，
+        也不参与任何去重键（origin_task_id 为 NULL 不等于字符串比较）。
+        """
         self.connection.execute(
-            "UPDATE task_terminal_events SET handled_at = ? WHERE id = ?",
-            (now.isoformat(), event_id),
+            """
+            INSERT INTO wakes(
+                contact_id, text, origin_task_id, run_session_id,
+                due_at, created_at, status, consumed_at
+            ) VALUES ('operator', ?, NULL, ?, ?, ?, 'done', ?)
+            """,
+            (
+                sanitize_text(text, 2000),
+                run_session_id or None,
+                now.isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
         )
         self.connection.commit()
 
@@ -1941,7 +2152,8 @@ class AuditStore:
         *,
         now: datetime,
     ) -> dict[str, Any]:
-        """操作者作答：落 human 事实、清 waiting_on、恢复 open，单事务完成。
+        """操作者作答：落 human 事实、清 waiting_on、恢复 open、生成
+        联系人唤醒，全部在同一事务内（答复与它触发的 wakes 同生共死）。
 
         判名按 waiting_on == operator_name 精确匹配；不匹配或事项不存在
         返回 ok=False，调用方拿 False 决定面板提示。
@@ -1975,6 +2187,27 @@ class AuditStore:
                 """,
                 (now.isoformat(), task_id, operator_name, int(row["version"])),
             )
+            text = f"操作者已答复：{sanitize_text(answer, 2000)}"
+            contact_ids = json.loads(row["contact_ids"] or "[]")
+            contact_ids = [
+                item for item in contact_ids if isinstance(item, str)
+            ] or [str(row["scope_contact"])]
+            for contact_id in contact_ids:
+                self.connection.execute(
+                    """
+                    INSERT INTO wakes(
+                        contact_id, text, origin_task_id,
+                        due_at, created_at, status
+                    ) VALUES (?, ?, ?, ?, ?, 'pending')
+                    """,
+                    (
+                        contact_id,
+                        text,
+                        task_id,
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
             self.connection.commit()
             return {
                 "ok": True,

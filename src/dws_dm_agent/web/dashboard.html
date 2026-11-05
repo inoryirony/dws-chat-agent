@@ -411,6 +411,16 @@
     refresh(); setInterval(refresh, 3000); setInterval(() => snapshot && renderActive(snapshot.active), 1000);
 
     // ---- 黑板（§18）：投影 + 回写，icon-first，2s 轮询 ----
+    // 操作者令牌：入口 URL ?token= 交付一次，之后存 localStorage 随请求附头。
+    {
+      const urlToken = new URLSearchParams(location.search).get("token");
+      if (urlToken) localStorage.setItem("dwsPanelToken", urlToken);
+    }
+    const panelToken = () => localStorage.getItem("dwsPanelToken") || "";
+    const operatorHeaders = () => {
+      const token = panelToken();
+      return token ? {"X-Operator-Token": token} : {};
+    };
     let board = null;
     let boardContacts = {};
     let boardAliasesLoaded = false;
@@ -447,7 +457,7 @@
     async function postBoard(url, body) {
       const response = await fetch(url, {
         method: "POST",
-        headers: {"Content-Type": "application/json"},
+        headers: {"Content-Type": "application/json", ...operatorHeaders()},
         body: JSON.stringify(body)
       });
       const data = await response.json().catch(() => ({}));
@@ -777,7 +787,7 @@
 
     async function boardRefresh() {
       try {
-        const response = await fetch("/api/board", {cache: "no-store"});
+        const response = await fetch("/api/board", {cache: "no-store", headers: operatorHeaders()});
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         board = await response.json();
         renderBoard();

@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import threading
@@ -540,6 +541,9 @@ class DashboardServer:
         self.config_store = config_store
         self.contact_search = contact_search
         self.service = service
+        # 面板写通道的操作者令牌：每次进程启动随机生成。完整值只经
+        # state_dir 的凭据文件交付（service 落盘），日志只允许前 4 位。
+        self.operator_token = secrets.token_urlsafe(32)
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.server: LocalThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -547,6 +551,11 @@ class DashboardServer:
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def tokened_url(self) -> str:
+        """带一次性 token 的本机入口；?token= 由页面存入 localStorage。"""
+        return f"{self.url}/?token={self.operator_token}"
 
     def board_service(self) -> Any | None:
         """Resolve the AgentService backing the board endpoints.
@@ -657,12 +666,24 @@ class DashboardServer:
                     self._send(payload, "application/json; charset=utf-8")
                     return
                 if path == "/api/board":
+                    if not self._operator_authorized():
+                        self._send_json({"error": "面板令牌无效"}, status=403)
+                        return
                     service = dashboard.board_service()
                     if service is None:
                         self._send_json({"error": "黑板服务未接入"}, status=503)
                         return
                     try:
-                        payload_obj = service.board_snapshot()
+                        # board_snapshot 读的是服务事件循环线程持有的
+                        # store 连接：与写端点同模式，经
+                        # run_coroutine_threadsafe 排回服务循环执行，
+                        # 绝不在 HTTP 线程上直接触碰 sqlite 连接。
+                        async def snapshot_on_service_loop() -> Any:
+                            return service.board_snapshot()
+
+                        payload_obj = self._resolve_maybe_coroutine(
+                            snapshot_on_service_loop()
+                        )
                     except Exception as exc:
                         self._send_json({"error": f"读取黑板失败：{exc}"}, status=500)
                         return
@@ -727,6 +748,13 @@ class DashboardServer:
                 }
                 return not origin or origin in allowed_origins
 
+            def _operator_authorized(self) -> bool:
+                supplied = self.headers.get("X-Operator-Token", "")
+                return secrets.compare_digest(
+                    supplied.encode("utf-8"),
+                    dashboard.operator_token.encode("utf-8"),
+                )
+
             def _handle_config_post(self) -> None:
                 if not self._origin_allowed():
                     self._send_json({"error": "不允许的请求来源"}, status=403)
@@ -784,6 +812,9 @@ class DashboardServer:
             ) -> None:
                 if not self._origin_allowed():
                     self._send_json({"error": "不允许的请求来源"}, status=403)
+                    return
+                if not self._operator_authorized():
+                    self._send_json({"error": "面板令牌无效"}, status=403)
                     return
                 service = dashboard.board_service()
                 if service is None:

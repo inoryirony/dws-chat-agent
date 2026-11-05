@@ -1217,7 +1217,9 @@ class AgentRuntime:
         source = self._workspace_root / repo
         if not source.is_dir() or not (source / ".git").exists():
             raise WorktreeError(f"worktree_repo is not a git repository: {repo}")
-        target = self._worktree_root / f"{repo}-{session_id[:10]}"
+        # 会话 id 尾段是每次运行唯一的 uuid 随机部：同日同仓的两次运行
+        # 绝不共用 worktree（日期前缀在一天内必然相同，等于必撞）。
+        target = self._worktree_root / f"{repo}-{session_id[-12:]}"
         try:
             self._worktree_root.mkdir(parents=True, exist_ok=True)
             completed = subprocess.run(

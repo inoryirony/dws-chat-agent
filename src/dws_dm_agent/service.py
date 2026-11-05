@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -42,7 +43,6 @@ from .core import (
     HistoryMessage,
     IncomingEvent,
     SecurityGate,
-    TaskScope,
     canonical_message_text,
     human_owns_conversation,
     parse_dws_event,
@@ -96,6 +96,9 @@ _OPERATOR_INSTRUCTION_DISCLAIMER = (
     "这是操作者本人下达的指令，按最高授权执行。"
 )
 _TIME_WAITING_PATTERN = re.compile(r"^@(.+)$")
+# claimed wake 超过该时长未收口视为派发进程已死：启动扫尾回置 pending
+# 重放（crash 后的合成输入最多迟 30 分钟，绝不丢）。
+_STALE_CLAIM_AGE = timedelta(minutes=30)
 
 
 def _is_synthetic_message_id(message_id: str) -> bool:
@@ -384,11 +387,16 @@ class AgentService:
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
         self.settings.worktree_root.mkdir(parents=True, exist_ok=True)
         LOG.info("starting mode=%s contacts=%d", self.mode, len(self.settings.contacts))
-        aborted_runs = self.store.abort_stale_runs(
-            datetime.now(self.settings.timezone)
-        )
+        now = datetime.now(self.settings.timezone)
+        aborted_runs = self.store.abort_stale_runs(now)
         if aborted_runs:
-            LOG.warning("startup aborted stale board runs count=%d", aborted_runs)
+            LOG.warning("startup aborted stale board runs count=%d", len(aborted_runs))
+            self._reclaim_orphan_worktrees(aborted_runs)
+        replayed = self.store.recover_stale_wakes(
+            now, max_claim_age=_STALE_CLAIM_AGE
+        )
+        if replayed:
+            LOG.warning("startup replayed claimed wakes count=%d", replayed)
         days = self._task_memory_inactive_days()
         if days > 0:
             archived = self.store.archive_inactive_tasks(
@@ -399,9 +407,16 @@ class AgentService:
         self._write_runtime()
         try:
             self.dashboard.start()
-            LOG.info("dashboard ready url=%s", self.dashboard.url)
+            self._write_panel_access_files()
+            LOG.info(
+                "dashboard ready url=%s panel token: %s…",
+                self.dashboard.url,
+                self.dashboard.operator_token[:4],
+            )
             if self.open_dashboard:
-                await asyncio.to_thread(webbrowser.open, self.dashboard.url)
+                await asyncio.to_thread(
+                    webbrowser.open, self.dashboard.tokened_url
+                )
         except OSError as exc:
             LOG.error("dashboard failed error=%s", exc)
         await self._recover_pending_events()
@@ -444,6 +459,90 @@ class AgentService:
 
     def request_stop(self) -> None:
         self.stop_event.set()
+
+    def _write_panel_access_files(self) -> None:
+        """面板凭据落盘：token 与带 token 的完整 URL，均 0600。
+
+        日志只打印 token 前 4 位；完整值仅进这两个文件（本机操作者可读）。
+        token 从不写入环境变量，也就从不可能进任何子进程。
+        """
+        token_path = self.settings.state_dir / "operator_token"
+        url_path = self.settings.state_dir / "panel.url"
+        for path, content in (
+            (token_path, f"{self.dashboard.operator_token}\n"),
+            (url_path, f"{self.dashboard.tokened_url}\n"),
+        ):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
+            os.chmod(path, 0o600)
+
+    def _reclaim_orphan_worktrees(self, aborted_runs: Sequence[Mapping[str, Any]]) -> None:
+        """回收崩溃运行的 worktree：路径在 worktree_root 下且 git 仍登记。
+
+        判据缺一即跳过（只记日志）：路径越界可能是配置迁移后的旧根，
+        git 记录不存在说明 worktree 已被手动清理，强删目录会丢未合并
+        的现场之外的东西。
+        """
+        root = self.settings.worktree_root.resolve()
+        reclaimed = 0
+        for run in aborted_runs:
+            raw_path = str(run.get("worktree_path") or "")
+            if not raw_path:
+                continue
+            path = Path(raw_path).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                LOG.warning(
+                    "skip worktree reclaim outside root path=%s", raw_path
+                )
+                continue
+            if path == root or not path.exists():
+                continue
+            source_repo = self._worktree_main_repo(path)
+            if source_repo is None:
+                LOG.warning(
+                    "skip worktree reclaim, not a registered worktree path=%s",
+                    raw_path,
+                )
+                continue
+            completed = subprocess.run(
+                [
+                    "git", "-C", str(source_repo),
+                    "worktree", "remove", "--force", str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if completed.returncode == 0:
+                reclaimed += 1
+            else:
+                LOG.warning(
+                    "worktree reclaim failed path=%s detail=%s",
+                    raw_path,
+                    completed.stderr.strip()[:200],
+                )
+        if reclaimed:
+            LOG.info("startup reclaimed orphan worktrees count=%d", reclaimed)
+
+    @staticmethod
+    def _worktree_main_repo(worktree_path: Path) -> Path | None:
+        """从 worktree 的 .git 文件反查主仓路径；不是 worktree 返回 None。"""
+        git_marker = worktree_path / ".git"
+        try:
+            content = git_marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not content.startswith("gitdir:"):
+            return None
+        gitdir = Path(content[len("gitdir:"):].strip())
+        if not gitdir.is_absolute():
+            gitdir = (worktree_path / gitdir).resolve()
+        # gitdir 指向 <main>/.git/worktrees/<name>；主仓是其上两级。
+        main_git = gitdir.parent.parent
+        return main_git if (main_git / "HEAD").exists() else None
 
     async def _recover_pending_events(self) -> None:
         async def recover(contact: Contact) -> None:
@@ -1396,7 +1495,10 @@ class AgentService:
 
         只在里程碑水位上涨时动作：首个里程碑创建卡片（silent 前仍零输出），
         后续里程碑整表重发。无里程碑不建卡，模型 delta 永不进正文。
+        面板内部轮没有对外会话：progress 只进面板事件流，零 DWS 调用。
         """
+        if batch[0].conversation_id.startswith("panel:"):
+            return
         if not getattr(getattr(self, "dws", None), "streaming_cards", False):
             return
         entries = self.store.recent_progress(
@@ -1512,10 +1614,12 @@ class AgentService:
         # <=0 视为关闭自动归档（事项继续留在活跃快照里）。
         return value
 
-    def _active_tasks_snapshot(
-        self, contact: Contact, conversation_id: str
-    ) -> str:
-        """构建活跃事项快照；加载前先做本地幂等归档。"""
+    def _active_tasks_snapshot(self, contact: Contact) -> str:
+        """构建活跃事项快照；加载前先做本地幂等归档。
+
+        与面板 board_tasks 同源转换：每条带最近 3 条 facts（含 source），
+        模型在 prompt 里可见跨轮事实，不必先 task_lookup。
+        """
         days = self._task_memory_inactive_days()
         if days > 0:
             archived = self.store.archive_inactive_tasks(
@@ -1523,12 +1627,9 @@ class AgentService:
             )
             if archived:
                 LOG.info("archived inactive tasks count=%d days=%d", archived, days)
-        scope = TaskScope(
-            self_id=self.settings.self_open_id,
-            contact_id=contact.identity,
-            conversation_id=conversation_id,
+        tasks = self.store.board_tasks(
+            contact_id=contact.identity, limit=_TASK_SNAPSHOT_LIMIT
         )
-        tasks = self.store.active_tasks(scope, limit=_TASK_SNAPSHOT_LIMIT)
         return json.dumps(tasks, ensure_ascii=False, indent=2)
 
     def _task_context_for(
@@ -1633,9 +1734,7 @@ class AgentService:
             "current_messages_json": json.dumps(
                 messages, ensure_ascii=False, indent=2
             ),
-            "active_tasks_json": self._active_tasks_snapshot(
-                contact, batch[0].conversation_id
-            ),
+            "active_tasks_json": self._active_tasks_snapshot(contact),
             "now": datetime.now(self.settings.timezone).strftime("%Y-%m-%d %H:%M:%S"),
             "skill_humanizer": _skill_path("humanizer_zh"),
             "skill_answer_html": _skill_path("answer_me_with_html"),
@@ -1777,7 +1876,12 @@ class AgentService:
                 if stage_profile.profile.protocol == "pi-rpc"
                 else None
             )
-            session = self.agent_runtime.open_session(
+            # open_session 内含 worktree 建立 subprocess（最长 600s）：
+            # 放入线程执行，事件循环在慢仓克隆期间仍可调度其他会话。
+            # WorktreeError 跨线程原样抛出，失败清理（session_dir 删除）
+            # 仍由本协程完成。
+            session = await asyncio.to_thread(
+                self.agent_runtime.open_session,
                 stage, session_id, prompt, session_dir, local_images,
                 model_override=model_override,
                 agent_override=agent_override,
@@ -1809,6 +1913,13 @@ class AgentService:
                     else "live"
                 ),
             )
+            worktree_path = getattr(
+                getattr(session, "prepared", None), "worktree_path", None
+            )
+            if worktree_path is not None:
+                # 崩溃回收的定位依据：worktree 属于本次运行，进程死后
+                # 只有这行记录知道它在哪。
+                self.store.set_run_worktree(session_id, worktree_path)
             self.live_sessions[session_id] = session
         except WorktreeError as exc:
             shutil.rmtree(session_dir, ignore_errors=True)
@@ -2512,81 +2623,113 @@ class AgentService:
                 self._scan_time_wakes(now)
                 self._drain_terminal_events(now)
                 for wake in self.store.due_wakes(now):
-                    self._dispatch_wake(wake, now)
+                    await self._dispatch_wake(wake, now)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 LOG.exception("wake dispatcher iteration failed")
 
     def _scan_time_wakes(self, now: datetime) -> None:
-        """扫 waiting_on=@时刻 的事项：到点（顺延入窗）唤醒主联系人。"""
-        for task in self.store.board_tasks(status="waiting"):
+        """扫 waiting_on=@时刻 的事项：到点（顺延入窗）唤醒主联系人。
+
+        去重键是 (task_id, waiting_on 当前值) 且只看未派发的 wake：
+        改约时间（waiting_on 变化）后到点会再次唤醒，同一时刻的
+        pending/claimed 不会重复入队。专用查询不截断，board_tasks 的
+        50 条上限不再吃掉排位靠后的等待事项。
+        """
+        for task in self.store.time_waiting_tasks():
             match = _TIME_WAITING_PATTERN.fullmatch(task["waiting_on"])
             if not match:
                 continue
-            moment = _parse_waiting_moment(
-                match.group(1), self.settings.timezone
-            )
+            moment = _parse_waiting_moment(match.group(1), self.settings.timezone)
             if moment is None:
                 continue
             effective = _roll_into_wake_window(moment)
             if now < effective:
                 continue
-            text = f"到点检查：{task['goal']}"
-            if self.store.wake_exists(task["id"], text):
+            if self.store.wake_exists(task["id"], task["waiting_on"]):
                 continue
             contact_ids = task["contact_ids"] or [task["contact_id"]]
             self.store.enqueue_wake(
                 contact_ids[0],
-                text,
+                f"到点检查：{task['goal']}",
                 origin_task_id=task["id"],
+                waiting_on=task["waiting_on"],
                 due_at=now,
                 now=now,
             )
 
     def _drain_terminal_events(self, now: datetime) -> None:
-        """把任务终态事件换成等待方的 wake；synthetic 轮终态不再传（回声切断）。"""
-        for event in self.store.pending_terminal_events():
-            try:
-                if self.store.run_origin(str(event["run_id"])) == "synthetic":
-                    continue
-                verb = (
-                    "任务完成" if event["status"] == "completed" else "任务取消"
-                )
-                text = f"{verb}：{event['goal']}，结果见 board"
-                for waiter in self.store.tasks_waiting_on(
-                    f"task:{event['task_id']}"
-                ):
-                    for contact_id in waiter["contact_ids"] or [
-                        waiter["contact_id"]
-                    ]:
-                        self.store.enqueue_wake(
-                            contact_id,
-                            text,
-                            origin_task_id=str(event["task_id"]),
-                            due_at=now,
-                            now=now,
-                        )
-            finally:
-                self.store.mark_terminal_event_handled(int(event["id"]), now=now)
+        """把任务终态事件换成等待方的 wake；synthetic 轮终态不再传（回声切断）。
 
-    def _dispatch_wake(self, wake: Mapping[str, Any], now: datetime) -> None:
-        """把到点 wake 变成合成输入，进该联系人真实会话的队列。"""
+        单事件单事务（store.fan_out_terminal_event）：wakes 生成与事件
+        标记 handled 同生共死，处理中崩溃只会整体重试，不会半提交。
+        """
+        for event in self.store.pending_terminal_events():
+            self.store.fan_out_terminal_event(int(event["id"]), now=now)
+
+    async def _steer_live_session(self, contact_id: str, text: str) -> bool:
+        """把唤醒文本 steer 进该联系人正在跑的会话；成功返回 True。
+
+        在跑会话比批队列快一个量级：它下一轮 digest 就能看到系统唤醒块。
+        任一会话 steer 失败按无活跃处理，走合成输入兜底。
+        """
+        for run in self.store.active_runs():
+            if str(run["contact_id"]) != contact_id:
+                continue
+            session = self.live_sessions.get(str(run["session_id"]))
+            if session is None or getattr(session, "done", True):
+                continue
+            try:
+                steered = await session.steer(
+                    _system_wake_block([("系统唤醒", text)])
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "wake steer failed session=%s error=%s",
+                    run["session_id"],
+                    sanitize_text(str(exc), 300),
+                )
+                continue
+            if steered:
+                return True
+        return False
+
+    async def _dispatch_wake(self, wake: Mapping[str, Any], now: datetime) -> None:
+        """把到点 wake 送达：在跑会话直接 steer，否则合成输入进批队列。
+
+        生命周期 pending -> claimed -> done：claim 之后崩溃的 wake 由
+        启动扫尾回置 pending 重放；派发失败也置 done 并记 error，绝不
+        无限重试同一条。
+        """
         wake_id = int(wake["id"])
-        if not self.store.consume_wake(wake_id, now=now):
+        if not self.store.claim_wake(wake_id, now=now):
             return
+        text = str(wake["text"])
+        contact_id = str(wake["contact_id"])
         contact = next(
             (
                 item
                 for item in self.settings.contacts
-                if item.identity == str(wake["contact_id"])
+                if item.identity == contact_id
             ),
             None,
         )
         if contact is None:
+            self.store.finish_wake(
+                wake_id, now=now, error=f"contact_not_whitelisted:{contact_id}"
+            )
             LOG.warning(
-                "wake dropped: contact not whitelisted contact=%s",
-                wake["contact_id"],
+                "wake done with error: contact not whitelisted contact=%s",
+                contact_id,
+            )
+            return
+        if await self._steer_live_session(contact_id, text):
+            self.store.finish_wake(wake_id, now=now)
+            LOG.info(
+                "wake steered to live session contact=%s origin_task=%s",
+                contact.alias,
+                wake.get("origin_task_id") or "-",
             )
             return
         event = IncomingEvent(
@@ -2597,11 +2740,12 @@ class AgentService:
                 or f"dm:{contact.identity}"
             ),
             contact=contact,
-            content=str(wake["text"]),
+            content=text,
             created_at=now,
         )
         self.store.claim_event(event)
         self._enqueue(event)
+        self.store.finish_wake(wake_id, now=now)
         LOG.info(
             "wake dispatched contact=%s origin_task=%s",
             contact.alias,
@@ -2620,6 +2764,7 @@ class AgentService:
 
         无 contact：contact_id 用 'operator' 的内部轮，回复只落
         panel_replies 不外发；有 contact：进该联系人真实会话队列走全链路。
+        动作本身落 wakes 审计行（contact_id='operator'，status='done'）。
         """
         now = datetime.now(self.settings.timezone)
         panel_id = f"panel-{uuid.uuid4().hex[:12]}"
@@ -2657,40 +2802,47 @@ class AgentService:
             created_at=now,
         )
         self.store.claim_event(event)
+        self.store.record_operator_action(
+            text, run_session_id=panel_id, now=now
+        )
         self._enqueue(event)
         return panel_id
 
     async def steer_run(self, session_id: str, text: str) -> bool:
-        """给在跑会话注入操作者指令；会话不在跑返回 False。绝不写 manual。"""
+        """给在跑会话注入操作者指令；会话不在跑返回 False。绝不写 manual。
+
+        成功的注入落 wakes 审计行（同 open_operator_session 的结构），
+        操作者对在跑会话的每次插话都有留痕可查。
+        """
         session = self.live_sessions.get(session_id)
         if session is None or getattr(session, "done", True):
             return False
-        return bool(
+        steered = bool(
             await session.steer(_system_wake_block([("操作者指令", text)]))
         )
+        if steered:
+            self.store.record_operator_action(
+                text, run_session_id=session_id, now=datetime.now(
+                    self.settings.timezone
+                )
+            )
+        return steered
 
     async def answer_task(self, task_id: int | str, answer: str) -> bool:
-        """给 waiting_on=本人名字 的任务作答：落 human 事实、恢复 open、唤醒联系人。"""
+        """给 waiting_on=本人名字 的任务作答：落 human 事实、恢复 open、唤醒联系人。
+
+        答复与其触发的 wakes 由 store 在同一事务内落地，无半提交窗口。
+        """
         answer = sanitize_text(answer, 2000).strip()
         if not answer:
             return False
-        now = datetime.now(self.settings.timezone)
         resolved = self.store.answer_waiting_task(
-            str(task_id), self.settings.self_name, answer, now=now
+            str(task_id),
+            self.settings.self_name,
+            answer,
+            now=datetime.now(self.settings.timezone),
         )
-        if not resolved.get("ok"):
-            return False
-        task = resolved["task"]
-        text = f"操作者已答复：{answer}"
-        for contact_id in task["contact_ids"] or [task["contact_id"]]:
-            self.store.enqueue_wake(
-                contact_id,
-                text,
-                origin_task_id=str(task["id"]),
-                due_at=now,
-                now=now,
-            )
-        return True
+        return bool(resolved.get("ok"))
 
     def board_snapshot(self) -> dict[str, Any]:
         """黑板投影快照：在跑会话（含里程碑）、任务、等我裁决、近 24h 完成、
