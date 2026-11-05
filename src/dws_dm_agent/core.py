@@ -21,6 +21,20 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 # 事项记忆的业务状态。归档（archived_at）独立于状态，不新增额外业务状态。
 TASK_STATUSES = ("open", "waiting", "completed", "cancelled")
 
+# 黑板运行（board_runs）的生命周期状态；终态为 done/failed/aborted。
+BOARD_RUN_STATUSES = ("running", "waiting", "done", "failed", "aborted")
+# close_run 的 outcome 到终态的映射；blocked 停在 waiting 是刻意的：
+# 阻塞的运行等待外部输入，属于面板上仍然"活着"的等待，不是失败。
+BOARD_RUN_OUTCOME_STATUS = {
+    "final": "done",
+    "silent": "done",
+    "escalate": "done",
+    "blocked": "waiting",
+    "error": "failed",
+    "aborted": "aborted",
+}
+FACT_SOURCES = ("human", "agent", "contact")
+
 
 class TaskScope(NamedTuple):
     """事项的作用域：本地登录身份 + 联系人 + 会话，三者组合隔离。"""
@@ -309,7 +323,8 @@ class AuditStore:
                 next_attempt_at TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
                 event_ids_json TEXT NOT NULL DEFAULT '[]',
-                source_received_at TEXT NOT NULL DEFAULT ''
+                source_received_at TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'agent'
             );
             CREATE INDEX IF NOT EXISTS outgoing_conversation_time
                 ON outgoing(conversation_id, sent_at);
@@ -349,6 +364,8 @@ class AuditStore:
                 waiting_on TEXT NOT NULL DEFAULT '',
                 evidence_summary TEXT NOT NULL DEFAULT '',
                 evidence_message_ids TEXT NOT NULL DEFAULT '[]',
+                resources TEXT NOT NULL DEFAULT '[]',
+                contact_ids TEXT NOT NULL DEFAULT '[]',
                 last_evidence_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -373,12 +390,48 @@ class AuditStore:
                 revoked_at TEXT NOT NULL DEFAULT '',
                 revoke_reason TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                anchor_message_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'agent',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS facts_task ON facts(task_id, id);
+            CREATE TABLE IF NOT EXISTS board_runs (
+                session_id TEXT PRIMARY KEY,
+                task_id TEXT,
+                contact_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                headline TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                ended_at TEXT,
+                outcome TEXT
+            );
+            CREATE INDEX IF NOT EXISTS board_runs_status
+                ON board_runs(status, started_at);
+            CREATE TABLE IF NOT EXISTS progress (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, seq)
+            );
             """
         )
         migrations = {
             "events": {"request_preview": "request_preview TEXT NOT NULL DEFAULT ''"},
             "runs": {"request_preview": "request_preview TEXT NOT NULL DEFAULT ''"},
+            "tasks": {
+                "resources": "resources TEXT NOT NULL DEFAULT '[]'",
+                "contact_ids": "contact_ids TEXT NOT NULL DEFAULT '[]'",
+            },
             "outgoing": {
+                "source": "source TEXT NOT NULL DEFAULT 'agent'",
                 "card_biz_id": "card_biz_id TEXT",
                 "card_flow_status": "card_flow_status INTEGER",
                 "payload_text": "payload_text TEXT NOT NULL DEFAULT ''",
@@ -465,15 +518,18 @@ class AuditStore:
         *,
         card_biz_id: str | None = None,
         card_flow_status: int | None = None,
+        source: str = "agent",
     ) -> None:
         self.connection.execute(
             """
             INSERT OR REPLACE INTO outgoing(
                 send_uuid, message_id, conversation_id, contact_user_id,
-                sent_at, content_sha256, session_id, card_biz_id, card_flow_status
+                sent_at, content_sha256, session_id, card_biz_id,
+                card_flow_status, source
             ) VALUES (?, ?, ?, ?, ?, ?, ?,
                 COALESCE(?, (SELECT card_biz_id FROM outgoing WHERE send_uuid = ?)),
-                COALESCE(?, (SELECT card_flow_status FROM outgoing WHERE send_uuid = ?))
+                COALESCE(?, (SELECT card_flow_status FROM outgoing WHERE send_uuid = ?)),
+                ?
             )
             """,
             (
@@ -488,6 +544,7 @@ class AuditStore:
                 send_uuid,
                 card_flow_status,
                 send_uuid,
+                source,
             ),
         )
         self.connection.commit()
@@ -809,6 +866,22 @@ class AuditStore:
                 pass
         return True
 
+    def message_source(
+        self,
+        message: HistoryMessage,
+        *,
+        self_open_id: str,
+        contact_open_id: str,
+    ) -> str:
+        """显式判定消息来源：contact / human / agent，不靠猜测。
+
+        自己发出的消息再二分：命中 outgoing 记账是 agent，否则是人工
+        （is_agent_outgoing 为骨架）。其余发送者一律视为 contact 侧。
+        """
+        if message.sender_open_dingtalk_id != self_open_id:
+            return "contact"
+        return "agent" if self.is_agent_outgoing(message) else "human"
+
     def record_manual(self, message: HistoryMessage) -> None:
         if not message.message_id:
             return
@@ -916,9 +989,12 @@ class AuditStore:
     def _task_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
+            "contact_id": str(row["scope_contact"]),
             "goal": str(row["goal"]),
             "status": str(row["status"]),
             "waiting_on": str(row["waiting_on"]),
+            "resources": json.loads(row["resources"] or "[]"),
+            "contact_ids": json.loads(row["contact_ids"] or "[]"),
             "evidence_summary": str(row["evidence_summary"]),
             "evidence_message_ids": json.loads(row["evidence_message_ids"] or "[]"),
             "last_evidence_at": str(row["last_evidence_at"]),
@@ -1096,15 +1172,20 @@ class AuditStore:
     def apply_task_lookup(
         self,
         *,
-        scope: TaskScope,
+        contact_id: str = "",
         status: str = "",
-        include_archived: bool = False,
+        include_done: bool = False,
         limit: int = 20,
         now: datetime,
         run_id: str = "",
         tool_call_id: str = "",
     ) -> dict[str, Any]:
-        """带幂等收据的 task_lookup：同一工具事件重放返回同一份查询结果。"""
+        """带幂等收据的 task_lookup（黑板读）：同一工具事件重放返回同一份结果。
+
+        读的是整块黑板：默认返回全部联系人的 open/waiting 事项，
+        include_done=True 时含 completed/cancelled（供跨月回访），
+        contact_id 非空时只看该联系人触碰的事项。
+        """
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             if run_id and tool_call_id:
@@ -1112,10 +1193,10 @@ class AuditStore:
                 if replayed is not None:
                     self.connection.commit()
                     return replayed
-            tasks = self.lookup_tasks(
-                scope=scope,
+            tasks = self.board_tasks(
+                contact_id=contact_id,
                 status=status,
-                include_archived=include_archived,
+                include_done=include_done,
                 limit=limit,
             )
             response = {"ok": True, "tasks": tasks}
@@ -1137,6 +1218,8 @@ class AuditStore:
         waiting_on: str | None = None,
         evidence_summary: str | None = None,
         evidence_message_ids: Sequence[str] = (),
+        resources: Sequence[str] | None = None,
+        facts: Sequence[Mapping[str, Any]] | None = None,
         expected_version: int | None = None,
         restore: bool = False,
         run_id: str = "",
@@ -1153,6 +1236,8 @@ class AuditStore:
         变化，不刷新 last_evidence_at、不递增 version（不延长保留期）。
         last_evidence_at 只随更新的证据前移：被引用旧消息的时间戳不会
         把已记录的证据时间回拨。
+        resources 整组替换；contact_ids 只增不减（触碰过该事项的联系
+        人自动累积）；facts 只追加，锚定校验在工具边界完成。
         """
         return self.apply_task_record(
             scope=scope,
@@ -1163,6 +1248,8 @@ class AuditStore:
                 "waiting_on": waiting_on,
                 "evidence_summary": evidence_summary,
                 "evidence_message_ids": evidence_message_ids,
+                "resources": resources,
+                "facts": facts,
                 "expected_version": expected_version,
                 "restore": restore,
                 "run_id": run_id,
@@ -1186,6 +1273,8 @@ class AuditStore:
         waiting_on = record.get("waiting_on")
         evidence_summary = record.get("evidence_summary")
         evidence_message_ids = record.get("evidence_message_ids") or ()
+        resources = record.get("resources")
+        facts = record.get("facts") or ()
         expected_version = record.get("expected_version")
         restore = bool(record.get("restore", False))
         run_id = str(record.get("run_id") or "")
@@ -1200,9 +1289,10 @@ class AuditStore:
                 INSERT INTO tasks(
                     id, scope_self, scope_contact, scope_conversation,
                     goal, status, waiting_on, evidence_summary,
-                    evidence_message_ids, last_evidence_at, created_at,
+                    evidence_message_ids, resources, contact_ids,
+                    last_evidence_at, created_at,
                     updated_at, run_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -1214,12 +1304,15 @@ class AuditStore:
                     waiting_on or "",
                     evidence_summary or "",
                     json.dumps(list(evidence_message_ids), ensure_ascii=False),
+                    json.dumps(list(resources or ()), ensure_ascii=False),
+                    json.dumps([scope.contact_id], ensure_ascii=False),
                     evidence_at.isoformat(),
                     now.isoformat(),
                     now.isoformat(),
                     run_id,
                 ),
             )
+            self._insert_facts_tx(task_id, facts, now)
             return {
                 "ok": True,
                 "task": self._task_row_to_dict(
@@ -1269,10 +1362,22 @@ class AuditStore:
             changes["evidence_message_ids"] = json.dumps(
                 list(evidence_message_ids), ensure_ascii=False
             )
+        if resources is not None:
+            normalized_resources = json.dumps(list(resources), ensure_ascii=False)
+            if normalized_resources != str(row["resources"] or "[]"):
+                changes["resources"] = normalized_resources
+        contact_ids = [
+            item
+            for item in json.loads(row["contact_ids"] or "[]")
+            if isinstance(item, str)
+        ]
+        if scope.contact_id not in contact_ids:
+            contact_ids.append(scope.contact_id)
+            changes["contact_ids"] = json.dumps(contact_ids, ensure_ascii=False)
         if restore and row["archived_at"]:
             changes["archived_at"] = ""
             changes["archive_reason"] = ""
-        if not changes:
+        if not changes and not facts:
             return {"ok": True, "task": self._task_row_to_dict(row)}
         # 证据时间来自被引用消息自身的时间戳：引用旧消息不会把任务刷新
         # 成新证据，也不回退已记录的更新证据时间（保留期只前移不回拨）。
@@ -1320,10 +1425,37 @@ class AuditStore:
                 "error": "version_conflict",
                 "task": self._task_row_to_dict(latest),
             }
+        self._insert_facts_tx(task_id, facts, now)
         return {
             "ok": True,
             "task": self._task_row_to_dict(self._load_task(scope, task_id)),  # type: ignore[arg-type]
         }
+
+    def _insert_facts_tx(
+        self,
+        task_id: str,
+        facts: Sequence[Mapping[str, Any]],
+        now: datetime,
+    ) -> None:
+        """在当前事务内追加事实；facts 只增不删，锚定校验在工具边界完成。"""
+        for fact in facts:
+            text = sanitize_text(fact.get("text"), 2000)
+            if not text:
+                continue
+            source = str(fact.get("source") or "agent")
+            self.connection.execute(
+                """
+                INSERT INTO facts(task_id, text, anchor_message_id, source, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    text,
+                    str(fact.get("anchor_message_id") or ""),
+                    source if source in FACT_SOURCES else "agent",
+                    now.isoformat(),
+                ),
+            )
 
     def lookup_tasks(
         self,
@@ -1374,6 +1506,243 @@ class AuditStore:
             (scope.self_id, scope.contact_id, scope.conversation_id, max(1, int(limit))),
         ).fetchall()
         return [self._task_row_to_dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # 黑板（§18）：tasks 的 board 视图 + facts + board_runs + progress。
+    # runs 审计表（会话结束落账）与黑板运行生命周期不同源，故黑板运行
+    # 存 board_runs，不复用 runs 的主键。
+    # ------------------------------------------------------------------
+
+    def add_fact(
+        self,
+        task_id: str,
+        text: str,
+        *,
+        anchor_message_id: str = "",
+        source: str = "agent",
+        now: datetime,
+    ) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT INTO facts(task_id, text, anchor_message_id, source, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                sanitize_text(text, 2000),
+                str(anchor_message_id or ""),
+                source if source in FACT_SOURCES else "agent",
+                now.isoformat(),
+            ),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid or 0)
+
+    def facts_for_task(self, task_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM facts WHERE task_id = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (task_id, max(1, int(limit))),
+        ).fetchall()
+        facts = [self._fact_row_to_dict(row) for row in rows]
+        facts.reverse()
+        return facts
+
+    @staticmethod
+    def _fact_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "task_id": str(row["task_id"]),
+            "text": str(row["text"]),
+            "anchor_message_id": str(row["anchor_message_id"] or ""),
+            "source": str(row["source"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    def board_tasks(
+        self,
+        *,
+        contact_id: str = "",
+        status: str = "",
+        include_done: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """黑板任务视图：跨联系人的未归档事项，每条带最近 3 条 facts。
+
+        默认只有 open/waiting；include_done=True 时含 completed/cancelled。
+        归档事项不进黑板（归档是退出默认上下文，与业务状态正交）。
+        """
+        if status and status not in TASK_STATUSES:
+            return []
+        conditions = ["archived_at = ''"]
+        parameters: list[Any] = []
+        if status:
+            conditions.append("status = ?")
+            parameters.append(status)
+        elif not include_done:
+            conditions.append("status IN ('open', 'waiting')")
+        if contact_id:
+            conditions.append("scope_contact = ?")
+            parameters.append(contact_id)
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM tasks WHERE {' AND '.join(conditions)}
+            ORDER BY last_evidence_at DESC LIMIT ?
+            """,
+            (*parameters, max(1, min(int(limit), 50))),
+        ).fetchall()
+        tasks = [self._task_row_to_dict(row) for row in rows]
+        for task in tasks:
+            task["recent_facts"] = self.facts_for_task(task["id"], limit=3)
+        return tasks
+
+    def register_run(
+        self,
+        session_id: str,
+        *,
+        contact_id: str,
+        stage: str,
+        task_id: str | None = None,
+        headline: str = "",
+        now: datetime,
+    ) -> None:
+        """登记一次黑板运行；幂等，重复登记保留最早起始时间。"""
+        if not session_id:
+            return
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO board_runs(
+                session_id, task_id, contact_id, stage, status, headline,
+                started_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
+            """,
+            (
+                session_id,
+                task_id,
+                contact_id,
+                stage,
+                sanitize_text(headline, 200),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self.connection.commit()
+
+    def touch_run(
+        self,
+        session_id: str,
+        *,
+        status: str | None = None,
+        headline: str | None = None,
+        now: datetime,
+    ) -> None:
+        """刷新黑板运行心跳；可选更新状态/一句话进度。已结束的运行不再刷新。"""
+        if not session_id:
+            return
+        assignments = ["updated_at = ?"]
+        parameters: list[Any] = [now.isoformat()]
+        if status is not None:
+            if status not in BOARD_RUN_STATUSES:
+                raise ValueError(f"invalid board run status: {status}")
+            assignments.append("status = ?")
+            parameters.append(status)
+        if headline is not None:
+            assignments.append("headline = ?")
+            parameters.append(sanitize_text(headline, 200))
+        parameters.append(session_id)
+        self.connection.execute(
+            f"""
+            UPDATE board_runs SET {', '.join(assignments)}
+            WHERE session_id = ? AND ended_at IS NULL
+            """,
+            parameters,
+        )
+        self.connection.commit()
+
+    def close_run(self, session_id: str, outcome: str, *, now: datetime) -> None:
+        """结束黑板运行；首次收口生效（幂等），后续 close 不覆盖已记结果。"""
+        if not session_id:
+            return
+        self.connection.execute(
+            """
+            UPDATE board_runs
+            SET status = ?, outcome = ?, ended_at = ?, updated_at = ?
+            WHERE session_id = ? AND ended_at IS NULL
+            """,
+            (
+                BOARD_RUN_OUTCOME_STATUS.get(outcome, "done"),
+                outcome,
+                now.isoformat(),
+                now.isoformat(),
+                session_id,
+            ),
+        )
+        self.connection.commit()
+
+    def abort_stale_runs(self, now: datetime) -> int:
+        """把重启后仍处于未收口状态的运行标记为 aborted（单实例服务的
+        启动扫尾：进程不在了，running 一定是上次未收口的遗留）。"""
+        cursor = self.connection.execute(
+            """
+            UPDATE board_runs
+            SET status = 'aborted', outcome = 'aborted', ended_at = ?,
+                updated_at = ?
+            WHERE status IN ('running', 'waiting') AND ended_at IS NULL
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+        self.connection.commit()
+        return cursor.rowcount
+
+    def active_runs(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM board_runs
+            WHERE status IN ('running', 'waiting') AND ended_at IS NULL
+            ORDER BY started_at
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_progress(self, session_id: str, text: str, *, now: datetime) -> int:
+        """给运行追加一条流水；seq 在会话内自增，仅给人看不触发通知。"""
+        clean = sanitize_text(text, 2000)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM progress WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            seq = int(row[0]) + 1
+            self.connection.execute(
+                """
+                INSERT INTO progress(session_id, seq, text, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (session_id, seq, clean, now.isoformat()),
+            )
+            self.connection.commit()
+            return seq
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def recent_progress(self, session_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT seq, text, created_at FROM progress
+            WHERE session_id = ? ORDER BY seq DESC LIMIT ?
+            """,
+            (session_id, max(1, int(limit))),
+        ).fetchall()
+        entries = [
+            {"seq": int(row["seq"]), "text": str(row["text"]), "created_at": str(row["created_at"])}
+            for row in rows
+        ]
+        entries.reverse()
+        return entries
 
     def archive_inactive_tasks(self, now: datetime, inactive_days: int) -> int:
         """把超过 inactive_days 无实质证据的 open/waiting 事项归档。

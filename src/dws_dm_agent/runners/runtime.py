@@ -24,6 +24,9 @@ from . import claude, codex, custom, pi
 
 
 _STAGE_ORDER = ("front", "worker")
+# git worktree add/remove 的兜底超时：大仓冷克隆态下 add 可能很慢，
+# 但绝不能无限等（会吃掉整个会话预算）。
+_WORKTREE_TIMEOUT_SECONDS = 600.0
 # 事件流单行上限必须容纳"允许下载的整批图片原样回传"：pi RPC 会把带图用户
 # 消息（含 base64 ImageContent）在 message/agent 事件里原样发回，单行最大为
 # 全部图片的 base64 膨胀（4/3）+ JSON 结构与文本余量。上限从 core 的图片
@@ -38,10 +41,10 @@ _DRIVER_PROTOCOLS = {
     "claude": "claude-stream-json",
     "pi": "pi-rpc",
 }
-# 本服务自有控制/事项工具（no_reply/task_record/task_lookup）目前只在
-# pi-rpc 挂载（见 runners/pi.py 与 pi_dws_tools.ts）；from_config 用这份
-# 名单约束"提示词引用了服务工具"与"阶段/备用 agent 协议"的组合。
-_SERVICE_TOOL_NAMES = ("no_reply", "task_record", "task_lookup")
+# 本服务自有控制/事项工具（no_reply/task_record/task_lookup/report）目前
+# 只在 pi-rpc 挂载（见 runners/pi.py 与 pi_dws_tools.ts）；from_config 用
+# 这份名单约束"提示词引用了服务工具"与"阶段/备用 agent 协议"的组合。
+_SERVICE_TOOL_NAMES = ("no_reply", "task_record", "task_lookup", "report")
 _SERVICE_TOOL_PROTOCOL = "pi-rpc"
 _SUPPORTED_PROTOCOLS = frozenset(
     (*_DRIVER_PROTOCOLS.values(), "custom-jsonl-v1")
@@ -96,6 +99,9 @@ class AgentProfile:
     extra_args: tuple[str, ...]
     # 执行失败时按顺序切换的备用 agent 名（仅对 worker 阶段生效）
     fallbacks: tuple[str, ...] = ()
+    # worker 阶段的 worktree 隔离仓（workspace_root 下的目录名；空=关闭）：
+    # 每次运行在 worktree_root 下从该仓当前 HEAD 建独立 worktree。
+    worktree_repo: str = ""
 
     @property
     def binary(self) -> str:
@@ -132,6 +138,13 @@ class PreparedAgent:
     # （本运行已覆盖消息的 id -> 时间戳映射）是证据 ID 的校验集与
     # 时间戳来源，保证事项证据落在被引用消息自身的实际时间上。
     task_context_path: Path | None = None
+    # pi RPC 专用：report 工具写 final/blocked 正文的文件；runtime 在
+    # tool_execution_end 读取后按正文收口会话（与 silent 同一通路）。
+    report_path: Path | None = None
+    # worktree 隔离（worker 专用）：源仓与本次运行的 worktree 路径。
+    # abort 清理 worktree，成功路径保留现场。
+    worktree_source: Path | None = None
+    worktree_path: Path | None = None
 
     @property
     def timeout_seconds(self) -> float:
@@ -159,6 +172,7 @@ class AgentSession:
         self._final_text = ""
         self._escalated = False
         self._silent = False
+        self._report_outcome = ""
         self._progress: list[str] = []
         self._stream_text = ""
         self._codex_item_phases: dict[str, str] = {}
@@ -188,6 +202,11 @@ class AgentSession:
     @property
     def silent(self) -> bool:
         return self._silent
+
+    @property
+    def blocked(self) -> bool:
+        """report(blocked) 结束的运行：正文照常交付，结果记为 blocked。"""
+        return self._report_outcome == "blocked"
 
     async def start(self) -> None:
         if self.process is not None:
@@ -296,6 +315,8 @@ class AgentSession:
                 raise RuntimeError(f"unsupported agent protocol: {self.prepared.protocol}")
         except Exception:
             await self.close()
+            # 启动失败等同于中止：没有可保留的运行现场，worktree 一并回收。
+            await self._remove_worktree()
             raise
 
     async def wait(self, timeout: float | None = None) -> None:
@@ -370,22 +391,57 @@ class AgentSession:
         return reply
 
     async def abort(self) -> None:
-        if self.process is None or self.process.returncode is not None:
-            return
-        with suppress(Exception):
-            if self.prepared.protocol == "codex-app-server" and self.thread_id and self.turn_id:
-                await self._jsonrpc_call(
-                    "turn/interrupt",
-                    {"threadId": self.thread_id, "turnId": self.turn_id},
-                    timeout=2,
-                )
-            elif self.prepared.protocol == "pi-rpc":
-                await self._pi_call({"type": "abort"}, timeout=2)
-            elif self.prepared.protocol == "custom-jsonl-v1":
-                await self._custom_call(
-                    {"type": "abort", "sessionId": self.session_id}, timeout=2
-                )
+        if self.process is not None and self.process.returncode is None:
+            with suppress(Exception):
+                if self.prepared.protocol == "codex-app-server" and self.thread_id and self.turn_id:
+                    await self._jsonrpc_call(
+                        "turn/interrupt",
+                        {"threadId": self.thread_id, "turnId": self.turn_id},
+                        timeout=2,
+                    )
+                elif self.prepared.protocol == "pi-rpc":
+                    await self._pi_call({"type": "abort"}, timeout=2)
+                elif self.prepared.protocol == "custom-jsonl-v1":
+                    await self._custom_call(
+                        {"type": "abort", "sessionId": self.session_id}, timeout=2
+                    )
         await self.close()
+        # abort 清理 worktree：被中止的运行没有可保留的现场；成功路径的
+        # close() 不走这里，现场留给操作者检查。清理失败只记日志，不掩盖
+        # abort 本身的结果。
+        await self._remove_worktree()
+
+    async def _remove_worktree(self) -> None:
+        prepared = self.prepared
+        if (
+            prepared.worktree_path is None
+            or prepared.worktree_source is None
+            or not prepared.worktree_path.exists()
+        ):
+            return
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "git", "-C", str(prepared.worktree_source),
+                    "worktree", "remove", "--force", str(prepared.worktree_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_WORKTREE_TIMEOUT_SECONDS,
+            )
+            if completed.returncode != 0:
+                logging.getLogger(__name__).warning(
+                    "worktree remove failed path=%s detail=%s",
+                    prepared.worktree_path,
+                    completed.stderr.strip()[:300],
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logging.getLogger(__name__).warning(
+                "worktree remove failed path=%s error=%s",
+                prepared.worktree_path,
+                exc,
+            )
 
     async def close(self) -> None:
         if self._closing:
@@ -625,6 +681,15 @@ class AgentSession:
                 # 只在工具真正执行成功后才承认 silent；工具失败时模型继续正常
                 # 收尾，不能把一次失败的 no_reply 当成沉默吞掉后续正文。
                 self._capture_silent()
+            elif (
+                event_type == "tool_execution_end"
+                and not event.get("isError")
+                and _is_report_tool(event.get("toolName"))
+            ):
+                # report(final/blocked) 已在扩展侧写好 DWS_REPORT_FILE 并
+                # terminate；这里读文件把正文接进终稿通路。工具执行失败时
+                # 不终止，模型继续正常收尾。
+                self._capture_report()
             elif event_type == "message_end":
                 text = _assistant_text(event)
                 if text and _is_pi_intermediate_message(event.get("message")):
@@ -635,14 +700,16 @@ class AgentSession:
                     self._capture_body(text, final=True)
             elif event_type == "agent_end":
                 messages = event.get("messages")
-                if isinstance(messages, list):
+                if isinstance(messages, list) and not self._report_outcome:
                     reply = _pi_final_reply_text(messages)
                     if reply:
                         self._capture_body(reply, final=True)
                     else:
                         # 本轮没有可交付的终稿：清掉 message_end 期间捕获的
                         # 候选文本，宁可空回复走 fallback 链，也不能把
-                        # 中间陈述当正式回复发出。
+                        # 中间陈述当正式回复发出。report 终稿除外：终止性
+                        # report 的最后一条 assistant 消息带 toolCall，
+                        # 终稿在工具事件里，这里不能清掉。
                         self._final_text = ""
                 if (
                     not self._escalated
@@ -736,6 +803,34 @@ class AgentSession:
         self._complete.set()
         self._signal_update()
 
+    def _capture_report(self) -> None:
+        """读取 report 工具落盘的 {kind, text} 并按终稿收口会话。
+
+        progress 调用不写文件也不终止（文件缺失直接忽略，模型继续跑）；
+        final/blocked 的文件存在但不可解析说明扩展与 runtime 的交接断了：
+        按失败收口（错误可见、可走 fallback），不能静默当无终稿处理。
+        """
+        if self.prepared.report_path is None:
+            return
+        try:
+            raw = self.prepared.report_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._fail(f"report_result_invalid: {exc}")
+            return
+        kind = str(payload.get("kind") or "")
+        text = str(payload.get("text") or "").strip()
+        if kind not in {"final", "blocked"} or not text:
+            self._fail("report_result_invalid: bad payload")
+            return
+        self._report_outcome = kind
+        self._capture_body(text, final=True)
+        self._complete.set()
+        self._signal_update()
+
     def _capture_stream_delta(self, delta: str) -> None:
         if not delta:
             return
@@ -771,6 +866,11 @@ class AgentSession:
         self._signal_update()
 
 
+class WorktreeError(RuntimeError):
+    """worktree 隔离失败：运行按 failed 收口，不允许 fallback 链在
+    未隔离的主仓上重试同一段写操作。"""
+
+
 class AgentRuntime:
     """Loads one two-stage workflow and hides provider-specific protocols."""
 
@@ -784,12 +884,14 @@ class AgentRuntime:
         supplement_strategy: str,
         supplement_prompt_path: Path,
         auto_messages: Mapping[str, Any],
+        worktree_root: Path | None = None,
     ) -> None:
         self.name = name
         self._stages = dict(stages)
         self._profiles = dict(profiles)
         self._config_dir = config_dir
         self._workspace_root = workspace_root
+        self._worktree_root = worktree_root or workspace_root / "worktrees"
         self.supplement_strategy = supplement_strategy
         self._supplement_prompt_path = supplement_prompt_path
         self._auto_messages = dict(auto_messages)
@@ -875,6 +977,7 @@ class AgentRuntime:
                 environment={str(key): str(item) for key, item in environment.items()},
                 extra_args=tuple(str(item) for item in extra_args),
                 fallbacks=tuple(str(item).strip() for item in fallbacks_raw),
+                worktree_repo=str(value.get("worktree_repo") or ""),
             )
         active = str(workflow_values.get("active") or "")
         presets = workflow_values.get("presets")
@@ -890,6 +993,10 @@ class AgentRuntime:
         if int(auto_messages.get("max_progress_updates", 60)) < 0:
             raise ValueError("max progress updates must not be negative")
         config_dir = config_path.resolve().parent
+        worktree_value = raw.get("worktree_root")
+        worktree_root = (
+            _resolve_path(config_dir, worktree_value) if worktree_value else None
+        )
         supplement_prompt_path = _resolve_path(
             config_dir, preset.get("supplement_prompt") or "prompts/supplement.md"
         )
@@ -976,6 +1083,7 @@ class AgentRuntime:
             supplement_strategy,
             supplement_prompt_path,
             auto_messages,
+            worktree_root=worktree_root,
         )
 
     def render(self, stage_name: str, variables: Mapping[str, Any]) -> str:
@@ -1048,6 +1156,7 @@ class AgentRuntime:
                 Path(__file__).with_name("escalate_mcp.py").resolve()
             )
         task_context_path: Path | None = None
+        report_path: Path | None = None
         if protocol == "pi-rpc" and task_context is not None:
             # 事项工具的作用域与运行信息只经环境变量注入 pi_dws_tools.ts，
             # 不进入 prompt，模型无法伪造其他作用域。DWS_TASK_CONTEXT 是
@@ -1066,11 +1175,24 @@ class AgentRuntime:
                 environment["DWS_TASK_CONTEXT"], encoding="utf-8"
             )
             environment["DWS_TASK_CONTEXT_FILE"] = str(task_context_path)
+            # report(final/blocked) 的正文经该文件传回 runtime（terminate
+            # 之后的最后一条 assistant 消息带 toolCall，不能当终稿）。
+            report_path = session_dir / "report.json"
+            environment["DWS_REPORT_FILE"] = str(report_path)
+        cwd = self._workspace_root
+        worktree_source: Path | None = None
+        worktree_path: Path | None = None
+        if stage_name == "worker" and stage.profile.worktree_repo:
+            worktree_source, worktree_path = self._add_worktree(
+                stage.profile.worktree_repo, session_id
+            )
+            cwd = worktree_path
+            environment["DWS_WORKTREE"] = str(worktree_path)
         return PreparedAgent(
             stage=stage,
             protocol=protocol,
             argv=tuple(argv),
-            cwd=self._workspace_root,
+            cwd=cwd,
             environment=environment,
             prompt=prompt,
             thread_options=_thread_options(stage.profile, self._workspace_root),
@@ -1081,7 +1203,39 @@ class AgentRuntime:
             local_image_paths=tuple(local_images),
             pi_images=pi_images,
             task_context_path=task_context_path,
+            report_path=report_path,
+            worktree_source=worktree_source,
+            worktree_path=worktree_path,
         )
+
+    def _add_worktree(self, repo: str, session_id: str) -> tuple[Path, Path]:
+        """从 workspace_root/<repo> 当前 HEAD 建本次运行专属的 worktree。
+
+        失败抛 WorktreeError：隔离不可用时宁可整场 failed，也不能让模型
+        在共享主仓上执行写操作（fallback 链同样被拦下）。
+        """
+        source = self._workspace_root / repo
+        if not source.is_dir() or not (source / ".git").exists():
+            raise WorktreeError(f"worktree_repo is not a git repository: {repo}")
+        target = self._worktree_root / f"{repo}-{session_id[:10]}"
+        try:
+            self._worktree_root.mkdir(parents=True, exist_ok=True)
+            completed = subprocess.run(
+                [
+                    "git", "-C", str(source),
+                    "worktree", "add", "--detach", str(target), "HEAD",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_WORKTREE_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise WorktreeError(f"git worktree add failed: {exc}") from exc
+        if completed.returncode != 0:
+            raise WorktreeError(
+                f"git worktree add failed: {completed.stderr.strip()[:300]}"
+            )
+        return source, target
 
     def open_session(
         self,
@@ -1407,3 +1561,8 @@ def _is_no_reply_tool(value: Any) -> bool:
     return name == "no_reply" or name.endswith(
         ("__no_reply", "/no_reply", ":no_reply")
     )
+
+
+def _is_report_tool(value: Any) -> bool:
+    name = str(value or "").lower()
+    return name == "report" or name.endswith(("__report", "/report", ":report"))

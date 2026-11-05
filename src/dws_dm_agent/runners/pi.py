@@ -4,8 +4,9 @@ from pathlib import Path
 from typing import Any
 
 
-# 本服务自有工具：no_reply 控制结果 + 事项记忆读写，front/worker 都挂载。
-_DWS_TOOL_NAMES = ("no_reply", "task_record", "task_lookup")
+# 本服务自有工具：no_reply 控制结果 + 事项记忆读写 + report 进度/终态，
+# front/worker 都挂载。
+_DWS_TOOL_NAMES = ("no_reply", "task_record", "task_lookup", "report")
 
 
 def command(profile: Any, mount_escalate: bool = False, *, model_override: str | None = None) -> list[str]:

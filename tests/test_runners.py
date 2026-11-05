@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,11 @@ from urllib.request import Request, urlopen
 
 from dws_dm_agent.front_eval import load_cases, matches_expected
 from dws_dm_agent.runners import pi as pi_module
-from dws_dm_agent.runners.runtime import AgentRuntime, AgentSession
+from dws_dm_agent.runners.runtime import (
+    AgentRuntime,
+    AgentSession,
+    WorktreeError,
+)
 from dws_dm_agent.dashboard import (
     AgentConfigStore,
     ConfigBusyError,
@@ -33,6 +38,8 @@ class AgentRuntimeTests(unittest.TestCase):
         worker_read_only: bool = False,
         command: list[str] | None = None,
         protocol: str = "",
+        worker_extra: dict | None = None,
+        worktree_root: str | None = None,
     ) -> AgentRuntime:
         (root / "prompts").mkdir(parents=True)
         (root / "prompts" / "front.md").write_text(
@@ -87,8 +94,10 @@ class AgentRuntimeTests(unittest.TestCase):
                     "timeout_seconds": 300,
                     "options": options,
                     "environment": {"RUNTIME_TEST": "1"},
+                    **(worker_extra or {}),
                 },
             },
+            **({"worktree_root": worktree_root} if worktree_root else {}),
             "workflows": {
                 "active": "dm-default",
                 "presets": {
@@ -204,9 +213,9 @@ class AgentRuntimeTests(unittest.TestCase):
             pi_worker = pi.prepare("worker", "worker", "prompt", root / "pw")
             self.assertEqual(pi_front.protocol, "pi-rpc")
             self.assertIn("rpc", pi_front.argv)
-            # 前台显式工具集在 escalate 之外追加服务工具（no_reply/事项记忆）。
+            # 前台显式工具集在 escalate 之外追加服务工具（no_reply/事项记忆/report）。
             self.assertIn(
-                "read,grep,find,ls,escalate,no_reply,task_record,task_lookup",
+                "read,grep,find,ls,escalate,no_reply,task_record,task_lookup,report",
                 pi_front.argv,
             )
             self.assertNotIn("read,grep,find,ls", pi_worker.argv)
@@ -218,7 +227,7 @@ class AgentRuntimeTests(unittest.TestCase):
             pi_front = pi.prepare("front", "front-fast", "prompt", root / "pf-fast")
             # tools 为空串时 escalate 仍强制挂载，服务工具随之进入列表。
             self.assertIn(
-                "escalate,no_reply,task_record,task_lookup", pi_front.argv
+                "escalate,no_reply,task_record,task_lookup,report", pi_front.argv
             )
             self.assertNotIn("read,grep,find,ls", pi_front.argv)
 
@@ -842,7 +851,7 @@ class PiDwsToolsMountTests(unittest.TestCase):
             self.assertNotIn("pi_escalate.ts", " ".join(worker.argv))
             # 显式工具集只出现在 front；worker 默认全量工具，不能被收窄。
             self.assertIn(
-                "read,grep,find,ls,escalate,no_reply,task_record,task_lookup",
+                "read,grep,find,ls,escalate,no_reply,task_record,task_lookup,report",
                 front.argv,
             )
             self.assertNotIn("--tools", worker.argv)
@@ -1546,6 +1555,241 @@ class PiEventStreamLimitTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 await self._close_session(session)
+
+
+# 模拟可长期存活的 pi RPC 子进程：回一个 prompt 成功响应后挂起，
+# 用于驱动真实的 start/abort 生命周期（含 worktree 清理）。
+_WAIT_EMITTER = """
+import json, sys, time
+
+request = json.loads(sys.stdin.readline())
+print(json.dumps({
+    "id": request.get("id"),
+    "type": "response",
+    "command": "prompt",
+    "success": True,
+}), flush=True)
+while True:
+    time.sleep(1)
+"""
+
+
+def _git_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "w1@example.com")
+    git("config", "user.name", "w1")
+    (path / "README.md").write_text("hello", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "init")
+    return path
+
+
+class WorkerWorktreeIsolationTests(unittest.IsolatedAsyncioTestCase):
+    def _worktree_runtime(
+        self, root: Path, *, command: list[str] | None = None
+    ) -> AgentRuntime:
+        return AgentRuntimeTests()._runtime(
+            root,
+            "pi",
+            command=command,
+            protocol="pi-rpc",
+            worker_extra={"worktree_repo": "repo"},
+            worktree_root=str(root / "wt"),
+        )
+
+    def test_worker_prepare_builds_detached_worktree_from_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            # resolve 消除 macOS 上 /var 与 /private/var 的 symlink 差异：
+            # runtime 内部对 workspace/worktree root 全部走 resolve。
+            root = Path(directory).resolve()
+            _git_repo(root / "repo")
+            runtime = self._worktree_runtime(root)
+
+            prepared = runtime.prepare(
+                "worker", "sess-abcdef1234567890", "prompt", root / "run"
+            )
+
+            target = root / "wt" / "repo-sess-abcde"
+            self.assertEqual(prepared.cwd, target)
+            self.assertEqual(prepared.worktree_source, root / "repo")
+            self.assertEqual(prepared.environment["DWS_WORKTREE"], str(target))
+            self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "hello")
+
+            # 源仓后续提交不进入已建好的 worktree（detached 在建点 HEAD）。
+            subprocess.run(
+                ["git", "-C", str(root / "repo"), "commit", "-q", "--allow-empty",
+                 "-m", "later"],
+                check=True, capture_output=True,
+            )
+            self.assertEqual(
+                (target / "README.md").read_text(encoding="utf-8"), "hello"
+            )
+
+    def test_front_stage_never_gets_a_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _git_repo(root / "repo")
+            raw_extra = {"worktree_repo": "repo"}
+            runtime = AgentRuntimeTests()._runtime(
+                root, "pi", worker_extra=raw_extra, worktree_root=str(root / "wt")
+            )
+
+            prepared = runtime.prepare("front", "sess-front", "prompt", root / "run")
+
+            self.assertEqual(prepared.cwd, root)
+            self.assertIsNone(prepared.worktree_path)
+            self.assertNotIn("DWS_WORKTREE", prepared.environment)
+            self.assertFalse((root / "wt" / "repo-sess-front").exists())
+
+    def test_missing_or_non_git_repo_fails_prepare_with_worktree_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "not-a-repo").mkdir()
+            runtime = self._worktree_runtime(root)
+
+            with self.assertRaises(WorktreeError):
+                runtime.prepare(
+                    "worker", "sess-x", "prompt", root / "run"
+                )
+            self.assertFalse((root / "wt").exists() and any((root / "wt").iterdir()))
+
+    async def test_abort_removes_worktree_but_plain_close_keeps_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _git_repo(root / "repo")
+            emitter = root / "wait-emitter.py"
+            emitter.write_text(_WAIT_EMITTER, encoding="utf-8")
+            runtime = self._worktree_runtime(root, command=[sys.executable, str(emitter)])
+
+            session = AgentSession(
+                runtime.prepare(
+                    "worker", "sess-abort12345", "prompt", root / "run"
+                ),
+                "sess-abort12345",
+            )
+            target = root / "wt" / "repo-sess-abort"
+            await session.start()
+            try:
+                self.assertTrue(target.exists())
+                await session.close()
+                # 成功路径保留现场：close 不清 worktree。
+                self.assertTrue(target.exists())
+            finally:
+                await session.abort()
+            self.assertFalse(target.exists())
+
+
+class PiReportToolTests(unittest.IsolatedAsyncioTestCase):
+    def _session(self, root: Path) -> AgentSession:
+        runtime = AgentRuntimeTests()._runtime(root, "pi")
+        return AgentSession(
+            runtime.prepare(
+                "worker",
+                "session",
+                "prompt",
+                root / "run",
+                task_context={
+                    "db_path": "/tmp/audit.sqlite3",
+                    "self_id": "self-open",
+                    "contact_id": "u-1",
+                    "conversation_id": "conversation-1",
+                    "run_id": "session",
+                    "message_times": {"message-1": "2026-11-06T09:00:00+08:00"},
+                },
+            ),
+            "session",
+        )
+
+    async def _tool_end(self, session: AgentSession, *, is_error: bool = False) -> None:
+        await session._handle_event(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "tool-report",
+                "toolName": "report",
+                "isError": is_error,
+            }
+        )
+
+    async def test_report_final_text_survives_toolcall_only_agent_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            assert session.prepared.report_path is not None
+            session.prepared.report_path.write_text(
+                json.dumps({"kind": "final", "text": "报表已生成并发给对方。"}),
+                encoding="utf-8",
+            )
+            await self._tool_end(session)
+            self.assertTrue(session.done)
+            self.assertFalse(session.blocked)
+            self.assertEqual(session.result(), "报表已生成并发给对方。")
+
+            # terminate 后最后一条 assistant 消息带 toolCall：终稿在工具事件
+            # 里，agent_end 不能把它清掉。
+            await session._handle_event(
+                {
+                    "type": "agent_end",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "stopReason": "toolUse",
+                            "content": [
+                                {"type": "text", "text": "调用 report 收尾。"},
+                                {
+                                    "type": "toolCall",
+                                    "toolCallId": "tool-report",
+                                    "name": "report",
+                                },
+                            ],
+                        }
+                    ],
+                }
+            )
+            self.assertEqual(session.result(), "报表已生成并发给对方。")
+            self.assertEqual(session.error, "")
+
+    async def test_report_blocked_marks_outcome_without_silence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            assert session.prepared.report_path is not None
+            session.prepared.report_path.write_text(
+                json.dumps({"kind": "blocked", "text": "缺少集群权限，无法继续。"}),
+                encoding="utf-8",
+            )
+            await self._tool_end(session)
+
+            self.assertTrue(session.blocked)
+            self.assertFalse(session.silent)
+            self.assertEqual(session.result(), "缺少集群权限，无法继续。")
+
+    async def test_progress_report_end_without_file_keeps_session_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            # progress 不写文件也不终止：工具正常返回后模型继续执行。
+            await self._tool_end(session)
+
+            self.assertFalse(session.done)
+            self.assertFalse(session.blocked)
+            self.assertEqual(session.error, "")
+
+    async def test_corrupt_report_file_fails_the_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            assert session.prepared.report_path is not None
+            session.prepared.report_path.write_text("{not-json", encoding="utf-8")
+            await self._tool_end(session)
+
+            self.assertTrue(session.done)
+            self.assertIn("report_result_invalid", session.error)
 
 
 if __name__ == "__main__":

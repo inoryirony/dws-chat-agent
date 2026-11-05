@@ -27,7 +27,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-from .runners.runtime import AgentRuntime, AgentSession
+from .runners.runtime import AgentRuntime, AgentSession, WorktreeError
 from .core import (
     MAX_IMAGES,
     MAX_IMAGE_BYTES,
@@ -168,12 +168,19 @@ class AgentResult:
     error: str = ""
     # 模型显式调用 no_reply 后的成功终态：不发消息、不进 fallback。
     silent: bool = False
+    # 模型经 report(blocked, text) 结束：正文照常交付，运行结果记 blocked。
+    blocked: bool = False
+    # 不可重试的失败（如 worktree 隔离建立失败）：禁止 fallback 链在
+    # 未隔离的环境里重试同一段写操作。
+    fatal: bool = False
 
     @property
     def outcome(self) -> str:
-        """运行的明确结果：interrupted/escalate/silent/reply/error。"""
+        """运行的明确结果：interrupted/blocked/escalate/silent/reply/error。"""
         if self.manual_takeover:
             return "interrupted"
+        if self.blocked:
+            return "blocked"
         if self.escalated:
             return "escalate"
         if self.silent:
@@ -181,6 +188,17 @@ class AgentResult:
         if self.reply is not None:
             return "reply"
         return "error"
+
+
+# 黑板运行的收口 outcome：AgentResult.outcome -> close_run outcome。
+_BOARD_CLOSE_OUTCOME = {
+    "interrupted": "aborted",
+    "blocked": "blocked",
+    "escalate": "escalate",
+    "silent": "silent",
+    "reply": "final",
+    "error": "failed",
+}
 
 
 def configure_logging(state_dir: Path, verbose: bool = False) -> None:
@@ -270,6 +288,11 @@ class AgentService:
         self.settings.state_dir.mkdir(parents=True, exist_ok=True)
         self.settings.worktree_root.mkdir(parents=True, exist_ok=True)
         LOG.info("starting mode=%s contacts=%d", self.mode, len(self.settings.contacts))
+        aborted_runs = self.store.abort_stale_runs(
+            datetime.now(self.settings.timezone)
+        )
+        if aborted_runs:
+            LOG.warning("startup aborted stale board runs count=%d", aborted_runs)
         days = self._task_memory_inactive_days()
         if days > 0:
             archived = self.store.archive_inactive_tasks(
@@ -1314,6 +1337,13 @@ class AgentService:
             codex_exit_code=result.exit_code,
             request_preview=self._request_preview(batch),
         )
+        # 黑板运行在此收口：_record_agent_result 覆盖全部 agent 会话终态
+        # （回复/silent/失败/接管/补充重排），close_run 幂等，首次收口生效。
+        self.store.close_run(
+            result.session_id,
+            _BOARD_CLOSE_OUTCOME.get(result.outcome, "failed"),
+            now=datetime.now(self.settings.timezone),
+        )
 
     def _task_memory_inactive_days(self) -> int:
         value = int(
@@ -1456,8 +1486,10 @@ class AgentService:
                 or result.silent
                 or result.manual_takeover
                 or result.supplements
+                or result.fatal
             ):
-                # silent 与正常回复同为成功终态，不能触发 fallback 兜底发送。
+                # silent 与正常回复同为成功终态，不能触发 fallback 兜底发送；
+                # fatal（隔离建立失败等）不允许在未隔离环境重试同一段写操作。
                 return result
             LOG.warning(
                 "worker fallback engaged agent=%s attempt=%d/%d error=%s",
@@ -1550,6 +1582,26 @@ class AgentService:
                 self.store.register_task_run(
                     session_id, datetime.now(self.settings.timezone)
                 )
+            # 黑板运行随会话开启登记（front/worker 都登）；headline 先以
+            # 请求摘要占位，report(progress) 会换成模型写的一句话进度。
+            self.store.register_run(
+                session_id,
+                contact_id=batch[0].contact.identity,
+                stage=stage,
+                headline=self._request_preview(batch)[:80],
+                now=datetime.now(self.settings.timezone),
+            )
+        except WorktreeError as exc:
+            shutil.rmtree(session_dir, ignore_errors=True)
+            return AgentResult(
+                session_id,
+                None,
+                None,
+                started_at,
+                datetime.now(self.settings.timezone),
+                error=f"{type(exc).__name__}: {exc}",
+                fatal=True,
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             shutil.rmtree(session_dir, ignore_errors=True)
             return AgentResult(
@@ -1584,6 +1636,9 @@ class AgentService:
             # 运行内不对外展示进度/思考：卡片要等非 silent 结果决定后才创建。
             while not session.done:
                 self._touch_runtime(batch[0].conversation_id)
+                self.store.touch_run(
+                    session_id, now=datetime.now(self.settings.timezone)
+                )
                 remaining = (
                     deadline - asyncio.get_running_loop().time()
                     if deadline is not None
@@ -1745,6 +1800,7 @@ class AgentService:
                 started_at,
                 datetime.now(self.settings.timezone),
                 escalated=session.escalated,
+                blocked=session.blocked,
                 consumed_supplements=sorted(
                     consumed.values(), key=lambda item: item.created_at
                 ),
