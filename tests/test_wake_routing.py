@@ -102,6 +102,7 @@ def _event(
     *,
     contact: Contact = ALICE,
     conversation_id: str = "conversation-1",
+    origin: str = "dm",
 ) -> IncomingEvent:
     return IncomingEvent(
         f"event-{message_id}",
@@ -110,6 +111,7 @@ def _event(
         contact,
         text,
         NOW,
+        origin=origin,
     )
 
 
@@ -404,8 +406,8 @@ class WakeDispatchTests(unittest.TestCase):
             service = _service(Path(directory))
             batch = [
                 _event("message-1", "接口好了吗"),
-                _event("wake-3", "任务完成：X，结果见 board"),
-                _event("panel-abc", "操作者指令"),
+                _event("wake-3", "任务完成：X，结果见 board", origin="wake"),
+                _event("panel-abc", "操作者指令", origin="panel"),
             ]
 
             context = service._task_context_for(batch, (), "run-1")
@@ -485,6 +487,7 @@ class SyntheticRunPromptTests(unittest.TestCase):
                     "wake-7",
                     "任务完成：上线支付回调，结果见 board",
                     conversation_id="conversation-1",
+                    origin="wake",
                 )
             ]
 
@@ -1259,6 +1262,7 @@ class PanelProgressIsolationTests(unittest.TestCase):
                     contact=Contact(
                         "operator", "天泽", "", SELF_OPEN_ID
                     ),
+                    origin="panel",
                 )
             ]
 

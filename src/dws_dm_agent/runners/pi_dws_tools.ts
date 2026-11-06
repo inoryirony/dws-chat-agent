@@ -113,6 +113,15 @@ const taskRecord = defineTool({
 					Type.Literal("cancelled"),
 				]),
 			),
+			ask: Type.Optional(
+				Type.String({
+					description:
+						"When status=waiting and waiting_on is the operator: " +
+						"one line stating what decision you need from them. " +
+						"goal says what the problem is; ask says what they must " +
+						"decide. Pass \"\" to clear.",
+				}),
+			),
 			waiting_on: Type.Optional(
 				Type.String({
 					description:
@@ -180,7 +189,8 @@ const taskLookup = defineTool({
 	label: "Read the board",
 	description:
 		"Read the task board across contacts: open/waiting tasks by default, " +
-		"completed/cancelled with include_done=true (for later follow-ups). " +
+		"completed/cancelled with include_done=true (for later follow-ups), " +
+		"archived tasks with include_archived=true (needed to restore one). " +
 		"Filter by a contact_id from a previous result to see one contact's " +
 		"tasks. Each task carries its latest facts; looking up does not " +
 		"extend a task's lifetime.",
@@ -203,6 +213,13 @@ const taskLookup = defineTool({
 				Type.Boolean({
 					description:
 						"Include completed/cancelled tasks; default false",
+				}),
+			),
+			include_archived: Type.Optional(
+				Type.Boolean({
+					description:
+						"Include archived tasks; default false. Needed to read " +
+						"an archived task's id/version before restore=true",
 				}),
 			),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),

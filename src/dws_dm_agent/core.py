@@ -62,12 +62,21 @@ class Contact:
 
 @dataclass(frozen=True)
 class IncomingEvent:
+    """进漏斗的统一信封。origin 是触发语义的唯一判定字段：
+
+    dm      钉钉私聊真人消息（默认，含恢复/对账补收）
+    wake    到点/终态/作答合成输入（无新授权，回声切断依据）
+    panel   操作者面板开轮（操作者本人=最高授权）
+    历史 message_id 前缀约定（wake-/panel-）只留作 id 生成，不参与判定。
+    """
+
     event_id: str
     message_id: str
     conversation_id: str
     contact: Contact
     content: str
     created_at: datetime
+    origin: str = "dm"
 
 
 @dataclass(frozen=True)
@@ -364,6 +373,7 @@ class AuditStore:
                 scope_conversation TEXT NOT NULL,
                 goal TEXT NOT NULL,
                 status TEXT NOT NULL,
+                ask TEXT NOT NULL DEFAULT '',
                 waiting_on TEXT NOT NULL DEFAULT '',
                 evidence_summary TEXT NOT NULL DEFAULT '',
                 evidence_message_ids TEXT NOT NULL DEFAULT '[]',
@@ -466,6 +476,9 @@ class AuditStore:
             "tasks": {
                 "resources": "resources TEXT NOT NULL DEFAULT '[]'",
                 "contact_ids": "contact_ids TEXT NOT NULL DEFAULT '[]'",
+                # 等裁决时的一行提问：goal 说明"问题是什么"，ask 说明
+                # "请你决定什么"。没有它面板只能把问题描述当请求展示。
+                "ask": "ask TEXT NOT NULL DEFAULT ''",
             },
             "outgoing": {
                 "source": "source TEXT NOT NULL DEFAULT 'agent'",
@@ -1049,6 +1062,7 @@ class AuditStore:
             "contact_id": str(row["scope_contact"]),
             "goal": str(row["goal"]),
             "status": str(row["status"]),
+            "ask": str(row["ask"]),
             "waiting_on": str(row["waiting_on"]),
             "resources": json.loads(row["resources"] or "[]"),
             "contact_ids": json.loads(row["contact_ids"] or "[]"),
@@ -1237,6 +1251,7 @@ class AuditStore:
         contact_id: str = "",
         status: str = "",
         include_done: bool = False,
+        include_archived: bool = False,
         limit: int = 20,
         now: datetime,
         run_id: str = "",
@@ -1259,6 +1274,7 @@ class AuditStore:
                 contact_id=contact_id,
                 status=status,
                 include_done=include_done,
+                include_archived=include_archived,
                 limit=limit,
             )
             response = {"ok": True, "tasks": tasks}
@@ -1332,6 +1348,7 @@ class AuditStore:
         task_id = str(record.get("task_id") or "")
         goal = record.get("goal")
         status = record.get("status")
+        ask = record.get("ask")
         waiting_on = record.get("waiting_on")
         evidence_summary = record.get("evidence_summary")
         evidence_message_ids = record.get("evidence_message_ids") or ()
@@ -1350,11 +1367,11 @@ class AuditStore:
                 """
                 INSERT INTO tasks(
                     id, scope_self, scope_contact, scope_conversation,
-                    goal, status, waiting_on, evidence_summary,
+                    goal, status, ask, waiting_on, evidence_summary,
                     evidence_message_ids, resources, contact_ids,
                     last_evidence_at, created_at,
                     updated_at, run_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -1363,6 +1380,7 @@ class AuditStore:
                     scope.conversation_id,
                     goal,
                     status or "open",
+                    ask or "",
                     waiting_on or "",
                     evidence_summary or "",
                     json.dumps(list(evidence_message_ids), ensure_ascii=False),
@@ -1407,13 +1425,19 @@ class AuditStore:
         # waiting_on 只在 waiting 状态有意义：显式离开 waiting 且未另提交
         # waiting_on 时一并清空，避免完成/取消/转 open 的事项残留等待说明。
         effective_waiting_on = waiting_on
-        if status is not None and status != "waiting" and waiting_on is None:
-            effective_waiting_on = ""
+        effective_ask = ask
+        if status is not None and status != "waiting":
+            if waiting_on is None:
+                effective_waiting_on = ""
+            if ask is None:
+                effective_ask = ""
         changes: dict[str, Any] = {}
         if goal and goal != str(row["goal"]):
             changes["goal"] = goal
         if status is not None and status != str(row["status"]):
             changes["status"] = status
+        if effective_ask is not None and effective_ask != str(row["ask"]):
+            changes["ask"] = effective_ask
         if effective_waiting_on is not None and effective_waiting_on != str(
             row["waiting_on"]
         ):
@@ -1441,6 +1465,9 @@ class AuditStore:
         if restore and row["archived_at"]:
             changes["archived_at"] = ""
             changes["archive_reason"] = ""
+        # 已存在的事实不重复插入、也不刷新保留期：重复提交同一条 facts
+        # 是模型的口头禅，不该让事项永远躲过 inactive_days 归档。
+        facts = [fact for fact in (facts or ()) if not self._fact_exists_tx(task_id, fact)]
         if not changes and not facts:
             return {"ok": True, "task": self._task_row_to_dict(row)}
         # 证据时间来自被引用消息自身的时间戳：引用旧消息不会把任务刷新
@@ -1530,6 +1557,19 @@ class AuditStore:
                 now.isoformat(),
             ),
         )
+
+    def _fact_exists_tx(self, task_id: str, fact: Mapping[str, Any]) -> bool:
+        """同一 task 下 text+anchor 完全相同的事实视为已存在（只看未归档行）。"""
+        text = sanitize_text(fact.get("text"), 2000)
+        if not text:
+            return True
+        anchor = str(fact.get("anchor_message_id") or "")
+        row = self.connection.execute(
+            "SELECT 1 FROM facts WHERE task_id = ? AND text = ? "
+            "AND anchor_message_id = ? LIMIT 1",
+            (task_id, text, anchor),
+        ).fetchone()
+        return row is not None
 
     def _insert_facts_tx(
         self,
@@ -1667,16 +1707,18 @@ class AuditStore:
         contact_id: str = "",
         status: str = "",
         include_done: bool = False,
+        include_archived: bool = False,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        """黑板任务视图：跨联系人的未归档事项，每条带最近 3 条 facts。
+        """黑板任务视图：跨联系人的事项，每条带最近 3 条 facts。
 
-        默认只有 open/waiting；include_done=True 时含 completed/cancelled。
-        归档事项不进黑板（归档是退出默认上下文，与业务状态正交）。
+        默认只有 open/waiting 的未归档事项；include_done=True 时含
+        completed/cancelled。include_archived=True 时把归档事项也带出，
+        供 restore 前查看原 task_id/version。
         """
         if status and status not in TASK_STATUSES:
             return []
-        conditions = ["archived_at = ''"]
+        conditions = [] if include_archived else ["archived_at = ''"]
         parameters: list[Any] = []
         if status:
             conditions.append("status = ?")

@@ -310,14 +310,19 @@ class BoardEndpointTests(unittest.TestCase):
 
 
 class BoardPageMarkupTests(unittest.TestCase):
-    def test_dashboard_wires_waiting_operator_and_write_endpoints(self) -> None:
-        page = (
-            Path(__file__).parents[1]
-            / "src"
-            / "dws_dm_agent"
-            / "web"
-            / "dashboard.html"
+    """黑板功能层（/board.js + /board.css）必须被两套设计共用。
+
+    外观各写各的没问题，功能分叉不行：任一设计少引一个文件，面板就会
+    只剩 snapshot 那半边，裁决/在跑/介入/抽屉全部消失。
+    """
+
+    def _web(self, name: str) -> str:
+        return (
+            Path(__file__).parents[1] / "src" / "dws_dm_agent" / "web" / name
         ).read_text(encoding="utf-8")
+
+    def test_shared_board_module_owns_the_write_endpoints(self) -> None:
+        board = self._web("board.js")
         for needle in (
             "/api/board",
             "/api/session/new",
@@ -326,17 +331,27 @@ class BoardPageMarkupTests(unittest.TestCase):
             "waiting_operator",
             "等我裁决",
             "在跑会话",
-            "▶",
-            "⏸",
+            "进行中",
+            "等待外部",
             # 操作者令牌：URL ?token= 交付一次，localStorage 保存后随
             # 读写请求附 X-Operator-Token 头。
             'localStorage.setItem("dwsPanelToken"',
             'localStorage.getItem("dwsPanelToken"',
             "X-Operator-Token",
         ):
-            self.assertIn(needle, page)
-        for column_head in ("id=\"colOpen\"", "id=\"colWait\"", "id=\"colDone\""):
-            self.assertIn(column_head, page)
+            self.assertIn(needle, board)
+
+    def test_both_designs_load_the_same_board_layer(self) -> None:
+        for page_name in ("dashboard.html", "diamond-preview.html"):
+            with self.subTest(page=page_name):
+                page = self._web(page_name)
+                self.assertIn('href="/board.css', page)
+                self.assertIn('src="/board.js', page)
+                self.assertIn("data-dws-board", page)
+                # 页面只给锚点；一旦又内联一份黑板逻辑，两套设计就会分叉。
+                self.assertIn("DwsBoard.start(", page)
+                self.assertNotIn("/api/task/answer", page)
+                self.assertNotIn("/api/run/", page)
 
 
 # 模拟可长期存活的 pi RPC 子进程：回一个 prompt 成功响应后挂起。

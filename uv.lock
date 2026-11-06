@@ -1,0 +1,8 @@
+version = 1
+revision = 5
+requires-python = ">=3.11"
+
+[[package]]
+name = "dws-chat-agent"
+version = "0.2.0"
+source = { editable = "." }

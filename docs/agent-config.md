@@ -37,9 +37,18 @@ Inspect executable paths and version/help output without changing their configur
 | Claude Code Router | `["ccr", "code"]` | `claude-stream-json` | Reuses the Claude protocol; CCR forwards its flags |
 | Pi | `["pi"]` | `pi-rpc` | Uses native RPC; a bundled session extension bridges `escalate()` to stdio MCP |
 | Oh My Pi | `["omp"]` | `pi-rpc` | Uses native RPC and the same bundled session extension |
+| dsh | `["dsh"]` | `dsh-headless-jsonl` | Boots the `headless` profile with `--json`; task goes over stdin. No mid-run steering (supplements restart via `--session-id`), no service tools — see caveats below |
 | Other CLI | exact executable and fixed args | `custom-jsonl-v1` | Implement or use a reviewed thin wrapper following `docs/custom-agent-protocol.md` |
 
 The launcher name and session protocol are independent. Do not implement a new adapter merely because the user invokes an existing protocol through a proxy command.
+
+### dsh worker caveats
+
+- Capability surface is declared per protocol in `src/dws_dm_agent/runners/adapters/` (images native/embed, `native_steer`, `service_tools`). dsh: embed/no/no.
+- Model routing and credentials live in the dsh profile's plugin layer, not on the command line. Give `options.dsh_patches` a YAML overlay (see `--dump-config` / `--dump-config-schema`) that configures `llm-pi-ai` providers and pins `agent-default-model`, mirroring an existing dsh profile.
+- Launcher flags (`--profile`, `--patch`, `--session-id`) must precede app flags and the task positional; the adapter owns this ordering — never pass them through `extra_args`.
+- Prompts referencing `no_reply`/`task_record`/`task_lookup`/`report` keep the stage locked to `pi-rpc`; a dsh worker needs a prompt variant without those tools.
+- `turn_end` reasons map as: `completed` → clean, `blocked` → blocked result, `error` → structured failure, everything else → error string. The terminal `final` event (emitted after `turn_end`) carries the deliverable text.
 
 ## 3. Gather only missing decisions
 
@@ -96,6 +105,10 @@ The front escalation adapter is session-local and must never be installed into g
 - Claude receives a per-session `--mcp-config` with `--strict-mcp-config`.
 - Pi/Oh My Pi receives the bundled extension only on that session; the extension calls the same stdio MCP server.
 - A custom front adapter receives `DWS_ESCALATE_MCP_CONFIG`, `DWS_ESCALATE_PYTHON`, and `DWS_ESCALATE_MCP_SCRIPT`.
+
+Pi profiles can additionally mount their own MCP servers with `options.mcp`. The runtime resolves each entry through `runners/mcp_catalog.py`, writes a session-local `mcp.json`, and passes it with `--mcp-config` plus `PI_MCP_CONFIG_MODE=exclusive` so nothing leaks in from `~/.pi/agent/mcp.json`. Keep that list short and prefer `directTools`; a 60-tool server costs its full schema on every request. Mount integration servers on the worker only. Pi's front escalates through the bundled `pi_escalate.ts` extension, so it needs no MCP server and cannot be used to smuggle write tools into a read-only stage.
+
+A Pi session is finished when it emits `agent_settled`. `agent_end` only ends one low-level run — retries, overflow recovery, compaction retries, and queued steering messages can still follow.
 
 The stdio server exposes only `escalate` with an empty object input schema. Do not persist generated MCP files, auth links, or provider caches outside the temporary session directory.
 

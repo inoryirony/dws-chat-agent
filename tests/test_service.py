@@ -972,8 +972,8 @@ class PlainAgentFlowTests(unittest.TestCase):
         # 终段输出契约移入 shared.md，worker 靠组装前置获得；两份模板
         # 都不再含 JSON Schema 时代的指令。
         shared = (root / "prompts" / "shared.md").read_text(encoding="utf-8")
-        self.assertIn("终段输出契约", shared)
-        self.assertIn("一字不差发给联系人", shared)
+        self.assertIn("<output_contract>", shared)
+        self.assertIn("最终输出会作为正文发给联系人", shared)
         self.assertNotIn("最终输出严格符合提供的 JSON Schema", worker)
         self.assertNotIn("最终输出严格符合提供的 JSON Schema", shared)
 

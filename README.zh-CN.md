@@ -204,7 +204,13 @@ PYTHONPATH=src python3 -m dws_dm_agent.front_eval --concurrency 1
 
 `label` 是工作流阶段的展示名称；`options` 保存协议专用设置；`extra_args` 会追加到适配器必需参数之后。`timeout_seconds: 0` 表示 Agent 无截止时间。对 Pi 而言，`options.tools: null` 会省略 `--tools` 白名单并暴露内置工具，前台仍由 `read_only: true` 和提示词共同约束权限。
 
-内置协议包括 `codex-app-server`、`claude-stream-json` 和 `pi-rpc`。当前 `ccr code` 启动器会转发 Claude Code 参数，Oh My Pi 则提供原生 `--mode rpc`。完全独立的 CLI 可以使用 `custom-jsonl-v1`，其简短 stdin/stdout 协议见 [docs/custom-agent-protocol.md](docs/custom-agent-protocol.md)。前台适配器通过 `DWS_ESCALATE_MCP_CONFIG` 获取当前会话 MCP 路径。
+`options.extensions` 是 Pi 的扩展白名单。键存在时（**包括空数组**）适配器会传 `--no-extensions`，只加载列出的扩展加自带的服务工具扩展。空数组是有意义的取值：表示「不装任何第三方扩展」，正是只读前台需要的。缺省该键则保留 Pi 默认的扩展发现行为。
+
+`options.mcp` 通过 `pi-mcp-adapter` 按 profile 挂载 MCP。每项可以是目录名（`grafana-dev`、`grafana-prod-logging`、`hsj-atlassian`，见 `runners/mcp_catalog.py`）、覆盖目录字段的对象，或完整的 `{command|url, args, ...}` 定义。适配器会写出会话级 `mcp.json` 并用 `--mcp-config` 加 `PI_MCP_CONFIG_MODE=exclusive` 注入，因此 `~/.pi/agent/mcp.json` 里的全局 server 不会串进会话。优先用 `directTools` 只声明少量工具：60 个工具的服务全量声明会在每次请求都付 schema 成本。声明了 `options.mcp` 却没在 `options.extensions` 里给出适配器时会在 prepare 阶段直接报错，而不是启动一个不认 `--mcp-config` 的 Pi。
+
+内置协议包括 `codex-app-server`、`claude-stream-json` 和 `pi-rpc`。当前 `ccr code` 启动器会转发 Claude Code 参数，Oh My Pi 则提供原生 `--mode rpc`。完全独立的 CLI 可以使用 `custom-jsonl-v1`，其简短 stdin/stdout 协议见 [docs/custom-agent-protocol.md](docs/custom-agent-protocol.md)。前台适配器通过 `DWS_ESCALATE_MCP_CONFIG` 获取当前会话 MCP 路径；Pi 的 escalate 是原生扩展，前台不需要任何 MCP server。
+
+Pi 会话的收口信号是 `agent_settled`，不是 `agent_end`。`agent_end` 只结束一次底层 run：之后仍可能有重试、溢出恢复、压缩重试以及排队的 steer/follow-up；Pi 在没有后续工作时才发 `agent_settled`。
 
 未来可以增加更多预设流程，无需把当前流水线扩展成通用 DAG 引擎。
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -132,6 +133,29 @@ def _clean_resources(value: Any) -> list[str]:
     return result[:_MAX_RESOURCES]
 
 
+def _truncation_report(
+    args: Mapping[str, Any],
+    evidence_ids: list[str],
+    facts: list[dict[str, str]] | None,
+) -> dict[str, int]:
+    """上报被静默截断的项数，避免模型以为全部落库。"""
+    truncated: dict[str, int] = {}
+
+    def _count(key: str, kept: int, cap: int) -> None:
+        raw = args.get(key)
+        if not isinstance(raw, (list, tuple)):
+            return
+        dropped = len([item for item in raw if item]) - kept
+        if dropped > 0:
+            truncated[key] = min(dropped, cap)
+
+    _count("evidence_message_ids", len(evidence_ids), _MAX_MESSAGE_IDS)
+    if facts is not None:
+        _count("facts", len(facts), _MAX_FACTS)
+    _count("resources", len(_clean_resources(args.get("resources"))), _MAX_RESOURCES)
+    return truncated
+
+
 def _clean_facts(value: Any) -> list[dict[str, str]] | None:
     """清洗 facts 数组；返回 None 表示本次不提交事实。
 
@@ -186,6 +210,7 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                 return {"ok": False, "error": message_times}
             evidence_ids = _clean_message_ids(args.get("evidence_message_ids"))
             facts = _clean_facts(args.get("facts"))
+            truncation = _truncation_report(args, evidence_ids, facts)
             unknown = [
                 item for item in evidence_ids if item not in message_times
             ]
@@ -225,6 +250,7 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                 contact_id=_clean_str(args.get("contact"), 200),
                 status=_clean_str(args.get("status"), 32),
                 include_done=bool(args.get("include_done", False)),
+                include_archived=bool(args.get("include_archived", False)),
                 limit=_int_or(args.get("limit"), 20),
                 now=now,
                 run_id=run_id,
@@ -240,6 +266,7 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                     "task_id": _clean_str(args.get("task_id"), 64),
                     "goal": _optional_str(args, "goal", 2000),
                     "status": _optional_str(args, "status", 32),
+                    "ask": _optional_str(args, "ask", 500),
                     "waiting_on": _optional_str(args, "waiting_on", 500),
                     "evidence_summary": _optional_str(args, "evidence_summary", 2000),
                     "evidence_message_ids": evidence_ids,
@@ -262,6 +289,8 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                 run_id=run_id,
                 tool_call_id=tool_call_id,
             )
+        if tool == "task_record" and isinstance(response, dict) and truncation:
+            response["truncated"] = truncation
         return response
     finally:
         store.close()
@@ -293,7 +322,10 @@ def _execute_report(
     try:
         now = datetime.now().astimezone()
         seq = store.add_progress(run_id, text, now=now)
-        store.touch_run(run_id, headline=text[:80], now=now)
+        # headline 是看板那一行摘要：折叠换行并限长，卡片上不会被多行
+        # 里程碑撑开；完整文本在进度流水里可展开查看。
+        headline = re.sub(r"\s+", " ", text).strip()[:120]
+        store.touch_run(run_id, headline=headline, now=now)
         return {"ok": True, "seq": seq}
     finally:
         store.close()

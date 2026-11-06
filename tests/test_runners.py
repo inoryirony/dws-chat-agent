@@ -17,6 +17,9 @@ from urllib.request import Request, urlopen
 
 from dws_dm_agent.front_eval import load_cases, matches_expected
 from dws_dm_agent.runners import pi as pi_module
+from dws_dm_agent.runners.adapters.pi import (
+    _pi_prompt_command,
+)
 from dws_dm_agent.runners.runtime import (
     AgentRuntime,
     AgentSession,
@@ -271,7 +274,9 @@ class AgentRuntimeTests(unittest.TestCase):
     def test_front_mounts_escalate_adapter_and_worker_stays_plain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for driver in ("codex", "claude", "pi"):
+            # pi 的 escalate 是原生扩展（pi_escalate.ts），不再写 escalate-only
+            # 的 mcp.json；只有 profile 显式声明 options.mcp 才落 MCP 配置。
+            for driver in ("codex", "claude"):
                 runtime = self._runtime(root / driver, driver)
                 front = runtime.prepare(
                     "front", f"{driver}-front", "prompt", root / f"{driver}-front"
@@ -283,6 +288,18 @@ class AgentRuntimeTests(unittest.TestCase):
                 self.assertFalse((worker.result_path.parent / "mcp.json").exists())
                 self.assertEqual(worker.result_path.name, "result.txt")
                 self.assertNotIn("--json-schema", worker.argv)
+
+            pi_runtime = self._runtime(root / "pi", "pi")
+            pi_front = pi_runtime.prepare(
+                "front", "pi-front", "prompt", root / "pi-front"
+            )
+            pi_worker = pi_runtime.prepare(
+                "worker", "pi-worker", "prompt", root / "pi-worker"
+            )
+            self.assertFalse((pi_front.result_path.parent / "mcp.json").exists())
+            self.assertNotIn("--mcp-config", pi_front.argv)
+            self.assertEqual(pi_worker.result_path.name, "result.txt")
+            self.assertNotIn("--json-schema", pi_worker.argv)
 
             self.assertIn("mcp_servers.dws-escalate.command", " ".join(
                 self._runtime(root / "codex-2", "codex").prepare(
@@ -477,19 +494,24 @@ class AgentSessionProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.latest_progress, "先确认上下文")
             self.assertEqual(session.result(), "最终正文")
 
-    async def test_pi_empty_agent_end_fails_safe_without_reprompting(self) -> None:
+    async def test_pi_empty_agent_end_then_settled_fails_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             session = self._session(Path(directory), "pi")
             # 未 start 的 session 没有可写的 stdin：若仍尝试重发 prompt，
             # _handle_event 会抛 BrokenPipeError 使本测试失败。
             await session._handle_event({"type": "agent_end", "messages": []})
+            # agent_end 只是底层 run 结束，pi 可能还要重试/压缩恢复/处理排队
+            # 消息；收口必须等 agent_settled。
+            self.assertFalse(session.done)
+
+            await session._handle_event({"type": "agent_settled"})
 
             self.assertTrue(session.done)
             self.assertEqual(session.error, "agent_result_missing")
             with self.assertRaises(ValueError):
                 session.result()
 
-    async def test_pi_agent_end_with_will_retry_keeps_session_open_until_final(self) -> None:
+    async def test_pi_agent_end_never_finishes_before_settled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             session = self._session(Path(directory), "pi")
             await session._handle_event(
@@ -520,6 +542,9 @@ class AgentSessionProtocolTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 }
             )
+
+            self.assertFalse(session.done)
+            await session._handle_event({"type": "agent_settled"})
 
             self.assertTrue(session.done)
             self.assertEqual(session.error, "")
@@ -568,6 +593,7 @@ class AgentSessionProtocolTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
             await session._handle_event({"type": "agent_end", "messages": []})
+            await session._handle_event({"type": "agent_settled"})
 
             # 实时思考展示保留，但绝不作为最终回复返回。
             self.assertEqual(
@@ -676,6 +702,7 @@ class AgentSessionProtocolTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 }
             )
+            await session._handle_event({"type": "agent_settled"})
 
             # 结束时只有中间陈述、没有终稿：宁可空回复走 fallback，
             # 不能把之前的候选文本当交付发出。
@@ -1367,7 +1394,7 @@ class PiNativeImageInputTests(unittest.TestCase):
             prepared = runtime.prepare(
                 "worker", "session", "看下这张截图", root / "run", (png,)
             )
-            command = AgentSession(prepared, "session")._pi_prompt_command()
+            command = _pi_prompt_command(AgentSession(prepared, "session"))
 
             self.assertEqual(command["type"], "prompt")
             self.assertEqual(command["message"], "看下这张截图")
@@ -1387,7 +1414,7 @@ class PiNativeImageInputTests(unittest.TestCase):
             root = Path(directory)
             runtime = AgentRuntimeTests()._runtime(root, "pi")
             prepared = runtime.prepare("worker", "session", "prompt", root / "run")
-            command = AgentSession(prepared, "session")._pi_prompt_command()
+            command = _pi_prompt_command(AgentSession(prepared, "session"))
 
             self.assertNotIn("images", command)
             self.assertEqual(
@@ -1447,6 +1474,9 @@ agent_end = {{
     ],
 }}
 print(json.dumps(agent_end), flush=True)
+# agent_end 之后 pi 还要发 agent_settled 才代表终局；截图回传的大行读回
+# 与收口都要覆盖。
+print(json.dumps({{"type": "agent_settled"}}), flush=True)
 """
 
 
@@ -1819,5 +1849,415 @@ class PiReportToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("report_result_invalid", session.error)
 
 
+class McpCatalogTests(unittest.TestCase):
+    """profile options.mcp → session mcp.json → pi --mcp-config 的接线。"""
+
+    def test_catalog_entries_expand_without_overrides(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+
+        servers = mcp_catalog.resolve_servers(["grafana-dev"])
+        self.assertEqual(set(servers), {"grafana-dev"})
+        self.assertEqual(servers["grafana-dev"]["args"], ["dev"])
+        self.assertTrue(servers["grafana-dev"]["command"].endswith("grafana-mcp-env.sh"))
+
+    def test_overrides_merge_onto_catalog_and_unknown_keys_are_dropped(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+
+        servers = mcp_catalog.resolve_servers(
+            {"grafana-dev": {"directTools": ["query_loki_logs"], "bogus": 1}}
+        )
+        self.assertEqual(servers["grafana-dev"]["directTools"], ["query_loki_logs"])
+        self.assertEqual(servers["grafana-dev"]["args"], ["dev"])
+        self.assertNotIn("bogus", servers["grafana-dev"])
+
+    def test_full_definition_is_accepted_for_uncatalogued_servers(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+
+        servers = mcp_catalog.resolve_servers(
+            {"adhoc": {"command": "/bin/true", "args": ["--x"]}}
+        )
+        self.assertEqual(servers["adhoc"], {"command": "/bin/true", "args": ["--x"]})
+
+    def test_false_disables_a_server(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+
+        self.assertEqual(mcp_catalog.resolve_servers({"grafana-dev": False}), {})
+
+    def test_unknown_name_without_definition_is_rejected(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+
+        with self.assertRaisesRegex(ValueError, "unknown MCP server"):
+            mcp_catalog.resolve_servers(["nope"])
+        with self.assertRaisesRegex(ValueError, "no command/url"):
+            mcp_catalog.resolve_servers({"nope": {"directTools": []}})
+
+    def test_written_config_disables_codemode_and_skips_empty(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mcp.json"
+            self.assertIsNone(
+                mcp_catalog.write_session_config(path, servers={})
+            )
+            self.assertFalse(path.exists())
+
+            result = mcp_catalog.write_session_config(
+                path, servers={"grafana-dev": {"command": "/bin/true"}}
+            )
+            self.assertEqual(result, path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIn("grafana-dev", payload["mcpServers"])
+            self.assertIs(payload["autoEnableCodemode"], False)
+
+
+class PiLiveStreamTests(unittest.IsolatedAsyncioTestCase):
+    """面板实时流：think / 正文 / 工具调用按顺序进 live_events。"""
+
+    def _session(self, root: Path) -> AgentSession:
+        runtime = AgentRuntimeTests()._runtime(root, "pi")
+        return AgentSession(
+            runtime.prepare("worker", "session", "prompt", root / "run"),
+            "session",
+        )
+
+    async def test_thinking_deltas_merge_into_one_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            for delta in ("先看 ", "catalog ", "配置"):
+                await session._handle_event(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "thinking_delta",
+                            "contentIndex": 0,
+                            "delta": delta,
+                        },
+                    }
+                )
+
+            kinds = [(item["kind"], item["text"]) for item in session.live_events]
+            self.assertEqual(kinds, [("think", "先看 catalog 配置")])
+
+    async def test_tool_start_and_end_share_one_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            await session._handle_event(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "bash",
+                    "args": {"command": "rg -n report src"},
+                }
+            )
+            await session._handle_event(
+                {"type": "tool_execution_end", "toolName": "bash", "isError": False}
+            )
+
+            entries = session.live_events
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["name"], "bash")
+            self.assertEqual(entries[0]["text"], "rg -n report src")
+            self.assertTrue(entries[0]["finished"])
+            self.assertFalse(entries[0]["failed"])
+
+    async def test_failed_tool_is_marked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            await session._handle_event(
+                {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "ls"}}
+            )
+            await session._handle_event(
+                {"type": "tool_execution_end", "toolName": "bash", "isError": True}
+            )
+
+            self.assertTrue(session.live_events[0]["failed"])
+
+    async def test_text_after_tool_starts_new_message_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            await session._handle_event(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "我先查"},
+                }
+            )
+            await session._handle_event(
+                {"type": "tool_execution_start", "toolName": "read", "args": {"path": "a.md"}}
+            )
+            await session._handle_event(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "查到了"},
+                }
+            )
+
+            self.assertEqual(
+                [(item["kind"], item["text"]) for item in session.live_events],
+                [("message", "我先查"), ("tool", "a.md"), ("message", "查到了")],
+            )
+
+    async def test_finish_seals_open_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            await session._handle_event(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "进行中"},
+                }
+            )
+            self.assertTrue(session.live_events[0]["streaming"])
+            await session._handle_event({"type": "agent_settled"})
+            self.assertFalse(session.live_events[0]["streaming"])
+
+    async def test_live_events_returns_a_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            await session._handle_event(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "一段正文"},
+                }
+            )
+            snapshot = session.live_events
+            snapshot[0]["text"] = "被改了"
+            self.assertEqual(session.live_events[0]["text"], "一段正文")
+
+    async def test_tool_args_redact_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            await session._handle_event(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "bash",
+                    "args": {
+                        "command": "curl -H 'Authorization: Bearer sk-live-abc123' "
+                        "https://x/api --token=topsecret"
+                    },
+                }
+            )
+            text = session.live_events[0]["text"]
+            self.assertNotIn("sk-live-abc123", text)
+            self.assertNotIn("topsecret", text)
+            self.assertIn("***", text)
+
+    async def test_tool_args_redact_secret_named_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = self._session(Path(directory))
+            await session._handle_event(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "http",
+                    "args": {"url": "https://x", "api_key": "sk-1", "verbose": True},
+                }
+            )
+            text = session.live_events[0]["text"]
+            self.assertEqual(text, "https://x")
+
+
+class PiMcpWiringTests(unittest.TestCase):
+    """runtime 把 profile options.mcp 落成 mcp.json 并注入 --mcp-config。"""
+
+    def test_pi_worker_gets_session_mcp_config_and_exclusive_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntimeTests()._runtime(root, "pi")
+            raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            raw["agents"]["worker-agent"]["options"]["mcp"] = ["grafana-dev"]
+            raw["agents"]["worker-agent"]["options"]["extensions"] = [
+                "/opt/pi/pi-mcp-adapter/index.ts"
+            ]
+            runtime = AgentRuntime.from_config(raw, root / "config.json", root)
+
+            prepared = runtime.prepare("worker", "s", "prompt", root / "run")
+            config_path = Path(prepared.environment["DWS_ESCALATE_MCP_CONFIG"])
+            self.assertEqual(config_path.name, "mcp.json")
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertIn("grafana-dev", payload["mcpServers"])
+            self.assertIn("--mcp-config", prepared.argv)
+            self.assertIn(str(config_path), prepared.argv)
+            self.assertEqual(prepared.environment["PI_MCP_CONFIG_MODE"], "exclusive")
+            # 白名单里已有 adapter 时不重复追加。
+            self.assertEqual(
+                prepared.argv.count("/opt/pi/pi-mcp-adapter/index.ts"), 1
+            )
+
+    def test_pi_profile_without_mcp_keeps_argv_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntimeTests()._runtime(root, "pi")
+            prepared = runtime.prepare("worker", "s", "prompt", root / "run")
+
+            self.assertNotIn("--mcp-config", prepared.argv)
+            self.assertNotIn("PI_MCP_CONFIG_MODE", prepared.environment)
+            self.assertFalse((root / "run" / "mcp.json").exists())
+
+    def test_mcp_without_adapter_is_rejected_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntimeTests()._runtime(root, "pi")
+            raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            raw["agents"]["worker-agent"]["options"]["mcp"] = ["grafana-dev"]
+            runtime = AgentRuntime.from_config(raw, root / "config.json", root)
+
+            with self.assertRaisesRegex(ValueError, "no MCP adapter"):
+                runtime.prepare("worker", "s", "prompt", root / "run")
+
+    def test_adapter_can_be_named_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntimeTests()._runtime(root, "pi")
+            raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            options = raw["agents"]["worker-agent"]["options"]
+            options["mcp"] = ["grafana-dev"]
+            options["mcp_adapter"] = "/opt/pi/pi-mcp-adapter/index.ts"
+            runtime = AgentRuntime.from_config(raw, root / "config.json", root)
+
+            prepared = runtime.prepare("worker", "s", "prompt", root / "run")
+            self.assertIn("--no-extensions", prepared.argv)
+            self.assertIn("/opt/pi/pi-mcp-adapter/index.ts", prepared.argv)
+            self.assertIn("--mcp-config", prepared.argv)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class DshHeadlessAdapterTests(unittest.IsolatedAsyncioTestCase):
+    """dsh-headless-jsonl：命令构造 + 事件投影解析 + 能力声明。"""
+
+    def _session(self, root: Path, stage: str = "worker") -> AgentSession:
+        runtime = AgentRuntimeTests()._runtime(
+            root, "dsh", command=["dsh"], protocol="dsh-headless-jsonl"
+        )
+        return AgentSession(
+            runtime.prepare(stage, "session", "prompt", root / "run"),
+            "session",
+        )
+
+    def test_registry_capabilities(self) -> None:
+        from dws_dm_agent.runners.adapters import ADAPTERS
+
+        adapter = ADAPTERS["dsh-headless-jsonl"]
+        self.assertEqual(adapter.images, "embed")
+        self.assertFalse(adapter.native_steer)
+        self.assertFalse(adapter.service_tools)
+
+    def test_command_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self._session(root)
+            prepared = session.prepared
+            self.assertEqual(prepared.protocol, "dsh-headless-jsonl")
+            self.assertEqual(
+                prepared.argv, ("dsh", "--profile", "headless", "--json", "-")
+            )
+
+    def test_config_accepts_dsh_driver(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntimeTests()._runtime(
+                root, "dsh", command=["dsh"], protocol="dsh-headless-jsonl"
+            )
+            self.assertEqual(
+                runtime.profile_name("worker"), "worker-agent"
+            )
+
+    async def test_event_projection_flow(self) -> None:
+        """session→thinking/text/tool_call/tool_result→final→turn_end 全链解析。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self._session(root)
+            await session._handle_event(
+                {"type": "session", "sessionId": "session-abc", "cwd": root}
+            )
+            self.assertEqual(
+                session._protocol_state["dsh_session_id"], "session-abc"
+            )
+            await session._handle_event(
+                {"type": "status", "phase": "turn_start", "turn": 1}
+            )
+            await session._handle_event({"type": "thinking", "text": "盘算一下"})
+            self.assertIn("盘算一下", session.latest_progress)
+            await session._handle_event({"type": "text", "text": "先查文件"})
+            self.assertEqual(session.latest_stream_text, "先查文件")
+            await session._handle_event(
+                {
+                    "type": "tool_call",
+                    "callId": "call-1",
+                    "tool": "read",
+                    "input": {"path": "a.py"},
+                }
+            )
+            tool_entries = [
+                e for e in session.live_events if e["kind"] == "tool"
+            ]
+            self.assertEqual(len(tool_entries), 1)
+            self.assertEqual(tool_entries[0]["name"], "read")
+            await session._handle_event(
+                {
+                    "type": "tool_result",
+                    "callId": "call-1",
+                    "status": "completed",
+                    "result": "file body",
+                }
+            )
+            self.assertTrue(session.live_events[-1].get("finished"))
+            # 实测事件序：turn_end 先到、final 后到；final 负责收口。
+            await session._handle_event(
+                {"type": "status", "phase": "turn_end", "turn": 1,
+                 "reason": {"kind": "completed"}}
+            )
+            self.assertFalse(session.done)
+            await session._handle_event({"type": "final", "text": "最终答复"})
+            self.assertTrue(session.done)
+            self.assertEqual(session.error, "")
+            self.assertEqual(session.result(), "最终答复")
+
+    async def test_turn_end_error_reason_fails_the_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self._session(root)
+            await session._handle_event(
+                {"type": "status", "phase": "turn_end", "turn": 1,
+                 "reason": {"kind": "error",
+                            "error": {"code": "MISSING_CREDENTIAL",
+                                      "message": "no API key"}}}
+            )
+            self.assertFalse(session.done)
+            self.assertIn("MISSING_CREDENTIAL", session.error)
+            await session._handle_event({"type": "final", "text": ""})
+            self.assertTrue(session.done)
+
+    async def test_turn_end_blocked_marks_blocked_not_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self._session(root)
+            await session._handle_event(
+                {"type": "status", "phase": "turn_end", "turn": 1,
+                 "reason": {"kind": "blocked"}}
+            )
+            self.assertFalse(session.done)
+            self.assertTrue(session.blocked)
+            await session._handle_event({"type": "final", "text": "部分结果"})
+            self.assertTrue(session.done)
+            self.assertEqual(session.error, "")
+            self.assertTrue(session.blocked)
+            self.assertEqual(session.result(), "部分结果")
+
+    async def test_unknown_event_types_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self._session(root)
+            await session._handle_event({"type": "some_future_event", "x": 1})
+            self.assertFalse(session.done)
+            self.assertEqual(session.error, "")
+
+    async def test_steer_reports_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self._session(root)
+            # process 未起，steer 的前置守卫先拦；协议层恒 False 是声明面。
+            self.assertFalse(
+                await AgentSession(session.prepared, "session").adapter.steer(
+                    session, "补一句"
+                )
+            )

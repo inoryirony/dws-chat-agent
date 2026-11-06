@@ -5,11 +5,13 @@ import base64
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -20,12 +22,22 @@ from ..prompts import (
     render_prompt as _render_text,
     validate_template_variables,
 )
-from . import claude, codex, custom, pi
+from .adapters import (
+    ADAPTERS as _ADAPTERS,
+    DRIVER_PROTOCOLS as _DRIVER_PROTOCOLS,
+    SERVICE_TOOL_PROTOCOL as _SERVICE_TOOL_PROTOCOL,
+    SUPPORTED_PROTOCOLS,
+    adapter_for as _adapter_for,
+    default_driver as _default_driver,
+)
 
 
-_STAGE_ORDER = ("front", "worker")
-# git worktree add/remove 的兜底超时：大仓冷克隆态下 add 可能很慢，
-# 但绝不能无限等（会吃掉整个会话预算）。
+# pipeline 编排空间：stage 名不再固定（front 只是惯例分诊槽位名），
+# preset 配置驱动；worker 唯一必填。
+# 协议行为（start/steer/abort/事件解析/命令构造）全部查 adapters 注册表：
+# runtime 不再持有 protocol 字符串分叉。加新 CLI 接入只动 runners/adapters/。
+# 服务工具名单保留在这里做提示词校验；协议锁死名单与 adapters 同源。
+_SERVICE_TOOL_NAMES = ("no_reply", "task_record", "task_lookup", "report")
 _WORKTREE_TIMEOUT_SECONDS = 600.0
 # 事件流单行上限必须容纳"允许下载的整批图片原样回传"：pi RPC 会把带图用户
 # 消息（含 base64 ImageContent）在 message/agent 事件里原样发回，单行最大为
@@ -36,20 +48,11 @@ _EVENT_STREAM_LIMIT = (
 )
 # pi-worker 冷启动（含扩展/MCP 加载）偶发超过默认 15s，首条 prompt 握手放宽到 3 分钟。
 _PI_START_HANDSHAKE_TIMEOUT_SECONDS = 180.0
-_DRIVER_PROTOCOLS = {
-    "codex": "codex-app-server",
-    "claude": "claude-stream-json",
-    "pi": "pi-rpc",
-}
-# 本服务自有控制/事项工具（no_reply/task_record/task_lookup/report）目前
-# 只在 pi-rpc 挂载（见 runners/pi.py 与 pi_dws_tools.ts）；from_config 用
-# 这份名单约束"提示词引用了服务工具"与"阶段/备用 agent 协议"的组合。
-_SERVICE_TOOL_NAMES = ("no_reply", "task_record", "task_lookup", "report")
-_SERVICE_TOOL_PROTOCOL = "pi-rpc"
-_SUPPORTED_PROTOCOLS = frozenset(
-    (*_DRIVER_PROTOCOLS.values(), "custom-jsonl-v1")
-)
-SUPPORTED_PROTOCOLS = tuple(sorted(_SUPPORTED_PROTOCOLS))
+# 面板实时流：一轮会话的 think / 正文 / 工具调用按时间顺序留在内存里，
+# 供看板展示"它现在在想什么、调了什么"。上限按行数与单行长度双封顶，
+# 长会话不会把内存吃穿；只给面板看，不落库、不外发。
+_LIVE_EVENT_LIMIT = 400
+_LIVE_EVENT_CHARS = 1200
 # pi RPC prompt/steer 命令的 images 字段使用 ImageContent：
 # {"type": "image", "data": "<base64>", "mimeType": "..."}（pi docs/rpc.md）。
 # service 层按魔数把图片落盘为正确后缀，这里按后缀映射 MIME。
@@ -175,9 +178,17 @@ class AgentSession:
         self._report_outcome = ""
         self._progress: list[str] = []
         self._stream_text = ""
-        self._codex_item_phases: dict[str, str] = {}
-        self._codex_reasoning: dict[str, str] = {}
-        self._pi_thinking: dict[int, str] = {}
+        self._live: list[dict[str, Any]] = []
+        self._live_seq = 0
+        # adapter 是共享单例，协议私有的会话状态一律挂这里；
+        # 键名由各 adapter 自行约定（codex/pi/dsh 已在模块 docstring 声明）。
+        self._protocol_state: dict[str, Any] = {
+            "item_phases": {},
+            "reasoning": {},
+            "pi_thinking": {},
+        }
+        # 协议行为入口：按 prepared.protocol 查 adapters 注册表。
+        self.adapter = _adapter_for(prepared.protocol)
 
     @property
     def exit_code(self) -> int | None:
@@ -194,6 +205,14 @@ class AgentSession:
     @property
     def latest_stream_text(self) -> str:
         return self._stream_text
+
+    @property
+    def live_events(self) -> list[dict[str, Any]]:
+        """面板实时流：think / 正文 / 工具调用按发生顺序排列。
+
+        返回副本，调用方（看板投影）不能借引用改动会话内部状态。
+        """
+        return [dict(item) for item in self._live]
 
     @property
     def escalated(self) -> bool:
@@ -230,89 +249,7 @@ class AgentSession:
         self._stderr_task = asyncio.create_task(self._read_stderr())
         self._watch_task = asyncio.create_task(self._watch_process())
         try:
-            if self.prepared.protocol == "codex-app-server":
-                initialized = await self._jsonrpc_call(
-                    "initialize",
-                    {
-                        "clientInfo": {
-                            "name": "dws-chat-agent",
-                            "title": "DWS Chat Agent",
-                            "version": "0.1.0",
-                        }
-                    },
-                )
-                if "result" not in initialized:
-                    raise RuntimeError("Codex app-server initialization failed")
-                await self._write_json(
-                    {"jsonrpc": "2.0", "method": "initialized", "params": {}}
-                )
-                started = await self._jsonrpc_call(
-                    "thread/start", dict(self.prepared.thread_options)
-                )
-                self.thread_id = str(
-                    started.get("result", {}).get("thread", {}).get("id") or ""
-                )
-                if not self.thread_id:
-                    raise RuntimeError("Codex app-server did not return a thread id")
-                inputs: list[dict[str, str]] = [
-                    {"type": "text", "text": self.prepared.prompt}
-                ]
-                inputs.extend(
-                    {"type": "localImage", "path": str(path.resolve())}
-                    for path in self.prepared.local_image_paths
-                )
-                turn = await self._jsonrpc_call(
-                    "turn/start",
-                    {
-                        "threadId": self.thread_id,
-                        "input": inputs,
-                        "effort": self.prepared.stage.profile.reasoning_effort or None,
-                        "summary": str(
-                            self.prepared.stage.profile.options.get(
-                                "reasoning_summary", "concise"
-                            )
-                        ),
-                    },
-                )
-                self.turn_id = str(
-                    turn.get("result", {}).get("turn", {}).get("id") or ""
-                )
-                if not self.turn_id:
-                    raise RuntimeError("Codex app-server did not return a turn id")
-            elif self.prepared.protocol == "pi-rpc":
-                response = await self._pi_call(
-                    self._pi_prompt_command(),
-                    timeout=_PI_START_HANDSHAKE_TIMEOUT_SECONDS,
-                )
-                if not response.get("success", False):
-                    raise RuntimeError(str(response.get("error") or "Pi rejected prompt"))
-            elif self.prepared.protocol == "custom-jsonl-v1":
-                response = await self._custom_call(
-                    {
-                        "type": "start",
-                        "protocolVersion": 1,
-                        "sessionId": self.session_id,
-                        "stage": self.prepared.stage.name,
-                        "cwd": str(self.prepared.cwd),
-                        "prompt": self.prepared.prompt,
-                        "readOnly": self.prepared.stage.profile.read_only,
-                        "model": self.prepared.stage.profile.model,
-                        "reasoningEffort": self.prepared.stage.profile.reasoning_effort,
-                    }
-                )
-                if not response.get("success", False):
-                    raise RuntimeError(
-                        str(response.get("error") or "custom agent rejected start")
-                    )
-            elif self.prepared.protocol == "claude-stream-json":
-                await self._write_json(
-                    {
-                        "type": "user",
-                        "message": {"role": "user", "content": self.prepared.prompt},
-                    }
-                )
-            else:
-                raise RuntimeError(f"unsupported agent protocol: {self.prepared.protocol}")
+            await self.adapter.start(self)
         except Exception:
             await self.close()
             # 启动失败等同于中止：没有可保留的运行现场，worktree 一并回收。
@@ -335,45 +272,7 @@ class AgentSession:
         if not prompt.strip() or self.done or self.process is None:
             return False
         try:
-            if self.prepared.protocol == "codex-app-server":
-                if not self.thread_id or not self.turn_id:
-                    return False
-                response = await self._jsonrpc_call(
-                    "turn/steer",
-                    {
-                        "threadId": self.thread_id,
-                        "expectedTurnId": self.turn_id,
-                        "input": [{"type": "text", "text": prompt}],
-                    },
-                )
-                return bool(response.get("result", {}).get("turnId"))
-            if self.prepared.protocol == "pi-rpc":
-                response = await self._pi_call(
-                    {
-                        "type": "prompt",
-                        "message": prompt,
-                        "streamingBehavior": "steer",
-                    }
-                )
-                return bool(response.get("success", False))
-            if self.prepared.protocol == "custom-jsonl-v1":
-                response = await self._custom_call(
-                    {
-                        "type": "steer",
-                        "sessionId": self.session_id,
-                        "message": prompt,
-                    }
-                )
-                return bool(response.get("success", False))
-            if self.prepared.protocol == "claude-stream-json":
-                await self._write_json(
-                    {
-                        "type": "user",
-                        "message": {"role": "user", "content": prompt},
-                    }
-                )
-                return True
-            return False
+            return await self.adapter.steer(self, prompt)
         except (BrokenPipeError, ConnectionError, RuntimeError, TimeoutError):
             return False
 
@@ -393,18 +292,7 @@ class AgentSession:
     async def abort(self) -> None:
         if self.process is not None and self.process.returncode is None:
             with suppress(Exception):
-                if self.prepared.protocol == "codex-app-server" and self.thread_id and self.turn_id:
-                    await self._jsonrpc_call(
-                        "turn/interrupt",
-                        {"threadId": self.thread_id, "turnId": self.turn_id},
-                        timeout=2,
-                    )
-                elif self.prepared.protocol == "pi-rpc":
-                    await self._pi_call({"type": "abort"}, timeout=2)
-                elif self.prepared.protocol == "custom-jsonl-v1":
-                    await self._custom_call(
-                        {"type": "abort", "sessionId": self.session_id}, timeout=2
-                    )
+                await self.adapter.abort(self)
         await self.close()
         # abort 清理 worktree：被中止的运行没有可保留的现场；成功路径的
         # close() 不走这里，现场留给操作者检查。清理失败只记日志，不掩盖
@@ -506,16 +394,6 @@ class AgentSession:
         finally:
             self._pending.pop(request_id, None)
 
-    def _pi_prompt_command(self) -> dict[str, Any]:
-        """构造 pi RPC 首条 prompt 命令；有图片时以 ImageContent 原生附带。"""
-        command: dict[str, Any] = {
-            "type": "prompt",
-            "message": self.prepared.prompt,
-        }
-        if self.prepared.pi_images:
-            command["images"] = list(self.prepared.pi_images)
-        return command
-
     async def _custom_call(
         self, command: Mapping[str, Any], *, timeout: float = 15
     ) -> Mapping[str, Any]:
@@ -585,197 +463,15 @@ class AgentSession:
             self._fail(f"agent_exit_{code}")
 
     async def _handle_event(self, event: Mapping[str, Any]) -> None:
-        protocol = self.prepared.protocol
-        if protocol == "codex-app-server":
-            method = str(event.get("method") or "")
-            params = event.get("params")
-            params = params if isinstance(params, Mapping) else {}
-            if method == "item/started":
-                item = params.get("item")
-                if isinstance(item, Mapping):
-                    item_id = str(item.get("id") or "")
-                    if item.get("type") == "agentMessage":
-                        self._codex_item_phases[item_id] = str(
-                            item.get("phase") or ""
-                        )
-                    elif _is_escalate_tool(
-                        item.get("tool")
-                        or item.get("toolName")
-                        or item.get("name")
-                    ):
-                        self._capture_escalation()
-            elif method == "item/reasoning/summaryTextDelta":
-                item_id = str(params.get("itemId") or "")
-                value = self._codex_reasoning.get(item_id, "") + str(
-                    params.get("delta") or ""
-                )
-                self._codex_reasoning[item_id] = value
-                self._capture_progress(value)
-            elif method == "item/completed":
-                item = params.get("item")
-                if isinstance(item, Mapping):
-                    if item.get("type") == "agentMessage":
-                        phase = str(item.get("phase") or "")
-                        text = str(item.get("text") or "")
-                        if phase == "final_answer":
-                            self._capture_body(text, final=True)
-                    elif item.get("type") == "reasoning":
-                        self._capture_progress(_codex_reasoning_text(item))
-                    elif _is_escalate_tool(
-                        item.get("tool")
-                        or item.get("toolName")
-                        or item.get("name")
-                    ):
-                        self._capture_escalation()
-            elif method == "turn/completed":
-                turn = params.get("turn")
-                if isinstance(turn, Mapping) and (
-                    not self.turn_id or str(turn.get("id") or "") == self.turn_id
-                ):
-                    if str(turn.get("status") or "") == "completed":
-                        self.error = ""
-                    else:
-                        self.error = f"codex_turn_{turn.get('status') or 'failed'}"
-                    self._finish()
-            elif method == "error":
-                if not bool(params.get("willRetry")):
-                    self.error = sanitize_text(
-                        str(params.get("message") or params), 500
-                    )
-            return
-        if protocol == "pi-rpc":
-            event_type = str(event.get("type") or "")
-            if event_type == "extension_ui_request":
-                if event.get("method") in {"select", "confirm", "input", "editor"}:
-                    await self._write_json(
-                        {
-                            "type": "extension_ui_response",
-                            "id": event.get("id"),
-                            "cancelled": True,
-                        }
-                    )
-            elif event_type == "message_update":
-                update = event.get("assistantMessageEvent")
-                update = update if isinstance(update, Mapping) else {}
-                update_type = str(update.get("type") or "")
-                if update_type == "text_delta":
-                    self._capture_stream_delta(str(update.get("delta") or ""))
-                elif update_type == "thinking_delta":
-                    index = int(update.get("contentIndex") or 0)
-                    value = self._pi_thinking.get(index, "") + str(
-                        update.get("delta") or ""
-                    )
-                    self._pi_thinking[index] = value
-                    self._capture_progress(value)
-                elif update_type == "thinking_end":
-                    self._capture_progress(str(update.get("content") or ""))
-            elif event_type == "tool_execution_start" and _is_escalate_tool(
-                event.get("toolName")
-            ):
-                self._capture_escalation()
-            elif (
-                event_type == "tool_execution_end"
-                and not event.get("isError")
-                and _is_no_reply_tool(event.get("toolName"))
-            ):
-                # 只在工具真正执行成功后才承认 silent；工具失败时模型继续正常
-                # 收尾，不能把一次失败的 no_reply 当成沉默吞掉后续正文。
-                self._capture_silent()
-            elif (
-                event_type == "tool_execution_end"
-                and not event.get("isError")
-                and _is_report_tool(event.get("toolName"))
-            ):
-                # report(final/blocked) 已在扩展侧写好 DWS_REPORT_FILE 并
-                # terminate；这里读文件把正文接进终稿通路。工具执行失败时
-                # 不终止，模型继续正常收尾。
-                self._capture_report()
-            elif event_type == "message_end":
-                text = _assistant_text(event)
-                if text and _is_pi_intermediate_message(event.get("message")):
-                    # 工具调用间隔中的中间陈述（带 toolCall 或 error/aborted 终止）
-                    # 只走进度展示，不能作为最终回复交付。
-                    self._capture_progress(text)
-                elif text:
-                    self._capture_body(text, final=True)
-            elif event_type == "agent_end":
-                messages = event.get("messages")
-                if isinstance(messages, list) and not self._report_outcome:
-                    reply = _pi_final_reply_text(messages)
-                    if reply:
-                        self._capture_body(reply, final=True)
-                    else:
-                        # 本轮没有可交付的终稿：清掉 message_end 期间捕获的
-                        # 候选文本，宁可空回复走 fallback 链，也不能把
-                        # 中间陈述当正式回复发出。report 终稿除外：终止性
-                        # report 的最后一条 assistant 消息带 toolCall，
-                        # 终稿在工具事件里，这里不能清掉。
-                        self._final_text = ""
-                if (
-                    not self._escalated
-                    and not self._final_text
-                    and event.get("willRetry")
-                ):
-                    # pi 会在可重试错误后自行续跑（agent_end 之后还有后续 turn）。
-                    # 保持会话打开等待下一次 agent_end；不再自行重发 prompt，
-                    # 避免与 pi 的重试或 steer 后续 turn 冲突
-                    # （Agent is already processing 会作废整场 run）。
-                    return
-                self._finish()
-            elif event_type == "response" and not event.get("success", True):
-                error = sanitize_text(str(event.get("error") or "Pi RPC error"), 500)
-                if "already processing" in error.lower():
-                    # pi 正在处理（或即将开始）后续 turn 时会拒绝新 prompt，
-                    # 此时会话本身健康；作废整场会连正在处理的补充消息一起丢，
-                    # 这里只忽略该次被拒请求，等 agent_end 或服务层超时兜底。
-                    return
-                self._fail(error)
-            return
-        if protocol == "custom-jsonl-v1":
-            event_type = str(event.get("type") or "")
-            if event_type in {"progress", "thinking"}:
-                self._capture_progress(str(event.get("text") or ""))
-            elif event_type == "assistant":
-                self._capture_body(_assistant_text(event))
-            elif event_type == "tool_call" and _is_escalate_tool(
-                event.get("name") or event.get("toolName")
-            ):
-                self._capture_escalation()
-            elif event_type == "result":
-                result = event.get("result", event.get("value"))
-                if isinstance(result, str):
-                    self._final_text = result
-                else:
-                    self.error = "custom_agent_result_missing"
-                self._finish()
-            elif event_type == "error":
-                self._fail(
-                    sanitize_text(
-                        str(event.get("message") or "custom agent error"), 500
-                    )
-                )
-            return
-        if protocol != "claude-stream-json":
-            self.error = f"unsupported_agent_protocol: {protocol}"
-            self._complete.set()
-            self._signal_update()
-            return
-        event_type = str(event.get("type") or "")
-        if event_type == "assistant":
-            for tool_name in _assistant_tool_names(event):
-                if _is_escalate_tool(tool_name):
-                    self._capture_escalation()
-            thinking = _assistant_thinking(event)
-            if thinking:
-                self._capture_progress(thinking)
-            self._capture_body(_assistant_text(event))
-        elif event_type == "result":
-            result = event.get("result")
-            if isinstance(result, str):
-                self._final_text = result
-            if event.get("is_error"):
-                self.error = sanitize_text(str(event.get("result") or "Claude error"), 500)
-            self._finish()
+        """协议事件统一入口：解析逻辑在 adapter，会话只保留通用管线。
+
+        adapter 无状态、单例共享；会话私有状态挂 _protocol_state。
+        """
+        try:
+            await self.adapter.parse_event(self, event)
+        except Exception as exc:
+            if not self._closing:
+                self._fail(f"event_stream_error: {exc}")
 
     def _capture_body(self, text: str, *, final: bool = False) -> None:
         clean = text.strip()
@@ -792,6 +488,129 @@ class AgentSession:
         if progress and (not self._progress or self._progress[-1] != progress):
             self._progress.append(progress)
             self._signal_update()
+
+    def _capture_live(self, kind: str, text: str, *, name: str = "") -> None:
+        """记一条面板实时流事件（think / message / tool / tool_result）。
+
+        与 _capture_progress 的区别：progress 是给联系人卡片的稀疏里程碑
+        （走 report 工具），这里是给操作者看的原始流水——同一段文字可以
+        既是 think 又有工具调用，两条都留。同 kind 且同 name 的连续
+        delta 合并成一条，避免 token 级写入把缓冲刷满。
+        """
+        body = str(text or "")
+        if not body.strip():
+            return
+        # 流式 delta 保留首尾空白：token 拼接靠它，strip 会把单词粘在一起。
+        if kind not in {"think", "message"}:
+            body = body.strip()
+        if len(body) > _LIVE_EVENT_CHARS:
+            body = body[:_LIVE_EVENT_CHARS] + "…"
+        last = self._live[-1] if self._live else None
+        if (
+            last is not None
+            and last["kind"] == kind
+            and last.get("name", "") == name
+            and last.get("streaming")
+        ):
+            merged = f"{last['text']}{body}"
+            last["text"] = merged[-_LIVE_EVENT_CHARS:]
+            return
+        self._live_seq += 1
+        self._live.append(
+            {
+                "seq": self._live_seq,
+                "kind": kind,
+                "name": name,
+                "text": body,
+                "streaming": kind in {"think", "message"},
+                "at": datetime.now().astimezone().isoformat(),
+            }
+        )
+        if len(self._live) > _LIVE_EVENT_LIMIT:
+            del self._live[: len(self._live) - _LIVE_EVENT_LIMIT]
+        self._signal_update()
+
+    def _record_tool_start(self, event: Mapping[str, Any]) -> None:
+        name = str(event.get("toolName") or event.get("name") or "tool")
+        # 工具开始意味着一轮陈述结束：把 think/message 定稿，后续另起一条。
+        self._seal_live("think", "message")
+        self._capture_live(
+            "tool", _tool_args_summary(event.get("args")), name=name
+        )
+
+    def _record_tool_end(self, event: Mapping[str, Any]) -> None:
+        name = str(event.get("toolName") or event.get("name") or "tool")
+        failed = bool(event.get("isError"))
+        # 结果并回对应的开始条目：面板上一行就是一个工具调用，不再多一行。
+        for entry in reversed(self._live):
+            if (
+                entry["kind"] == "tool"
+                and entry.get("name") == name
+                and not entry.get("finished")
+            ):
+                entry["finished"] = True
+                entry["failed"] = failed
+                return
+        self._capture_live("tool", "完成" if not failed else "失败", name=name)
+
+    def _record_tool_result(self, call_id: str, failed: bool, result: str) -> None:
+        """按 callId 并回工具结果（dsh 流形态：call/result 分离，无名字）。"""
+        state = self._protocol_state
+        name = state.get("dsh_tool_names", {}).get(call_id, "tool")
+        for entry in reversed(self._live):
+            if (
+                entry["kind"] == "tool"
+                and not entry.get("finished")
+                and entry.get("name") == name
+                and entry.get("call_id", call_id) == call_id
+            ):
+                entry["finished"] = True
+                entry["failed"] = failed
+                return
+        self._capture_live("tool", "完成" if not failed else "失败", name=name)
+
+    def _mark_blocked(self) -> None:
+        """非 pi 协议的 blocked 终态（如 dsh turn_end blocked）：结果记
+        blocked，正文照常交付——语义对齐 pi 的 report(blocked)。"""
+        self._report_outcome = "blocked"
+
+    def _seal_live(self, *kinds: str) -> None:
+        """结束指定类型的流式条目：之后同 kind 的 delta 另起一条。"""
+        wanted = set(kinds) if kinds else None
+        for entry in self._live:
+            if wanted is None or entry["kind"] in wanted:
+                entry["streaming"] = False
+
+    # —— adapter 门面：协议解析层（runners/adapters/*）经这些方法读写会话，
+    # 不直接摸内部字段。全部是既有内部实现的薄委托，行为不变。
+
+    @staticmethod
+    def _sanitize(text: str, limit: int) -> str:
+        return sanitize_text(text, limit)
+
+    @staticmethod
+    def _is_escalate_tool(value: Any) -> bool:
+        return _is_escalate_tool(value)
+
+    @staticmethod
+    def _is_no_reply_tool(value: Any) -> bool:
+        return _is_no_reply_tool(value)
+
+    @staticmethod
+    def _is_report_tool(value: Any) -> bool:
+        return _is_report_tool(value)
+
+    @staticmethod
+    def _assistant_text(event: Mapping[str, Any]) -> str:
+        return _assistant_text(event)
+
+    @staticmethod
+    def _tool_args_summary(args: Any) -> str:
+        return _tool_args_summary(args)
+
+    def _close_live_streams(self) -> None:
+        """一轮结束：所有流式条目定稿。"""
+        self._seal_live()
 
     def _capture_escalation(self) -> None:
         self._escalated = True
@@ -843,6 +662,7 @@ class AgentSession:
 
     def _finish(self) -> None:
         # result.txt 仅作排障留档：无终稿时保留流文本便于回溯，但不作为交付。
+        self._close_live_streams()
         payload = self._final_text or self._stream_text
         if payload:
             self.prepared.result_path.write_text(payload, encoding="utf-8")
@@ -919,19 +739,12 @@ class AgentRuntime:
             protocol = str(value.get("protocol") or "").lower().replace("_", "-")
             if not protocol:
                 protocol = _DRIVER_PROTOCOLS.get(driver, "")
-            if protocol not in _SUPPORTED_PROTOCOLS:
+            if protocol not in _ADAPTERS:
                 raise ValueError(
                     f"unsupported agent protocol: {protocol or driver or name}"
                 )
             if not driver:
-                driver = next(
-                    (
-                        candidate
-                        for candidate, candidate_protocol in _DRIVER_PROTOCOLS.items()
-                        if candidate_protocol == protocol
-                    ),
-                    "custom",
-                )
+                driver = _default_driver(protocol)
             timeout = float(value.get("timeout_seconds", 60))
             if timeout < 0:
                 raise ValueError(f"agent timeout must be non-negative: {name}")
@@ -1004,13 +817,17 @@ class AgentRuntime:
             raise ValueError(
                 f"workflow supplement prompt does not exist: {supplement_prompt_path}"
             )
+        # pipeline 编排空间：worker 必填，其余 stage 名自由——preset 里写
+        # 什么键就有什么 step（front 只是缺省分诊槽位的惯例名）。service
+        # 侧经 has_stage(<name>) 探测，无配置即无该 step。
         stages: dict[str, WorkflowStage] = {}
-        for stage_name in _STAGE_ORDER:
+        stage_names = [name for name in preset if isinstance(preset.get(name), Mapping)]
+        if "worker" not in stage_names:
+            raise ValueError(f"workflow {active} requires stage: worker")
+        for stage_name in stage_names:
             value = preset.get(stage_name)
-            if not isinstance(value, Mapping):
-                if stage_name == "front":
-                    continue
-                raise ValueError(f"workflow {active} requires stage: {stage_name}")
+            if stage_name in {"supplement_prompt", "supplement_strategy", "auto_messages"}:
+                continue
             profile_name = str(value.get("agent") or "")
             profile = profiles.get(profile_name)
             if profile is None:
@@ -1020,10 +837,7 @@ class AgentRuntime:
                 raise ValueError(f"workflow prompt does not exist: {prompt_path}")
             stages[stage_name] = WorkflowStage(
                 name=stage_name,
-                label=str(
-                    value.get("label")
-                    or ("前置模型" if stage_name == "front" else "后置模型")
-                ),
+                label=str(value.get("label") or ("前置模型" if stage_name == "front" else "模型")),
                 profile=profile,
                 prompt_path=prompt_path,
             )
@@ -1139,10 +953,15 @@ class AgentRuntime:
                 protocol,
                 len(local_images),
             )
-        mcp_config_path = (
-            _write_escalate_mcp_config(session_dir) if stage_name == "front" else None
+        mcp_config_path = _prepare_mcp_config(
+            stage.profile, protocol, session_dir, stage_name
         )
-        argv = _command(stage.profile, mcp_config_path, model_override)
+        argv = _command(
+            stage.profile,
+            mcp_config_path,
+            model_override,
+            mount_escalate=stage_name == "front",
+        )
         environment = self._environment(
             stage.profile,
             session_dir / "codex-home"
@@ -1150,6 +969,8 @@ class AgentRuntime:
             else None,
         )
         if mcp_config_path is not None:
+            # pi 走 adapter：exclusive 让 --mcp-config 成为唯一来源，不串全局 server。
+            environment["PI_MCP_CONFIG_MODE"] = "exclusive"
             environment["DWS_ESCALATE_MCP_CONFIG"] = str(mcp_config_path)
             environment["DWS_ESCALATE_PYTHON"] = sys.executable
             environment["DWS_ESCALATE_MCP_SCRIPT"] = str(
@@ -1307,7 +1128,7 @@ class AgentRuntime:
                     ),
                     "prompt": self._stages[name].prompt_path.read_text(encoding="utf-8"),
                 }
-                for name in _STAGE_ORDER
+                for name in self._stages
                 if name in self._stages
             ],
             "availableAgents": [
@@ -1387,46 +1208,31 @@ def _resolve_path(base: Path, value: Any) -> Path:
     return path.resolve() if path.is_absolute() else (base / path).resolve()
 
 
-def _command(profile: AgentProfile, mcp_config_path: Path | None, model_override: str | None = None) -> list[str]:
-    protocol = profile.protocol
-    if protocol == "codex-app-server":
-        return codex.command(profile, bool(mcp_config_path))
-    if protocol == "claude-stream-json":
-        return claude.command(profile, mcp_config_path)
-    if protocol == "custom-jsonl-v1":
-        return custom.command(profile)
-    if protocol == "pi-rpc":
-        return pi.command(profile, bool(mcp_config_path), model_override=model_override)
-    raise ValueError(f"unsupported agent protocol: {protocol}")
-
-
-def _write_escalate_mcp_config(session_dir: Path) -> Path:
-    path = session_dir / "mcp.json"
-    script = Path(__file__).with_name("escalate_mcp.py").resolve()
-    path.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "dws-escalate": {
-                        "type": "stdio",
-                        "command": sys.executable,
-                        "args": [str(script)],
-                    }
-                }
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+def _command(
+    profile: AgentProfile,
+    mcp_config_path: Path | None,
+    model_override: str | None = None,
+    *,
+    mount_escalate: bool = False,
+) -> list[str]:
+    return _adapter_for(profile.protocol).command(
+        profile, mcp_config_path, model_override, mount_escalate=mount_escalate
     )
-    return path
+
+
+def _prepare_mcp_config(
+    profile: AgentProfile, protocol: str, session_dir: Path, stage_name: str
+) -> Path | None:
+    """session 级 mcp.json 生成：具体形状由 adapter 决定。
+
+    pi 走 --mcp-config（exclusive 不串全局 server）；codex/claude 只有
+    front 需要 escalate；其余协议（custom/dsh）不消费 MCP 配置文件。
+    """
+    return _adapter_for(protocol).mcp_config(profile, session_dir, stage_name)
 
 
 def _thread_options(profile: AgentProfile, workspace_root: Path) -> dict[str, Any]:
-    if profile.protocol != "codex-app-server":
-        return {}
-    return codex.thread_options(profile, workspace_root)
+    return _adapter_for(profile.protocol).thread_options(profile, workspace_root)
 
 
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
@@ -1475,43 +1281,6 @@ def _assistant_text(event: Mapping[str, Any]) -> str:
     ).strip()
 
 
-def _is_pi_intermediate_message(message: Any) -> bool:
-    """判断 pi 的 assistant 消息是否为工具调用间隔中的中间陈述或错误/中断消息。
-
-    pi 助手消息的 content 块类型为 text/thinking/toolCall；带 toolCall 块
-    （stopReason=toolUse）说明模型还要继续执行工具，以 error/aborted 终止的
-    消息则不是正常收尾。这两类消息的文本都不能作为最终回复交付。
-    """
-    if not isinstance(message, Mapping):
-        return False
-    if str(message.get("stopReason") or "") in {"error", "aborted"}:
-        return True
-    content = message.get("content")
-    if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(item, Mapping) and item.get("type") == "toolCall"
-        for item in content
-    )
-
-
-def _pi_final_reply_text(messages: list[Any]) -> str:
-    """从 pi agent_end.messages 提取可交付的终稿文本。
-
-    只认可最后一条 assistant 消息：必须是无 toolCall 的纯文本且非
-    error/aborted 终止，才算终稿。工具调用间隔中的中间陈述、错误消息
-    一律返回空串，由上层记 agent_result_missing 走 fallback 链，
-    避免把计划独白当正式回复发给联系人。
-    """
-    for message in reversed(messages):
-        if not isinstance(message, Mapping) or message.get("role") != "assistant":
-            continue
-        if _is_pi_intermediate_message(message):
-            return ""
-        return _assistant_text({"message": message})
-    return ""
-
-
 def _assistant_thinking(event: Mapping[str, Any]) -> str:
     message = event.get("message")
     if not isinstance(message, Mapping):
@@ -1523,17 +1292,6 @@ def _assistant_thinking(event: Mapping[str, Any]) -> str:
         str(item.get("thinking") or "")
         for item in content
         if isinstance(item, Mapping) and item.get("type") == "thinking"
-    ).strip()
-
-
-def _codex_reasoning_text(item: Mapping[str, Any]) -> str:
-    summary = item.get("summary")
-    if not isinstance(summary, list):
-        return ""
-    return "\n".join(
-        str(part.get("text") or "")
-        for part in summary
-        if isinstance(part, Mapping)
     ).strip()
 
 
@@ -1556,6 +1314,59 @@ def _is_escalate_tool(value: Any) -> bool:
     return name == "escalate" or name.endswith(
         ("__escalate", "/escalate", ":escalate")
     )
+
+
+def _tool_args_summary(args: Any) -> str:
+    """把工具参数压成一行可读摘要，给面板的 toolcall 条目用。
+
+    完整 JSON 在面板上没人看得懂也塞不下：优先取最能表达意图的字段，
+    其余按 key=value 拼接并限长。凭据类字段一律打码——工具参数里出现
+    令牌时不能因为"面板是本地的"就原样落进浏览器的 DOM。
+    """
+    if not isinstance(args, Mapping):
+        return ""
+    for key in ("command", "path", "file_path", "query", "url", "pattern", "goal", "text"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return _redact_secrets(value.strip())[:_LIVE_EVENT_CHARS]
+    parts = []
+    for key, value in args.items():
+        if _is_secret_key(key):
+            parts.append(f"{key}=***")
+        elif isinstance(value, (str, int, float, bool)):
+            parts.append(f"{key}={_redact_secrets(str(value))}")
+        elif isinstance(value, (list, tuple)):
+            parts.append(f"{key}[{len(value)}]")
+        elif isinstance(value, Mapping):
+            parts.append(f"{key}{{{len(value)}}}")
+    return " ".join(parts)[:_LIVE_EVENT_CHARS]
+
+
+_SECRET_KEY_HINTS = ("token", "secret", "password", "passwd", "api_key", "apikey", "credential", "cookie", "authorization")
+# 值可能是 "Bearer sk-..." 这种带方案前缀的形式：方案名保留，后面的凭据整段打码，
+# 否则只吃到第一个空格，令牌就漏在面板上。
+_SECRET_VALUE = r"(\"[^\"]*\"|'[^']*'|(?:(?:Bearer|Basic|Token)\s+)?\S+)"
+_SECRET_FLAG = re.compile(
+    r"(?i)(--?(?:token|secret|password|passwd|api[-_]?key|authorization|cookie)[=\s]+)" + _SECRET_VALUE
+)
+_SECRET_PAIR = re.compile(
+    r"(?i)\b((?:token|secret|password|passwd|api[-_]?key|authorization|cookie)\s*[:=]\s*)" + _SECRET_VALUE
+)
+_SECRET_SCHEME = re.compile(r"(?i)^((?:Bearer|Basic|Token)\s+).*$")
+
+
+def _is_secret_key(key: Any) -> bool:
+    return any(hint in str(key).lower() for hint in _SECRET_KEY_HINTS)
+
+
+def _redact_secrets(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        value = match.group(2)
+        scheme = _SECRET_SCHEME.match(value.strip("\"'"))
+        # 保留 "Bearer " 之类的方案前缀，只吞掉凭据本体。
+        return f"{match.group(1)}{scheme.group(1) if scheme else ''}***"
+
+    return _SECRET_PAIR.sub(replace, _SECRET_FLAG.sub(replace, text))
 
 
 def _is_no_reply_tool(value: Any) -> bool:
