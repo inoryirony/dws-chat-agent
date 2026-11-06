@@ -219,6 +219,13 @@ When configured, the front profile must set `read_only: true`. It may use the to
 
 With streaming cards enabled, acceptance is shown immediately. Both roles use the same provider-neutral stream surface: Codex maps reasoning summaries, Pi maps native thinking, Claude maps thinking blocks, and custom adapters may emit `thinking`. The service does not invent progress labels, fixed progress intervals, or heartbeat text. Models that emit no native thinking produce no fabricated progress. The final natural-language body is persisted in the local outbox before delivery, retried with the same send UUID after transient failures, and replaces the thinking card after the final freshness check.
 
+## Optional Jev message advice
+
+Optional [Jev message-action advice](docs/jev-message-advice.md) can supply a
+memory-aware classification to the existing front/worker flow. It is disabled
+by default, preserves the Agent's task-memory processing, and never directly
+triggers `no_reply`.
+
 ## Safety
 
 - A small deterministic gate only drops empty acknowledgements and enforces the message-size limit; all semantic safety decisions stay with the model.

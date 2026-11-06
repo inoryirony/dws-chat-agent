@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import Contact
+from .jev import validate_config as validate_jev_config
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -114,6 +115,7 @@ def load_settings(path: Path, env_path: Path = DEFAULT_ENV) -> Settings:
     env = _read_env_file(env_path)
     env.update(os.environ)
     raw = _resolve_env(json.loads(path.read_text(encoding="utf-8")), env)
+    validate_jev_config(raw.get("jev", {}))
     timezone = _load_timezone(str(raw.get("timezone", "Asia/Shanghai")))
     contacts = tuple(
         Contact(

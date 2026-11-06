@@ -57,6 +57,7 @@ from .config import (
 )
 from .dashboard import AgentConfigStore, DashboardServer
 from .dws import DwsClient, _find_dws_error_code
+from .jev import advise as jev_advise, prompt_advice
 
 
 LOG = logging.getLogger("dws-chat-agent")
@@ -1007,6 +1008,19 @@ class AgentService:
                 )
                 return
 
+            advice_kwargs: dict[str, Any] = {}
+            jev_config = self.settings.raw.get("jev", {})
+            if jev_config.get("enabled", False):
+                state = {
+                    "current_messages": [{"message_id": item.message_id,
+                                          "time": item.created_at.isoformat(), "text": item.content}
+                                         for item in batch],
+                    "recent_context": list(recent_context),
+                    "active_tasks": json.loads(self._active_tasks_snapshot(batch[0].contact, batch[0].conversation_id)),
+                    "task_snapshot_is_partial": True,
+                }
+                advice_kwargs["jev_advice"] = await jev_advise(jev_config, state)
+
             result: AgentResult | None = None
             if (
                 self.agent_runtime.has_stage("front")
@@ -1018,11 +1032,13 @@ class AgentService:
                     prior_attempt,
                     front=True,
                     recent_context=recent_context,
+                    **advice_kwargs,
                 )
                 if front_result.consumed_supplements:
                     batch = self._deduplicate(
                         [*batch, *front_result.consumed_supplements]
                     )
+                    advice_kwargs = {}  # The front has seen newer evidence than this advice.
                 if front_result.manual_takeover:
                     # 人工接管后不再新建对外卡片通知；接管事实由人工消息本身
                     # 传达，但已存在的处理中卡片必须安全收口，不能悬在会话里。
@@ -1062,6 +1078,7 @@ class AgentService:
                     batch,
                     prior_attempt,
                     recent_context=recent_context,
+                    **advice_kwargs,
                 )
                 if result.consumed_supplements:
                     batch = self._deduplicate(
@@ -1442,14 +1459,17 @@ class AgentService:
         prior_attempt: str,
         *,
         recent_context: Sequence[Mapping[str, str]] = (),
+        jev_advice: Mapping[str, Any] | None = None,
     ) -> AgentResult:
         """按主 worker + fallbacks 链执行；无回复视为该 agent 失败，切换链上下一个。"""
         result = await self._run_agent(
             batch,
             prior_attempt,
             recent_context=recent_context,
+            **({"jev_advice": jev_advice} if jev_advice is not None else {}),
         )
         fallbacks = self.agent_runtime._stage("worker").profile.fallbacks
+        consumed = list(result.consumed_supplements or ())
         for index, agent_name in enumerate(fallbacks, start=1):
             if (
                 result.reply is not None
@@ -1466,12 +1486,18 @@ class AgentService:
                 len(fallbacks),
                 result.error[:200],
             )
+            if consumed:
+                batch = self._deduplicate([*batch, *consumed])
+                jev_advice = None  # A backup must process the newer evidence, not the old hint.
             result = await self._run_agent(
                 batch,
                 prior_attempt,
                 recent_context=recent_context,
                 agent_override=agent_name,
+                **({"jev_advice": jev_advice} if jev_advice is not None else {}),
             )
+            consumed = self._deduplicate([*consumed, *(result.consumed_supplements or ())])
+            result.consumed_supplements = consumed or None
         return result
 
     async def _run_agent(
@@ -1482,6 +1508,7 @@ class AgentService:
         front: bool = False,
         recent_context: Sequence[Mapping[str, str]] = (),
         agent_override: str | None = None,
+        jev_advice: Mapping[str, Any] | None = None,
     ) -> AgentResult:
         stage = "front" if front else "worker"
         profile = re.sub(
@@ -1513,6 +1540,8 @@ class AgentService:
                 recent_context,
             ),
         )
+        if jev_advice is not None:
+            prompt += prompt_advice(jev_advice)
         try:
             stage_profile = self.agent_runtime.resolve_stage(stage, agent_override)
             local_images = (
