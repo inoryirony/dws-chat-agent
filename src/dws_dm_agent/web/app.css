@@ -217,9 +217,6 @@ h1 {
   font: 700 9px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
   letter-spacing: .15em;
 }
-.workbench > .panel:first-child h2::before { content: "ACTIVE / 01"; }
-.workbench > .panel:last-child h2::before { content: "QUEUE / 02"; color: var(--warning-ink); }
-.shell > .panel:not([aria-labelledby]) h2::before { content: "TIMELINE / 03"; }
 .section-head h2::before { content: "SYSTEM MODULE"; }
 .config-card > h2::before { content: "CONFIG BLOCK"; }
 
