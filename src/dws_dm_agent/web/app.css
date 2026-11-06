@@ -653,3 +653,17 @@ textarea:focus-visible {
 /* 在跑会话里的真实阶段条：与旧 ops 卡片同一套 .steps 外观。 */
 .run-rail { margin-top: 8px; }
 .run-rail .step-label { font-size: 10px; }
+
+/* 任务列过长会吃掉整页高度：列内滚动，列头保持可见。 */
+.board-col { max-height: 62vh; overflow-y: auto; scrollbar-gutter: stable; }
+
+/* 阶段条只在当前节点露标签，其余留给线，九段挤在一行也读得清。 */
+.run-rail .step-label { opacity: 0; }
+.run-rail .step.current .step-label,
+.run-rail .step.done:nth-last-child(1) .step-label { opacity: 1; }
+.run-rail .steps { grid-template-columns: repeat(9, minmax(0, 1fr)); }
+
+@media (max-width: 1100px) {
+  .run-rail .steps { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .run-rail .step:nth-child(n+6) { display: none; }
+}
