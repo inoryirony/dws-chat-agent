@@ -224,3 +224,7 @@ PYTHONPATH=src python3 -m dws_dm_agent.front_eval --concurrency 1
 - 自动钉钉消息保留平台 AI 标记。
 
 运行状态、日志、审计数据和临时会话保存在 `state/`，不会提交。`.env` 和 `.env.*` 均被忽略，只有 `.env.example` 例外。
+
+## 可选 Jev 消息动作参考
+
+[接入说明与流程](docs/jev-message-advice.md)：默认关闭；Jev 结合近期聊天和活跃事项提供分类参考，保留 Agent 的事项记录与沉默流程。

@@ -25,6 +25,11 @@
   "workspace_root": "${DWS_CHAT_AGENT_WORKSPACE_ROOT}",
   "worktree_root": "${DWS_CHAT_AGENT_WORKTREE_ROOT}",
   "state_dir": "state",
+  "jev": {
+    "enabled": false,
+    "model": "jev-1.14.0",
+    "api_key": "${TYPESAFE_API_KEY}"
+  },
   "task_memory": {
     "inactive_days": 2
   },
