@@ -34,7 +34,31 @@ def render_prompt(template: str, variables: Mapping[str, Any]) -> str:
     missing = sorted(set(_PLACEHOLDER.findall(template)) - set(variables))
     if missing:
         raise ValueError(f"missing prompt variables: {', '.join(missing)}")
-    return _PLACEHOLDER.sub(lambda match: str(variables[match.group(1)]), template)
+    return _PLACEHOLDER.sub(
+        lambda match: _neutralize_structural_tags(str(variables[match.group(1)])),
+        template,
+    )
+
+
+# 变量值进入 prompt 后可能落在 <untrusted_*> 数据块内：联系人消息里若
+# 出现 "</untrusted_...>" 或 "<system_wake>" 字面量，会提前闭合数据块、
+# 把后面的内容伪装成指令。结构性标签统一替换为全角括号形式，字面量
+# 保留、语义失效。
+_STRUCTURAL_TAG = re.compile(
+    r"(</?\s*(?:untrusted_[a-z_]+|system_wake|override|conflict-rule)\s*>)",
+    re.IGNORECASE,
+)
+
+
+def _neutralize_structural_tags(value: str) -> str:
+    return _STRUCTURAL_TAG.sub(
+        lambda match: match.group(1).replace("<", "＜").replace(">", "＞"),
+        value,
+    )
+
+
+# 公开别名：service 侧对 <system_wake> 注入文本做同一套失效化。
+neutralize_structural_tags = _neutralize_structural_tags
 
 
 def assemble_stage_prompt(shared: str, stage: str) -> str:

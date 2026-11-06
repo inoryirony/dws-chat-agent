@@ -207,7 +207,13 @@ A preset always requires a `worker`; `front` is optional. Omitting `front` sends
 
 `label` is display text for a workflow stage. `options` contains protocol-specific settings, while `extra_args` appends literal CLI arguments after the adapter's required flags. `timeout_seconds: 0` means no agent deadline. For Pi, `options.tools: null` omits the `--tools` allowlist and exposes its built-in tools; the front prompt and `read_only: true` remain the authorization boundary.
 
-The bundled protocols are `codex-app-server`, `claude-stream-json`, and `pi-rpc`. The current `ccr code` launcher forwards Claude Code flags, while Oh My Pi exposes native `--mode rpc`. A completely independent CLI can use `custom-jsonl-v1`; its small stdin/stdout contract is documented in [docs/custom-agent-protocol.md](docs/custom-agent-protocol.md). The front adapter receives the session-local MCP path in `DWS_ESCALATE_MCP_CONFIG`.
+`options.extensions` is an allowlist for Pi. When the key is present — including an empty array — the adapter passes `--no-extensions` and loads only the listed extensions plus its own service-tool extensions. An empty array is meaningful: it means "no third-party extension", which is what a read-only front wants. Omitting the key keeps Pi's default discovery.
+
+`options.mcp` mounts MCP servers per profile through `pi-mcp-adapter`. Each entry is either a catalog name (`grafana-dev`, `grafana-prod-logging`, `hsj-atlassian`, see `runners/mcp_catalog.py`), an object that overrides fields on the catalog entry, or a full `{command|url, args, ...}` definition. The adapter writes a session-local `mcp.json` and passes `--mcp-config` with `PI_MCP_CONFIG_MODE=exclusive`, so global servers in `~/.pi/agent/mcp.json` never reach the session. Prefer `directTools` with a short list over leaving a 60-tool server fully declared: schema size is charged on every request. Declaring `options.mcp` without an adapter in `options.extensions` fails at prepare time instead of starting a Pi that rejects `--mcp-config`.
+
+The bundled protocols are `codex-app-server`, `claude-stream-json`, and `pi-rpc`. The current `ccr code` launcher forwards Claude Code flags, while Oh My Pi exposes native `--mode rpc`. A completely independent CLI can use `custom-jsonl-v1`; its small stdin/stdout contract is documented in [docs/custom-agent-protocol.md](docs/custom-agent-protocol.md). The front adapter receives the session-local MCP path in `DWS_ESCALATE_MCP_CONFIG`; Pi's own escalate is a native extension, so its front needs no MCP server at all.
+
+Pi session completion waits for `agent_settled`, not `agent_end`. `agent_end` only closes one low-level run: retries, overflow recovery, compaction retries, and queued steering or follow-up messages can still follow, and Pi reports `agent_settled` once nothing remains.
 
 Future custom flows can be introduced as additional presets without turning the current pipeline into a general DAG engine.
 

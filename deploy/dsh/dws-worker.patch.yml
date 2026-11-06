@@ -1,0 +1,41 @@
+# dws worker patch: ccr-internal 模型层 + engram MCP（streamable-http）。
+# launcher 级 --patch 逐条前置（dsh-cmdline 契约），本文件经 options.dsh_patches 注入。
+# reasoningEfforts 必须是映射（off: 空、low: low…），列表形态报 NO_ADAPTER。
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: ccr-internal
+    model: glm-5.2
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      ccr-internal:
+        displayName: aimodel-默认
+        apiKeyEnv: CCR_INTERNAL_API_KEY
+        api: anthropic-messages
+        baseURL: https://aimodel.hsjdata.com
+        models:
+          - id: glm-5.2
+            name: glm-5.2
+            contextWindow: 1000000
+            input: [ text ]
+            reasoningEfforts: &efforts-with-off
+              off:
+              low: low
+              medium: medium
+              high: high
+          - id: glm-5.1
+            name: glm-5.1
+            contextWindow: 1000000
+            input: [ text ]
+            reasoningEfforts: *efforts-with-off
+- insert:
+    - id: mcp-engram
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: engram
+        transport: streamable-http
+        url: http://10.1.9.181:8701/mcp
+        headers:
+          X-Engram-User: tianzema

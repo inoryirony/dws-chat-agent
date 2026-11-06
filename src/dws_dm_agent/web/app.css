@@ -458,6 +458,18 @@ textarea:focus-visible {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 裁决行需要读全文：单行省略会把"为什么等我裁决"吃掉。改成最多三行，
+   仍用 line-clamp 兜住超长目标，悬停有 title 可看完整文本。 */
+.verdict-row { align-items: flex-start; }
+.verdict-row .board-goal {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+.verdict-row .board-input { align-self: center; }
+.verdict-row .icon-btn { align-self: center; }
 .board-input {
   flex: 0 1 320px;
   min-width: 120px;
@@ -482,12 +494,28 @@ textarea:focus-visible {
 }
 .board-run-row.waiting { border-left-color: var(--warning); }
 .run-main { flex: 1; min-width: 0; display: grid; gap: 7px; }
-.run-line { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.run-headline { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-line { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
+/* headline 是模型写的进度一句话，也是请求摘要占位。单行省略看不到内容，
+   改成两行截断；完整文本仍在 title 上。 */
+.run-headline {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.run-headline.placeholder { color: var(--muted); font-style: italic; }
 .run-elapsed { color: var(--muted); font-variant-numeric: tabular-nums; }
-.pdots { display: flex; align-items: center; gap: 6px; }
+.pdots { display: flex; align-items: center; gap: 6px; padding: 2px 0; background: none; border: 0; cursor: pointer; }
 .pdot { width: 7px; height: 7px; border-radius: 50%; background: var(--line-strong); }
 .pdot.latest { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.run-steps { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--ark-radius); background: color-mix(in srgb, var(--control) 45%, transparent); }
+.run-steps[hidden] { display: none; }
+.run-step { display: flex; gap: 10px; font-size: 13px; line-height: 1.5; }
+.run-step-time { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.run-step-text { min-width: 0; overflow-wrap: anywhere; color: var(--text-secondary); }
 .steer-box { display: flex; gap: 8px; }
 .steer-box[hidden] { display: none; }
 .send-btn, .steer-btn { color: var(--text-secondary); }

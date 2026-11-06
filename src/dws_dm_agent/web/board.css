@@ -1,0 +1,634 @@
+/* Shared operations board: 等我裁决 / 在跑会话 / 任务 / 抽屉 / 铃 / 新会话。
+ *
+ * 两套设计共用本文件与 board.js，功能、文案、交互完全一致；差异只在
+ * 版式语言：
+ *   Metropolis（dashboard.html + app.css）—— 3px 圆角、右上 12px 切角、
+ *   --line-strong 边框、3px 左强调条、等宽大写微标签；
+ *   Diamond（diamond-preview.html）—— 直角、切角几何，浮在已有
+ *   .channel-field 框架里，不再套一层边框。
+ *
+ * 颜色语义（与看板一致，不要混用）：
+ *   danger/红 = 失败、出错、被拒；
+ *   warning/黄 = 等外部、等你处理（尚未出错）；
+ *   accent = 正在跑；success = 完成；muted = 归档。
+ */
+
+.dws-board {
+  --dws-radius: var(--ark-radius, 3px);
+  --dws-cut: var(--ark-cut, 12px);
+  --dws-bar: 3px;
+  --dws-panel-bg: color-mix(in srgb, var(--panel) 96%, transparent);
+  display: grid;
+  gap: 14px;
+}
+
+.dws-board-alert {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--danger-border);
+  border-left: var(--dws-bar) solid var(--danger);
+  border-radius: var(--dws-radius);
+  background: color-mix(in srgb, var(--danger-soft) 70%, transparent);
+  color: var(--danger-ink);
+  font-size: 13px;
+}
+.dws-board-alert[hidden] { display: none; }
+.dws-board-alert a { color: inherit; text-underline-offset: 3px; }
+
+/* ---------- 面板：与 app.css .panel 同一套几何 ---------- */
+
+.dws-panel {
+  padding: 18px 20px 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--dws-radius);
+  background: var(--dws-panel-bg);
+  clip-path: polygon(0 0, calc(100% - var(--dws-cut)) 0, 100% var(--dws-cut), 100% 100%, 0 100%);
+  min-width: 0;
+}
+.dws-panel[hidden] { display: none; }
+
+.dws-panel-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+  min-height: 44px;
+  padding-bottom: 11px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.dws-panel-title { min-width: 0; }
+.dws-panel-code {
+  margin: 0 0 5px;
+  color: var(--accent-ink);
+  font: 700 9px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: .15em;
+}
+.dws-panel-head h2 {
+  margin: 0;
+  display: flex; align-items: center; gap: 8px;
+  font-size: 15px; font-weight: 700; letter-spacing: .035em;
+}
+.dws-panel-head .dws-hint { color: var(--muted); font-size: 11px; }
+.dws-count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* ---------- 等我裁决 ---------- */
+
+.dws-verdict-rows { display: grid; gap: 8px; }
+.dws-verdict {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: var(--dws-bar) solid var(--warning);
+  border-radius: var(--dws-radius);
+  background: linear-gradient(90deg, var(--warning-soft), transparent 22rem), var(--panel-2);
+}
+.dws-verdict-body { display: grid; gap: 8px; min-width: 0; }
+.dws-verdict-goal {
+  min-width: 0;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.dws-verdict-goal-button {
+  min-width: 0; padding: 0; text-align: left; font: inherit; color: inherit;
+  background: none; border: 0; cursor: pointer;
+}
+.dws-verdict-goal-button:hover { transform: none; background: none; box-shadow: none; }
+.dws-verdict-goal-button:hover .dws-verdict-goal { color: var(--text); }
+.dws-verdict.open .dws-verdict-goal { -webkit-line-clamp: unset; display: block; }
+.dws-verdict.open .dws-verdict-goal-button { cursor: default; }
+
+/* "要你决定什么"：整张卡里唯一需要一眼看到的东西，用左边线 + 淡底托住。 */
+.dws-verdict-ask {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--warning);
+  border-radius: 0 var(--dws-radius) var(--dws-radius) 0;
+  background: var(--warning-soft);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.dws-verdict-ask[hidden] { display: none; }
+
+.dws-verdict-facts {
+  margin: 0; padding: 0 0 0 2px;
+  list-style: none;
+  display: grid; gap: 4px;
+}
+.dws-verdict-facts[hidden] { display: none; }
+.dws-verdict-facts li {
+  display: flex; gap: 8px;
+  font-size: 12px; line-height: 1.55;
+  color: var(--text-secondary);
+}
+/* 默认只露最近两条，展开看全部：卡片保持可扫读。 */
+.dws-verdict-facts li:nth-child(n+3) { display: none; }
+.dws-verdict.open .dws-verdict-facts li:nth-child(n+3) { display: flex; }
+.dws-fact-time { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dws-fact-text { min-width: 0; overflow-wrap: anywhere; }
+
+.dws-verdict-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); font-size: 12px; }
+
+/* 选项一排、输入一排：点一下就走，打字是兜底。 */
+.dws-choices { display: flex; flex-wrap: wrap; gap: 8px; }
+.dws-choice {
+  padding: 7px 14px;
+  font: inherit; font-size: 13px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--control) 88%, transparent);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--dws-radius);
+  cursor: pointer;
+}
+.dws-choice:hover { border-color: var(--accent); color: var(--accent-ink); }
+.dws-choice.ok {
+  color: var(--success-ink);
+  border-color: var(--success-border);
+  background: var(--success-soft);
+}
+.dws-choice.ok:hover { border-color: var(--success); }
+
+.dws-verdict-actions {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; gap: 8px;
+}
+.dws-answer {
+  flex: 1 1 240px; min-width: 140px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: var(--control);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--dws-radius);
+  font: inherit; font-size: 13px;
+}
+.dws-answer:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ---------- 在跑会话 ---------- */
+
+.dws-run-rows { display: grid; gap: 8px; }
+.dws-run {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: var(--dws-bar) solid var(--accent);
+  border-radius: var(--dws-radius);
+  background: var(--panel-2);
+  transition: border-color var(--ark-fast, 160ms), box-shadow var(--ark-flow, 260ms);
+}
+.dws-run:hover { border-color: var(--line-strong); border-left-color: var(--accent); }
+.dws-run.is-waiting { border-left-color: var(--warning); }
+.dws-run-main { display: grid; gap: 8px; min-width: 0; }
+.dws-run-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; min-width: 0; }
+.dws-run-contact { flex: 0 0 auto; font-size: 14px; font-weight: 700; color: var(--text); }
+.dws-run-headline {
+  flex: 1 1 100%; min-width: 0;
+  font-size: 13px; line-height: 1.6; color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.dws-run-headline.placeholder { color: var(--muted); font-style: italic; }
+.dws-run-elapsed { flex: 0 0 auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+.dws-run-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; color: var(--muted); font-size: 11px; }
+
+/* 九段阶段条：来自原设计 .steps/.step/.step-line/.step-label，两页各自
+   有基样式（3px 线 + 标签），这里只补容器语义与窄屏密度。 */
+.dws-rail { margin-top: 2px; }
+.dws-rail[hidden] { display: none; }
+.dws-rail .steps { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: 5px; }
+.dws-rail .step { min-width: 0; }
+.dws-rail .step-line { height: 3px; margin-bottom: 6px; border-radius: 0; overflow: hidden; }
+.dws-rail .step-label { font-size: 10px; line-height: 1.4; }
+.dws-rail .step.current .step-line {
+  position: relative;
+  background: color-mix(in srgb, var(--info) 30%, var(--line));
+}
+.dws-rail .step.current .step-line::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0 20%, var(--info) 48%, transparent 76%);
+  transform: translateX(-100%);
+  animation: dws-phase-flow 1.8s linear infinite;
+}
+/* 已完成段用 success，当前段用 info：与原设计 .step.done/.step.current 一致。 */
+.dws-rail .step.done .step-line { background: var(--success); }
+@media (max-width: 1100px) {
+  .dws-rail .steps { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .dws-rail .step:nth-child(n+6) { display: none; }
+}
+
+.dws-progress-toggle {
+  justify-self: start;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 0;
+  color: var(--text-secondary); font: inherit; font-size: 12px;
+  background: none; border: 0; cursor: pointer;
+}
+.dws-progress-toggle[hidden] { display: none; }
+.dws-progress-toggle:hover { color: var(--accent-ink); transform: none; background: none; box-shadow: none; }
+.dws-progress-toggle .dws-icon { transition: transform var(--ark-fast, 160ms); }
+.dws-progress-toggle[aria-expanded="false"] .dws-icon { transform: rotate(-90deg); }
+
+.dws-progress-list {
+  display: grid; gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--dws-radius);
+  background: color-mix(in srgb, var(--control) 45%, transparent);
+}
+.dws-progress-list[hidden] { display: none; }
+.dws-progress-row { display: flex; gap: 10px; font-size: 13px; line-height: 1.5; }
+.dws-progress-time { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dws-progress-text { min-width: 0; overflow-wrap: anywhere; color: var(--text-secondary); }
+.dws-progress-empty { color: var(--muted); font-size: 12px; }
+
+/* ---------- 实时流（think / 正文 / 工具调用） ---------- */
+
+.dws-live {
+  display: grid; gap: 3px;
+  max-height: 300px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--dws-radius);
+  background: color-mix(in srgb, var(--control) 55%, transparent);
+}
+.dws-live[hidden] { display: none; }
+.dws-live-row {
+  display: grid; grid-template-columns: 2.6em minmax(0, 1fr);
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+/* 展开态多一列时间：不给它整行，否则每条轨迹都被时间撑成两行。 */
+.dws-live:not(.is-compact) .dws-live-row { grid-template-columns: 2.6em minmax(0, 1fr) auto; }
+.dws-live-tag {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  padding-top: 1px;
+}
+.dws-live-text { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; color: var(--text-secondary); }
+
+/* 思考：压低对比度当背景音；正文：正常可读；工具：等宽 + 状态色。 */
+.dws-live-row.is-think .dws-live-text { color: var(--muted); font-style: italic; }
+.dws-live-row.is-message .dws-live-text { color: var(--text); }
+.dws-live-row.is-tool .dws-live-text,
+.dws-live-row.is-tool_result .dws-live-text {
+  display: grid; grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: baseline; gap: 8px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}
+.dws-live-tool { color: var(--accent-ink); font-weight: 600; white-space: nowrap; }
+.dws-live-args { min-width: 0; overflow-wrap: anywhere; color: var(--text-secondary); white-space: pre-wrap; }
+.dws-live-status { font-size: 11px; white-space: nowrap; }
+.dws-live-status.is-ok { color: var(--success-ink); }
+.dws-live-status.is-failed { color: var(--danger-ink); }
+/* 折叠态：工具只占一行、只给名字；思考每个片段从新行起头，长了自然换行；
+   正文完整显示。展开才铺参数、时间和完整轨迹。 */
+.dws-live.is-compact {
+  max-height: 320px;
+  gap: 3px;
+  padding: 7px 10px;
+}
+.dws-live.is-compact .dws-live-row {
+  display: grid;
+  grid-template-columns: 2.6em minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  padding: 1px 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+/* 工具：一行，只留名字，参数属于展开后的细节。 */
+.dws-live.is-compact .dws-live-row.is-tool .dws-live-text,
+.dws-live.is-compact .dws-live-row.is-tool_result .dws-live-text {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 思考：每段另起一行，超出宽度正常折行，不截断。 */
+.dws-live.is-compact .dws-live-row.is-think .dws-live-text {
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* 正文是主内容：折叠态也完整显示，不做截断。 */
+.dws-live.is-compact .dws-live-row.is-message .dws-live-text {
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.dws-live-more {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  margin-top: 4px; padding-top: 5px;
+  border-top: 1px dashed var(--line);
+  color: var(--muted); font-size: 11px;
+}
+.dws-live-more b { color: var(--accent-ink); font-weight: 500; cursor: pointer; }
+.dws-live-time { color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; align-self: center; }
+
+.dws-live-sep {
+  margin: 6px 0 2px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .06em;
+}
+
+.dws-steer { display: flex; gap: 8px; }
+.dws-steer[hidden] { display: none; }
+
+/* ---------- 任务 ---------- */
+
+.dws-board-cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.dws-board-cols.single { grid-template-columns: minmax(0, 1fr); }
+.dws-board-cols.single .dws-col:first-child { display: none; }
+.dws-col {
+  min-width: 0; display: grid; gap: 8px; align-content: start;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--dws-radius);
+  background: color-mix(in srgb, var(--control) 45%, transparent);
+}
+.dws-col-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 2px 0 6px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-secondary); font-size: 12px; letter-spacing: .04em;
+}
+.dws-col-head b { color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+.dws-cards { display: grid; gap: 8px; min-height: 40px; }
+.dws-card {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px;
+  width: 100%; min-width: 0; padding: 10px 12px;
+  text-align: left; font: inherit; font-size: 13px; line-height: 1.6;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-left: var(--dws-bar) solid var(--accent);
+  border-radius: var(--dws-radius);
+  cursor: pointer;
+}
+.dws-card:hover { transform: translateY(-1px); border-color: var(--line-strong); border-left-color: var(--accent); }
+.dws-card-goal {
+  min-width: 0; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.dws-card.is-done { border-left-color: var(--success); opacity: .72; }
+/* 等外部 = 等待，不是出错：黄条；红只留给失败。 */
+.dws-card.is-waiting { border-left-color: var(--warning); }
+.dws-card.is-cancelled { border-left-color: var(--line-strong); opacity: .46; }
+.dws-card.is-mine {
+  border-left-color: var(--warning);
+  background: linear-gradient(90deg, var(--warning-soft), transparent 16rem), var(--panel-2);
+}
+.dws-col-empty { padding: 10px 0; color: var(--muted); font-size: 12px; text-align: center; }
+
+.dws-done-strip { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.dws-done-strip[hidden] { display: none; }
+.dws-done-strip summary {
+  display: flex; align-items: center; gap: 8px;
+  cursor: pointer; list-style: none;
+  color: var(--muted); font-size: 12px;
+}
+.dws-done-strip summary::-webkit-details-marker { display: none; }
+.dws-done-strip summary .dws-icon { transition: transform var(--ark-fast, 160ms); transform: rotate(-90deg); }
+.dws-done-strip[open] summary .dws-icon { transform: none; }
+.dws-done-strip[open] .dws-cards { margin-top: 10px; }
+
+/* ---------- 头像 ---------- */
+
+.dws-avatar {
+  width: 34px; height: 34px; min-width: 34px;
+  display: inline-grid; place-items: center;
+  border-radius: 50%;
+  background: var(--control-deep, var(--control));
+  border: 1px solid var(--line-strong);
+  color: var(--text-secondary);
+  font-size: 14px; font-weight: 700; line-height: 1;
+}
+
+/* ---------- 图标按钮（与 app.css .icon-btn 同规格） ---------- */
+
+.dws-icon-btn {
+  display: inline-grid; place-items: center;
+  min-width: 38px; min-height: 38px;
+  padding: 0 10px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--control) 88%, transparent);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--dws-radius);
+  cursor: pointer;
+}
+.dws-icon-btn:hover { color: var(--accent-ink); border-color: var(--accent); background: var(--accent-soft); }
+.dws-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.dws-icon-btn.ok { color: var(--success-ink); }
+.dws-icon-btn.ok:hover { border-color: var(--success); }
+.dws-icon-btn[disabled] { opacity: .45; cursor: default; }
+.dws-icon { display: block; width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ---------- 铃 ---------- */
+
+.dws-bell-wrap { position: relative; display: inline-flex; }
+.dws-bell-badge {
+  position: absolute; top: -6px; right: -6px;
+  min-width: 18px; height: 18px; padding: 0 4px;
+  display: grid; place-items: center;
+  border-radius: 999px;
+  /* 铃里的数字是"有事等你"，不是错误，用黄；只有真失败才算红。 */
+  background: var(--warning);
+  color: var(--accent-text, #101416);
+  font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+.dws-bell-badge[hidden] { display: none; }
+.dws-bell-menu {
+  position: absolute; z-index: 50; top: calc(100% + 8px); right: 0;
+  width: min(380px, 86vw); max-height: 60vh; overflow-y: auto;
+  padding: 8px;
+  display: grid; gap: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--dws-radius);
+  box-shadow: 0 22px 50px rgba(0, 0, 0, .4);
+}
+.dws-bell-menu[hidden] { display: none; }
+.dws-bell-row {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px;
+  width: 100%; padding: 9px 10px;
+  text-align: left; font: inherit; font-size: 13px; line-height: 1.5;
+  color: var(--text);
+  background: transparent; border: 1px solid transparent; border-radius: var(--dws-radius);
+  cursor: pointer;
+}
+.dws-bell-row:hover { background: var(--accent-soft); border-color: var(--line); transform: none; box-shadow: none; }
+.dws-bell-text { min-width: 0; overflow-wrap: anywhere; }
+.dws-bell-row.is-mine .dws-bell-text { color: var(--warning-ink); }
+.dws-bell-empty { padding: 16px 8px; color: var(--muted); font-size: 13px; text-align: center; }
+
+/* ---------- 抽屉 ---------- */
+
+.dws-drawer-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(0, 0, 0, .42);
+}
+.dws-drawer-backdrop[hidden] { display: none; }
+.dws-drawer {
+  position: fixed; z-index: 61; top: 0; right: 0; bottom: 0;
+  width: min(470px, 92vw);
+  display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 14px;
+  padding: 20px 20px 28px;
+  background: var(--panel);
+  border-left: 1px solid var(--line-strong);
+  box-shadow: -18px 0 44px rgba(0, 0, 0, .35);
+  overflow: auto;
+}
+.dws-drawer[hidden] { display: none; }
+.dws-drawer-head { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.dws-drawer-goal {
+  margin: 6px 0 0;
+  font-size: 16px; font-weight: 700; line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.dws-drawer-people {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.dws-facts { display: grid; gap: 4px; align-content: start; }
+.dws-fact {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 6px 0;
+  font-size: 13px; line-height: 1.5;
+}
+.dws-fact-dot { width: 9px; height: 9px; min-width: 9px; border-radius: 50%; align-self: center; background: var(--line-strong); }
+.dws-fact-dot.is-human { background: var(--warning); }
+.dws-fact-dot.is-contact { background: var(--muted); }
+.dws-fact-dot.is-agent { background: transparent; border: 2px solid var(--text-secondary); }
+.dws-fact .dws-fact-text { flex: 1; min-width: 0; color: var(--text-secondary); }
+.dws-fact .dws-fact-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+/* ---------- 新会话 ---------- */
+
+.dws-modal-overlay {
+  position: fixed; z-index: 70; inset: 0;
+  display: grid; place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, .46);
+}
+.dws-modal-overlay[hidden] { display: none; }
+.dws-modal {
+  width: min(520px, 92vw);
+  display: grid; gap: 12px;
+  padding: 20px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--dws-radius);
+  box-shadow: 0 26px 60px rgba(0, 0, 0, .45);
+}
+.dws-modal textarea, .dws-modal select {
+  width: 100%; padding: 10px;
+  color: var(--text); background: var(--control);
+  border: 1px solid var(--line-strong); border-radius: var(--dws-radius);
+  font: inherit; font-size: 13px; resize: vertical;
+}
+.dws-modal-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.dws-modal-error { flex: 1; min-width: 0; color: var(--danger-ink); font-size: 12px; }
+.dws-btn {
+  padding: 9px 14px;
+  font: inherit; font-size: 13px;
+  color: var(--text-secondary); background: transparent;
+  border: 1px solid var(--line-strong); border-radius: var(--dws-radius);
+  cursor: pointer;
+}
+.dws-btn:hover { color: var(--text); }
+.dws-btn.primary {
+  padding: 9px 18px;
+  color: var(--accent-text, #101416);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.dws-btn[disabled] { opacity: .5; cursor: default; }
+
+.dws-toast {
+  position: fixed; z-index: 80; left: 50%; bottom: 26px; transform: translateX(-50%);
+  max-width: min(480px, 90vw);
+  padding: 11px 18px;
+  background: var(--panel-2);
+  border: 1px solid var(--accent-border);
+  border-left: var(--dws-bar) solid var(--accent);
+  border-radius: var(--dws-radius);
+  color: var(--text); font-size: 13px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .4);
+}
+.dws-toast[hidden] { display: none; }
+.dws-toast.is-error { border-color: var(--danger-border); border-left-color: var(--danger); color: var(--danger-ink); }
+
+@keyframes dws-phase-flow { to { transform: translateX(100%); } }
+
+@media (max-width: 900px) {
+  .dws-board-cols { grid-template-columns: 1fr; }
+  .dws-board-cols.single .dws-col:first-child { display: none; }
+  .dws-verdict { grid-template-columns: auto minmax(0, 1fr); }
+  .dws-run { grid-template-columns: auto minmax(0, 1fr); }
+  .dws-panel { padding: 14px 14px 16px; }
+}
+
+/* ---------- Diamond：直角 + 切角，浮在 .channel-field 框架内 ---------- */
+
+html[data-design="diamond"] .dws-board {
+  --dws-radius: 0px;
+  --dws-cut: 12px;
+  --dws-panel-bg: transparent;
+  gap: 12px;
+}
+html[data-design="diamond"] .dws-panel {
+  border: 0;
+  border-radius: 0;
+  clip-path: none;
+  padding: 18px 22px 22px;
+}
+html[data-design="diamond"] .dws-panel + .dws-panel { border-top: 1px solid var(--line); }
+html[data-design="diamond"] .dws-panel-head {
+  min-height: 0;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+html[data-design="diamond"] .dws-panel-head h2 { font-size: clamp(18px, 2.2vw, 26px); letter-spacing: 0; }
+html[data-design="diamond"] .dws-panel-head h2::before { display: none; }
+html[data-design="diamond"] .dws-verdict,
+html[data-design="diamond"] .dws-run,
+html[data-design="diamond"] .dws-card,
+html[data-design="diamond"] .dws-col {
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+}
+html[data-design="diamond"] .dws-avatar,
+html[data-design="diamond"] .dws-icon-btn,
+html[data-design="diamond"] .dws-choice,
+html[data-design="diamond"] .dws-answer,
+html[data-design="diamond"] .dws-progress-list { border-radius: 0; }
+html[data-design="diamond"] .dws-col { background: transparent; }
+html[data-design="diamond"] .dws-col-head { font-size: 10px; letter-spacing: .13em; }

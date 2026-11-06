@@ -501,6 +501,96 @@ class MessageSourceTests(BoardStoreTests):
             "contact",
         )
 
+class FactDedupTests(FactAnchorTests):
+    def test_resubmitting_identical_fact_does_not_extend_lifetime(self) -> None:
+        created = task_tools.execute_request(
+            {
+                "tool": "task_record",
+                "tool_call_id": "tool-1",
+                "args": {
+                    "goal": "去重验证",
+                    "facts": [
+                        {"text": "同一条事实", "anchor_message_id": "message-1"}
+                    ],
+                },
+            },
+            self.context,
+        )
+        self.assertTrue(created["ok"])
+        task_id = created["task"]["id"]
+        first = self.store._load_task(self.scope, task_id)
+        self.assertEqual(first["version"], 1)
+
+        again = task_tools.execute_request(
+            {
+                "tool": "task_record",
+                "tool_call_id": "tool-2",
+                "args": {
+                    "task_id": task_id,
+                    "expected_version": 1,
+                    "facts": [
+                        {"text": "同一条事实", "anchor_message_id": "message-1"}
+                    ],
+                },
+            },
+            self.context,
+        )
+        self.assertTrue(again["ok"])
+        # 重复 facts 不算变更：版本不动、facts 不重复插入。
+        self.assertEqual(again["task"]["version"], 1)
+        rows = self.store.connection.execute(
+            "SELECT COUNT(*) FROM facts WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        self.assertEqual(rows, 1)
+
+
+class ArchiveVisibilityTests(FactAnchorTests):
+    def test_archived_task_is_visible_only_with_include_archived(self) -> None:
+        created = self._record()
+        task_id = created["task"]["id"]
+        self.store.connection.execute(
+            "UPDATE tasks SET archived_at = ?, archive_reason = 'inactive' "
+            "WHERE id = ?",
+            (NOW.isoformat(), task_id),
+        )
+        self.store.connection.commit()
+
+        default = self.store.board_tasks()
+        self.assertNotIn(task_id, {task["id"] for task in default})
+
+        archived = self.store.board_tasks(include_archived=True)
+        self.assertIn(task_id, {task["id"] for task in archived})
+
+        via_tool = task_tools.execute_request(
+            {
+                "tool": "task_lookup",
+                "tool_call_id": "tool-archived",
+                "args": {"include_archived": True},
+            },
+            self.context,
+        )
+        self.assertTrue(via_tool["ok"])
+        self.assertIn(task_id, {task["id"] for task in via_tool["tasks"]})
+
+
+class TruncationReportTests(FactAnchorTests):
+    def test_over_limit_facts_report_what_was_dropped(self) -> None:
+        facts = [
+            {"text": f"事实 {index}", "anchor_message_id": "message-1"}
+            for index in range(10)
+        ]
+        result = task_tools.execute_request(
+            {
+                "tool": "task_record",
+                "tool_call_id": "tool-trunc",
+                "args": {"goal": "截断验证", "facts": facts},
+            },
+            self.context,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["truncated"], {"facts": 2})
+
+
 
 if __name__ == "__main__":
     unittest.main()

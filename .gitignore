@@ -228,3 +228,4 @@ state/
 /agent.db
 .playwright-cli/
 .DS_Store
+verify-evidence/

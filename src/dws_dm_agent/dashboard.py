@@ -68,6 +68,43 @@ class _BoardTargetMissing(LookupError):
     pass
 
 
+_ASSET_PATTERN = re.compile(
+    r'(?P<attr>(?:href|src)=")(?P<path>/(?:app|board|diamond-preview)\.(?:css|js))'
+    r'(?:\?v=[^"]*)?(?P<quote>")'
+)
+
+
+def _asset_version(path: Path) -> str:
+    """按文件内容长度 + mtime 派生版本串。
+
+    HTML 里写死 ?v=1 的结果是改完样式浏览器还拿旧文件——静态响应虽然是
+    no-store，但页面里那个 query 不变，缓存键就不变。改成服务端现算，
+    每次文件变化自动换 key，不再需要手工 bump。
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return "0"
+    return f"{int(stat.st_mtime)}-{stat.st_size}"
+
+
+def _with_asset_versions(dashboard: Any, page: Path) -> bytes:
+    """给页面里的 app.css / board.css / board.js 打上内容版本号。"""
+    assets = {
+        "/app.css": dashboard.app_css,
+        "/board.css": dashboard.board_css,
+        "/board.js": dashboard.board_js,
+        "/diamond-preview.css": dashboard.diamond_css,
+    }
+    versions = {name: _asset_version(path) for name, path in assets.items()}
+
+    def replace(match: re.Match[str]) -> str:
+        path = match.group("path")
+        return f'{match.group("attr")}{path}?v={versions.get(path, "0")}{match.group("quote")}'
+
+    return _ASSET_PATTERN.sub(replace, page.read_text(encoding="utf-8")).encode("utf-8")
+
+
 def _board_text(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("请输入内容")
@@ -533,6 +570,10 @@ class DashboardServer:
         self.diamond_favicon = self.html.with_name("diamond-favicon.svg")
         self.theme_js = self.html.with_name("theme.js")
         self.app_css = self.html.with_name("app.css")
+        # 黑板是两套设计共用的功能层：脚本与样式单独成文件，页面只提供锚点。
+        # 只把黑板写进其中一套会让两套设计功能不一致，所以两边都引同一份。
+        self.board_js = self.html.with_name("board.js")
+        self.board_css = self.html.with_name("board.css")
         self.favicon = self.html.with_name("favicon.svg")
         self.contacts = dict(contacts)
         self.timezone = timezone
@@ -632,12 +673,30 @@ class DashboardServer:
                         "text/css; charset=utf-8",
                     )
                     return
+                if path == "/board.css":
+                    if not dashboard.board_css.is_file():
+                        self.send_error(404)
+                        return
+                    self._send(
+                        dashboard.board_css.read_bytes(),
+                        "text/css; charset=utf-8",
+                    )
+                    return
+                if path == "/board.js":
+                    if not dashboard.board_js.is_file():
+                        self.send_error(404)
+                        return
+                    self._send(
+                        dashboard.board_js.read_bytes(),
+                        "text/javascript; charset=utf-8",
+                    )
+                    return
                 if path == "/":
                     # 页面只经 loopback 提供，cookie 直接带操作者令牌，书签
                     # 打开根路径即可读黑板；API 仍校验凭据，SameSite=Strict
                     # 让跨站页面带不上它。
                     self._send(
-                        dashboard.html.read_bytes(),
+                        _with_asset_versions(dashboard, dashboard.html),
                         "text/html; charset=utf-8",
                         extra_headers=[
                             (
@@ -654,7 +713,7 @@ class DashboardServer:
                         self.send_error(404)
                         return
                     self._send(
-                        dashboard.diamond_html.read_bytes(),
+                        _with_asset_versions(dashboard, dashboard.diamond_html),
                         "text/html; charset=utf-8",
                         content_security_policy=(
                             "default-src 'self'; "

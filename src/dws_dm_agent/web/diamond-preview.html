@@ -9,7 +9,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
   <link rel="icon" href="/diamond-favicon.svg?v=3" type="image/svg+xml">
   <link rel="stylesheet" href="/diamond-preview.css?v=1">
+  <link rel="stylesheet" href="/board.css?v=3">
   <script src="/theme.js"></script>
+  <script src="/board.js?v=3"></script>
 </head>
 <body>
   <a class="skip-link" href="#mainContent">跳到主要内容</a>
@@ -35,6 +37,8 @@
         <div><strong>PROJECT D.I.A.M.O.N.D.</strong><span>DingTalk-Integrated Agent for Messaging, Orchestration &amp; Networked Delegation</span></div>
       </div>
       <div class="topbar-actions">
+        <button data-dws-new-session class="dws-icon-btn" type="button" aria-label="开启会话" title="开启会话"></button>
+        <span class="bell-wrap"><button data-dws-bell class="dws-icon-btn" type="button" aria-label="通知" title="通知"></button></span>
         <a class="theme-link" href="/settings#appearanceTitle">设置 / SETTINGS</a>
         <div class="service-state"><span id="pulse" class="pulse"></span><span id="serviceText">正在连接本地代理…</span></div>
       </div>
@@ -88,6 +92,14 @@
             <div id="queue" class="queue-list"></div>
           </aside>
         </div>
+      </section>
+
+      <section id="board" class="channel-field" aria-labelledby="boardTitle">
+        <header class="section-heading">
+          <div><p>OPERATIONS BOARD / 04</p><h2 id="boardTitle">黑板 <span>Board</span></h2></div>
+          <span>裁决 · 在跑 · 任务，两套设计共用同一套功能</span>
+        </header>
+        <div data-dws-board></div>
       </section>
 
       <section id="channels" class="channel-field" aria-labelledby="channelsTitle">
@@ -286,6 +298,11 @@
     document.getElementById("contactFilter").addEventListener("change", () => renderRecent(true));
     document.getElementById("statusFilter").addEventListener("change", () => renderRecent(true));
     refresh(); setInterval(refresh, 3000); setInterval(() => snapshot && renderActive(snapshot.active), 1000);
+
+    // 黑板由 /board.js 提供：与 Metropolis 同一份实现，只有外观随本页 token 变化。
+    DwsBoard.start({board: document.querySelector("[data-dws-board]"),
+                    bell: document.querySelector("[data-dws-bell]"),
+                    newSession: document.querySelector("[data-dws-new-session]")});
   </script>
 </body>
 </html>
