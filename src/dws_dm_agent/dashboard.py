@@ -633,7 +633,21 @@ class DashboardServer:
                     )
                     return
                 if path == "/":
-                    self._send(dashboard.html.read_bytes(), "text/html; charset=utf-8")
+                    # 页面只经 loopback 提供，cookie 直接带操作者令牌，书签
+                    # 打开根路径即可读黑板；API 仍校验凭据，SameSite=Strict
+                    # 让跨站页面带不上它。
+                    self._send(
+                        dashboard.html.read_bytes(),
+                        "text/html; charset=utf-8",
+                        extra_headers=[
+                            (
+                                "Set-Cookie",
+                                "dws_panel_token="
+                                f"{dashboard.operator_token}; "
+                                "Path=/; HttpOnly; SameSite=Strict",
+                            )
+                        ],
+                    )
                     return
                 if path in {"/diamond-preview", "/diamond-preview.html"}:
                     if not dashboard.diamond_html.is_file():
@@ -750,6 +764,12 @@ class DashboardServer:
 
             def _operator_authorized(self) -> bool:
                 supplied = self.headers.get("X-Operator-Token", "")
+                if not supplied:
+                    for chunk in (self.headers.get("Cookie") or "").split(";"):
+                        name, _, value = chunk.strip().partition("=")
+                        if name == "dws_panel_token":
+                            supplied = value
+                            break
                 return secrets.compare_digest(
                     supplied.encode("utf-8"),
                     dashboard.operator_token.encode("utf-8"),
@@ -896,8 +916,11 @@ class DashboardServer:
                 status: int = 200,
                 cache_control: str = "no-store",
                 content_security_policy: str | None = None,
+                extra_headers: list[tuple[str, str]] | None = None,
             ) -> None:
                 self.send_response(status)
+                for name, value in extra_headers or ():
+                    self.send_header(name, value)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
                 self.send_header("Cache-Control", cache_control)

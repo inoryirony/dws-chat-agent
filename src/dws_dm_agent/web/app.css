@@ -637,3 +637,22 @@ textarea:focus-visible {
   .board-input { flex-basis: 160px; }
   .header-actions { flex-wrap: wrap; }
 }
+
+/* 黑板提示条：只有鉴权失败时才出现，出现即说明黑板区不可信。 */
+.board-alert {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-radius: var(--radius, 10px);
+  background: var(--danger-soft, rgba(220, 80, 80, 0.12));
+  color: var(--text);
+  font-size: 13px;
+}
+.board-alert a { color: inherit; text-underline-offset: 3px; }
+.board-alert[hidden] { display: none; }
+
+/* 在跑会话里的真实阶段条：与旧 ops 卡片同一套 .steps 外观。 */
+.run-rail { margin-top: 8px; }
+.run-rail .step-label { font-size: 10px; }
