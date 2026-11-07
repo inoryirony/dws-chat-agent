@@ -39,6 +39,12 @@ _MAX_RESOURCES = 12
 _MAX_FACTS = 8
 _REPORT_KINDS = {"progress", "final", "blocked"}
 
+# 提示词注入用的截断上限描述（单源：改上面三个常量即自动跟到模板）。
+TASK_MEMORY_LIMITS_TEXT = (
+    f"单次提交超过 {_MAX_FACTS} 条 facts / "
+    f"{_MAX_MESSAGE_IDS} 个证据 ID / {_MAX_RESOURCES} 个资源标签会被静默截断"
+)
+
 
 def _context_from_env() -> dict[str, Any]:
     # 优先读服务刷新过的上下文文件：steer 进补充消息后，可引用的证据

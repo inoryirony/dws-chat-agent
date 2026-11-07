@@ -100,12 +100,12 @@ def main() -> int:
                 },
                 "verify-dsh": {
                     "supplement_strategy": "restart_with_context",
-                    "supplement_prompt": str(args.repo / "prompts" / "supplement-dsh.md"),
+                    "supplement_prompt": str(args.repo / "prompts" / "supplement.md"),
                     "auto_messages": {"ack_enabled": False},
                     "worker": {
                         "label": "验证 Worker（dsh）",
                         "agent": "verify-worker-dsh",
-                        "prompt": str(args.repo / "prompts" / "worker-dsh.md"),
+                        "prompt": str(args.repo / "prompts" / "worker.md"),
                     },
                 },
             },

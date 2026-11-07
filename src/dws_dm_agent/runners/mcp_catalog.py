@@ -55,6 +55,39 @@ def tools_script_path() -> Path:
     return Path(__file__).with_name("dws_tools_mcp.py")
 
 
+def gate_script_path() -> Path:
+    return Path(__file__).with_name("mcp_tool_gate.py")
+
+
+def apply_tool_gate(server: dict[str, Any]) -> dict[str, Any]:
+    """directTools 白名单的协议无关形态：stdio 外包 mcp_tool_gate。
+
+    pi 原生消费 directTools；claude/codex/dsh 没有 per-server 工具白名单
+    （模型看得见全部工具），装配层调本函数把 server 包成
+    `python mcp_tool_gate.py --allow ... -- <原命令>`，白名单外工具从
+    tools/list 与 tools/call 双向消失。仅 stdio server 可包；http 形态
+    原样透出（当前 CATALOG 无 http+directTools 组合，出现即 fail-loud）。
+    """
+    tools = server.get("directTools")
+    if not isinstance(tools, list) or not tools:
+        return server
+    if "command" not in server:
+        raise ValueError(
+            "directTools requires a stdio server; http servers cannot be gated"
+        )
+    gated = {key: value for key, value in server.items() if key != "directTools"}
+    gated["command"] = sys.executable
+    gated["args"] = [
+        str(gate_script_path()),
+        "--allow",
+        ",".join(str(name) for name in tools),
+        "--",
+        str(server["command"]),
+        *[str(item) for item in server.get("args", [])],
+    ]
+    return gated
+
+
 def service_tools_server() -> dict[str, Any]:
     """非 pi 协议的服务工具挂载形态：本地 stdio server dws-tools。
 

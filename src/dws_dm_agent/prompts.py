@@ -19,6 +19,9 @@ STAGE_PROMPT_VARIABLES = frozenset(
         # 名字+描述+路径每行一条，空清单为空串。
         "skills",
         "deliveries_dir",
+        # 黑板截断上限与唤醒示例时刻：数字与日期不在模板里手写，
+        # 由 service 从 task_tools 常量与当前时间注入（单源）。
+        "task_memory_limits", "wake_example",
     }
 )
 SUPPLEMENT_PROMPT_VARIABLES = frozenset(
@@ -44,13 +47,10 @@ def render_prompt(template: str, variables: Mapping[str, Any]) -> str:
 
 
 # 变量值进入 prompt 后可能落在 <untrusted_*> 数据块内：联系人消息里若
-# 出现 "</untrusted_...>" 或 "<system_wake>" 字面量，会提前闭合数据块、
-# 把后面的内容伪装成指令。结构性标签统一替换为全角括号形式，字面量
-# 保留、语义失效。
-_STRUCTURAL_TAG = re.compile(
-    r"(</?\s*(?:untrusted_[a-z_]+|system_wake|override|conflict-rule)\s*>)",
-    re.IGNORECASE,
-)
+# 出现任何模板结构标签的字面量（如 "</board>"、"<system_wake>"），会
+# 提前闭合数据块、把后面的内容伪装成指令。失效化按"一切尖括号标签"
+# 处理而不是枚举已知标签名：新增结构标签不需要同步维护这张表。
+_STRUCTURAL_TAG = re.compile(r"(</?\s*[A-Za-z][A-Za-z0-9_-]*\s*>)")
 
 
 def _neutralize_structural_tags(value: str) -> str:

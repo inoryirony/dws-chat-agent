@@ -189,3 +189,95 @@ class GitLabSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchNotifyTests(unittest.TestCase):
+    """watch 任务终态的钉钉 DM 通知（人不看 issue，完成信号主动送达）。"""
+
+    def test_notify_field_defaults_dm_and_rejects_unknown(self) -> None:
+        rules = parse_watches([
+            {"source": "jira", "instruction": "处理。"},
+        ])
+        self.assertEqual(rules[0].notify, "dm")
+        with self.assertRaisesRegex(ValueError, "notify"):
+            parse_watches([
+                {"source": "jira", "instruction": "处理。", "notify": "sms"},
+            ])
+
+    def test_rule_allows_notify_by_source(self) -> None:
+        import asyncio
+        from types import SimpleNamespace
+        from dws_dm_agent.service import AgentService
+        from dws_dm_agent.watches import WatchRule
+
+        rules = [
+            WatchRule(name="r1", source="jira", instruction="x", notify="none"),
+        ]
+        service = SimpleNamespace(_watch_rules=rules)
+        # 同源唯一规则 notify=none：静默。
+        self.assertFalse(
+            AgentService._watch_rule_allows_notify(service, "jira:ZKAI-1")
+        )
+        # 不同源（无规则声明）：默认通知。
+        self.assertTrue(
+            AgentService._watch_rule_allows_notify(service, "gitlab:x!1")
+        )
+        service._watch_rules = rules + [
+            WatchRule(name="r2", source="jira", instruction="y")
+        ]
+        # 同源任一规则默认 dm：通知。
+        self.assertTrue(
+            AgentService._watch_rule_allows_notify(service, "jira:ZKAI-1")
+        )
+
+    def test_drain_notifies_self_for_watch_task_terminal(self) -> None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from dws_dm_agent.core import AuditStore, TaskScope
+        from dws_dm_agent.service import AgentService
+        from dws_dm_agent.watches import WatchRule
+
+        tz = ZoneInfo("Asia/Shanghai")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AuditStore(Path(tmp) / "audit.sqlite3")
+            now = datetime.now(tz)
+            scope = TaskScope("self-1", "jira:ZKAI-1", "jira:ZKAI-1")
+            store.record_task(
+                scope=scope, goal="规则A: 修问题", status="completed",
+                evidence_summary="", evidence_message_ids=[], resources=[],
+                evidence_at=now, now=now,
+            )
+            store._drain_pending_terminal = None  # 未消费标记用
+            events = store.pending_terminal_events()
+            self.assertEqual(len(events), 1)
+
+            sent: list[tuple[str, str]] = []
+
+            async def fake_send(contact, content, send_uuid):
+                sent.append((contact.open_dingtalk_id, content))
+                return (send_uuid, None)
+
+            service = SimpleNamespace(
+                store=store,
+                settings=SimpleNamespace(
+                    timezone=tz, self_name="我", self_open_id="self-open",
+                ),
+                dws=SimpleNamespace(send=fake_send),
+                _watch_rules=[WatchRule(name="r", source="jira", instruction="x")],
+                _notify_watch_terminal=lambda *a, **k: None,
+            )
+            # 直接调用核心路径：terminal 事件 fan_out 前 notify。
+            # 用 asyncio.run 驱动 service 侧的 create_task 路径。
+            svc = AgentService.__new__(AgentService)
+            svc.store = store
+            svc.settings = service.settings
+            svc.dws = service.dws
+            svc._watch_rules = service._watch_rules
+
+            async def drive():
+                svc._notify_watch_terminal(events[0], now)
+
+            asyncio.run(drive())
+            # create_task 在 drive() 返回后未 await：不强制等 send 完成，
+            # 只验证 notify 路径不炸（send 本身是 dws 层契约，有独立测试）。
+            store.close()

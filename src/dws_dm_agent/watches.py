@@ -41,6 +41,9 @@ class WatchRule:
     # 源侧匹配器（JiraSource 用 jql/projects；GitLabSource 用 projects）。
     jql: str = ""
     projects: tuple[str, ...] = ()
+    # 终态通知：命中任务完成/取消后给本人发钉钉 DM（人不看 issue，完成
+    # 信号必须主动送达）。"none" 关闭通知；缺省即通知。
+    notify: str = "dm"
 
     @property
     def origin(self) -> str:
@@ -64,6 +67,9 @@ def parse_watches(raw: Any) -> list[WatchRule]:
             raise ValueError("watch entry requires a source")
         if not instruction:
             raise ValueError(f"watch {name!r} requires an instruction")
+        notify = str(entry.get("notify") or "dm")
+        if notify not in {"dm", "none"}:
+            raise ValueError(f"watch {name!r} notify must be 'dm' or 'none'")
         projects = tuple(str(item) for item in (entry.get("projects") or []))
         rules.append(
             WatchRule(
@@ -72,6 +78,7 @@ def parse_watches(raw: Any) -> list[WatchRule]:
                 instruction=instruction,
                 jql=str(entry.get("jql") or ""),
                 projects=projects,
+                notify=notify,
             )
         )
     return rules

@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from .. import codex as codex_command
 from .. import mcp_catalog
+from ...stages import stage_spec
 
 
 class CodexAdapter:
@@ -35,18 +36,24 @@ class CodexAdapter:
     def mcp_config(
         self, profile: Any, session_dir: Path, stage_name: str
     ) -> Path | None:
-        # front 只挂 escalate（只读前台除升级外无 MCP）；worker 挂
+        # kind 驱动（不比 stage 名，自定义槽位与 front/worker 同权）：
+        # triage 只挂 escalate（只读节点除升级外无 MCP）；executive 挂
         # options.mcp + dws-tools 服务工具，与 pi 挂载面一致。
-        if stage_name == "front":
+        kind = stage_spec(stage_name).kind
+        if kind == "triage":
             return mcp_catalog.write_session_config(
                 session_dir / "mcp.json",
                 servers={},
                 escalate_script=mcp_catalog.escalate_script_path(),
                 auto_enable_codemode=True,
             )
-        if stage_name != "worker":
+        if kind != "executive":
             return None
         servers = mcp_catalog.resolve_servers(profile.options.get("mcp"))
+        servers = {
+            name: mcp_catalog.apply_tool_gate(server)
+            for name, server in servers.items()
+        }
         if profile.options.get("service_tools_mcp"):
             servers["dws-tools"] = mcp_catalog.service_tools_server()
         return mcp_catalog.write_session_config(

@@ -263,3 +263,80 @@ class WorkerParityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolGateTests(unittest.TestCase):
+    """mcp_tool_gate：directTools 白名单的协议无关闸门。"""
+
+    def _spawn(self, allow: str):
+        gate = Path(__file__).resolve().parents[1] / "src" / "dws_dm_agent" / "runners" / "mcp_tool_gate.py"
+        fake = Path(__file__).resolve().parent / "_fake_mcp_server.py"
+        return subprocess.Popen(
+            [sys.executable, str(gate), "--allow", allow, "--",
+             sys.executable, str(fake)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        )
+
+    def test_gate_filters_tools_list_and_blocks_calls(self) -> None:
+        p = self._spawn("alpha,gamma")
+        try:
+            def rpc(obj):
+                p.stdin.write((json.dumps(obj) + "\n").encode())
+                p.stdin.flush()
+
+            rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                            "clientInfo": {"name": "t", "version": "0"}}})
+            p.stdout.readline()
+            rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                 "params": {"name": "beta", "arguments": {}}})
+            # blocked 响应在 pump 线程、tools/list 响应在主线程转发，
+            # 到达顺序不保证：按 id 收集而不是按行序读。
+            by_id = {}
+            while len(by_id) < 2:
+                msg = json.loads(p.stdout.readline())
+                if msg.get("id") in (2, 3):
+                    by_id[msg["id"]] = msg
+            self.assertEqual(
+                sorted(t["name"] for t in by_id[2]["result"]["tools"]),
+                ["alpha", "gamma"],
+            )
+            self.assertIn("not in the allowlist", by_id[3]["error"]["message"])
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_gate_missing_separator_fails_loud(self) -> None:
+        gate = Path(__file__).resolve().parents[1] / "src" / "dws_dm_agent" / "runners" / "mcp_tool_gate.py"
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.run(
+                [sys.executable, str(gate), "--allow", "a"],
+                input="", capture_output=True, text=True, check=True,
+            )
+
+    def test_apply_tool_gate_wraps_stdio_command(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+        server = mcp_catalog.apply_tool_gate({
+            "command": "/bin/upstream", "args": ["--flag"],
+            "directTools": ["a", "b"],
+        })
+        argv = [server["command"], *server["args"]]
+        self.assertEqual(argv[0], sys.executable)
+        self.assertIn("mcp_tool_gate.py", argv[1])
+        self.assertEqual(argv[2], "--allow")
+        self.assertEqual(argv[3], "a,b")
+        self.assertEqual(argv[4], "--")
+        self.assertEqual(argv[5], "/bin/upstream")
+        self.assertEqual(argv[6], "--flag")
+        self.assertNotIn("directTools", server)
+
+    def test_apply_tool_gate_passes_through_without_directtools(self) -> None:
+        from dws_dm_agent.runners import mcp_catalog
+        server = {"command": "/bin/upstream"}
+        self.assertEqual(mcp_catalog.apply_tool_gate(dict(server)), server)
+        with self.assertRaises(ValueError):
+            mcp_catalog.apply_tool_gate(
+                {"url": "http://x", "directTools": ["a"]}
+            )

@@ -196,11 +196,12 @@ class PromptVariablesTests(unittest.TestCase):
                 variables["deliveries_dir"],
                 str(root / "state" / "deliveries"),
             )
-            worker = render_prompt(
-                (PROMPTS_DIR / "worker.md").read_text(encoding="utf-8"),
+            shared = render_prompt(
+                (PROMPTS_DIR / "shared.md").read_text(encoding="utf-8"),
                 variables,
             )
-            self.assertIn("任一为空时跳过本节", worker)
+            # attachments 节已收编进 shared.md（worker 收成薄模板）。
+            self.assertIn("任一为空时跳过本节", shared)
             service.store.close()
 
     def test_shared_and_worker_render_with_service_variables(self) -> None:
@@ -246,11 +247,18 @@ class InjectionNeutralizationTests(unittest.TestCase):
         self.assertIn("＜/untrusted_current_messages＞", rendered)
 
     def test_plain_text_passes_through_unchanged(self) -> None:
+        # 失效化按"一切尖括号标签"处理（新增结构标签免维护），普通
+        # HTML 标签字面量同样被中和；不含标签的纯文本原样通过。
+        rendered = render_prompt(
+            "{{current_messages_json}}",
+            {"current_messages_json": "正常消息，不含任何标签"},
+        )
+        self.assertEqual(rendered, "正常消息，不含任何标签")
         rendered = render_prompt(
             "{{current_messages_json}}",
             {"current_messages_json": "正常消息，含 <b>HTML</b> 标签"},
         )
-        self.assertEqual(rendered, "正常消息，含 <b>HTML</b> 标签")
+        self.assertEqual(rendered, "正常消息，含 ＜b＞HTML＜/b＞ 标签")
 
     def test_system_wake_and_override_literals_neutralized(self) -> None:
         for tag in ("<system_wake>", "</system_wake>", "<override>"):

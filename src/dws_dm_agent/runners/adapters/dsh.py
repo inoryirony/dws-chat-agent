@@ -92,6 +92,10 @@ class DshAdapter:
         # 这里只接 session_dir/skills 的既定约定）。模型层 provider 不在
         # 此层，仍走 options.dsh_patches 静态文件。
         servers = mcp_catalog.resolve_servers(profile.options.get("mcp"))
+        servers = {
+            name: mcp_catalog.apply_tool_gate(server)
+            for name, server in servers.items()
+        }
         if profile.options.get("service_tools_mcp"):
             servers["dws-tools"] = mcp_catalog.service_tools_server()
         skills_dir = session_dir / "skills"

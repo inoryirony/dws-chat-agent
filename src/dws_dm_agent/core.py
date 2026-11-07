@@ -2201,6 +2201,18 @@ class AuditStore:
         ).fetchall()
         return [self._task_row_to_dict(row) for row in rows]
 
+    def task_conversation(self, task_id: str) -> str:
+        """按事项 id 取其作用域 conversation（只读；事项不存在返回空串）。
+
+        watch 命中建的 task conversation 是 jira:/gitlab: 前缀，本查询
+        是服务侧判定"终态是否属于外部来源"的唯一依据。
+        """
+        row = self.connection.execute(
+            "SELECT scope_conversation FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        return str(row["scope_conversation"]) if row is not None else ""
+
     def answer_waiting_task(
         self,
         task_id: str,
