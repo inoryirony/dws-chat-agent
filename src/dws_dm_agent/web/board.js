@@ -85,7 +85,14 @@
   }
 
   const Board = {
-    token: () => localStorage.getItem("dwsPanelToken") || "",
+    token: () => {
+      // 凭据优先级：localStorage（URL ?token= 写入）→ cookie（页面路由
+      // 每次打开都刷新，重启换 token 也不会失联）。
+      const stored = localStorage.getItem("dwsPanelToken") || "";
+      if (stored) return stored;
+      const match = document.cookie.match(/(?:^|;\s*)dws_panel_token=([^;]+)/);
+      return match ? decodeURIComponent(match[1]) : "";
+    },
     state: null,
     contacts: {},
     toastTimer: 0,
