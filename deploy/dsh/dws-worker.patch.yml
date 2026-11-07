@@ -36,6 +36,6 @@
       config:
         serverName: engram
         transport: streamable-http
-        url: http://10.1.9.181:8701/mcp
+        url: !!js process.env.DWS_ENGRAM_URL || ''
         headers:
-          X-Engram-User: tianzema
+          X-Engram-User: !!js process.env.DWS_ENGRAM_USER || ''

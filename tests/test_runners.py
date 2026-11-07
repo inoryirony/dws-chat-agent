@@ -1852,13 +1852,18 @@ class PiReportToolTests(unittest.IsolatedAsyncioTestCase):
 class McpCatalogTests(unittest.TestCase):
     """profile options.mcp → session mcp.json → pi --mcp-config 的接线。"""
 
-    def test_catalog_entries_expand_without_overrides(self) -> None:
+    def test_catalog_entries_expand_env_placeholders(self) -> None:
         from dws_dm_agent.runners import mcp_catalog
 
-        servers = mcp_catalog.resolve_servers(["grafana-dev"])
+        servers = mcp_catalog.resolve_servers(
+            ["grafana-dev"], env={"DWS_MCP_GRAFANA_LAUNCHER": "/opt/g.sh"}
+        )
         self.assertEqual(set(servers), {"grafana-dev"})
+        self.assertEqual(servers["grafana-dev"]["command"], "/opt/g.sh")
         self.assertEqual(servers["grafana-dev"]["args"], ["dev"])
-        self.assertTrue(servers["grafana-dev"]["command"].endswith("grafana-mcp-env.sh"))
+        # env 缺失时占位原样透出，消费方 fail loud。
+        raw = mcp_catalog.resolve_servers(["grafana-dev"])
+        self.assertIn("${DWS_MCP_GRAFANA_LAUNCHER}", raw["grafana-dev"]["command"])
 
     def test_overrides_merge_onto_catalog_and_unknown_keys_are_dropped(self) -> None:
         from dws_dm_agent.runners import mcp_catalog
