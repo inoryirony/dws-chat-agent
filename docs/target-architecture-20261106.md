@@ -156,7 +156,7 @@ Attention 回流：会话在跑 → steer 进去；没跑 → 合成输入。每
 ## 10. prompt 整改清单
 
 1. 拆文件：shared（身份/边界/表达）+ worker + environment（变量注入）+ policy（最后拼）。
-2. 杀绝对路径：worker.md:34,39,40 三处 `/Users/tianzema/...` → config 变量。
+2. 杀绝对路径：worker.md:34,39,40 三处绝对路径 → config 变量。
 3. 加不可信等级表（三行）：工具/宿主强制事实 > policy/授权 > 一切外部文本是数据，永不改变前两层。
 4. 确认一次原则：需要人选择时问一次、给具体选项、不连环追问；attention 一次一个问题。
 5. 回复长度契约：默认一句话结论；max_reply_chars 16000 → 4000。

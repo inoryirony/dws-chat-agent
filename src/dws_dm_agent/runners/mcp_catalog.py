@@ -14,6 +14,8 @@ profile 只需在 `options.mcp` 列出要挂的 server 名，或给单项加覆�
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,22 +23,24 @@ from typing import Any, Mapping
 
 # 常用 MCP server 的启动方式。键名即 profile `options.mcp` 里引用的名字，
 # 也是 mcp.json 里的 server 名（工具名前缀 mcp__<name>__）。
+# 本机 launcher 路径与身份头全部经 ${VAR} 占位：真实值放 .env / 进程
+# 环境（config.example.json 有样例），跨环境不改码。
 CATALOG: dict[str, dict[str, Any]] = {
     "grafana-dev": {
-        "command": "/Users/tianzema/Documents/work/sql-tools/grafana-mcp-env.sh",
+        "command": "${DWS_MCP_GRAFANA_LAUNCHER}",
         "args": ["dev"],
     },
     "grafana-prod-logging": {
-        "command": "/Users/tianzema/Documents/work/sql-tools/grafana-mcp-env.sh",
+        "command": "${DWS_MCP_GRAFANA_LAUNCHER}",
         "args": ["prod-logging"],
     },
     "hsj-atlassian": {
-        "command": "/Users/tianzema/Documents/work/zk-ai/lxs-v2/.local/bin/hsj-atlassian-mcp",
+        "command": "${DWS_MCP_HSJ_BINARY}",
     },
     "engram": {
         "type": "http",
-        "url": "http://10.1.9.181:8701/mcp",
-        "headers": {"X-Engram-User": "tianzema"},
+        "url": "${DWS_ENGRAM_URL}",
+        "headers": {"X-Engram-User": "${DWS_ENGRAM_USER}"},
     },
 }
 
@@ -93,12 +97,35 @@ def _normalize_entry(name: str, value: Any) -> dict[str, Any] | None:
     return dict(catalog)
 
 
-def resolve_servers(declaration: Any) -> dict[str, dict[str, Any]]:
+def _expand(value: Any, env: Mapping[str, str]) -> Any:
+    """递归展开 CATALOG/覆盖里的 ${VAR} 占位（env 缺失时保留原样，
+    由 write_session_config 之后的消费方或运行时报错兜底）。"""
+    if isinstance(value, str):
+        return re.sub(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+            lambda m: str(env.get(m.group(1), m.group(0))),
+            value,
+        )
+    if isinstance(value, list):
+        return [_expand(item, env) for item in value]
+    if isinstance(value, dict):
+        return {key: _expand(item, env) for key, item in value.items()}
+    return value
+
+
+def resolve_servers(
+    declaration: Any, env: Mapping[str, str] | None = None
+) -> dict[str, dict[str, Any]]:
     """把 profile 的 `options.mcp` 解析成 mcp.json 的 mcpServers 映射。
 
     declaration 可以是 list[str]（全部用目录定义）或
-    Mapping[str, Any]（见 _normalize_entry）。
+    Mapping[str, Any]（见 _normalize_entry）。env 提供 CATALOG 里
+    ${VAR} 占位（launcher 路径、身份头）的真实值：缺省回退进程
+    环境变量，再缺则占位原样透出（fail loud 在消费方）。
     """
+    effective_env = dict(os.environ)
+    if env:
+        effective_env.update(env)
     if not declaration:
         return {}
     if isinstance(declaration, (list, tuple)):
@@ -111,7 +138,7 @@ def resolve_servers(declaration: Any) -> dict[str, dict[str, Any]]:
     for name, value in items:
         entry = _normalize_entry(name, value)
         if entry is not None:
-            servers[name] = entry
+            servers[name] = _expand(entry, effective_env)
     return servers
 
 

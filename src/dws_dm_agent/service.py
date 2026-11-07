@@ -3118,6 +3118,11 @@ def _acquire_single_instance(state_dir: Path):
 async def _run_service(
     settings: Settings, mode: str | None, *, open_dashboard: bool = False
 ) -> int:
+    # .env 值进进程环境（setdefault：显式 shell 环境优先）。MCP 目录的
+    # ${VAR} 占位（launcher 路径、身份头）与 dsh patch 层的 process.env
+    # 都从这一份取，单一来源。
+    for key, value in _read_env_file(settings.env_path).items():
+        os.environ.setdefault(key, value)
     lock_handle = _acquire_single_instance(settings.state_dir)
     service = AgentService(settings, mode, open_dashboard=open_dashboard)
     loop = asyncio.get_running_loop()
