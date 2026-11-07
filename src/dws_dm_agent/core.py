@@ -2213,6 +2213,18 @@ class AuditStore:
         ).fetchone()
         return str(row["scope_conversation"]) if row is not None else ""
 
+    def task_waiting_on(self, task_id: str) -> str:
+        """按事项 id 取其当前 waiting_on（只读；不存在返回空串）。
+
+        「完成后通知：<姓名>」协议的载体：worker 收尾时经 task_record 写
+        入，服务侧终态通知按它解析收件人。
+        """
+        row = self.connection.execute(
+            "SELECT waiting_on FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        return str(row["waiting_on"]) if row is not None else ""
+
     def answer_waiting_task(
         self,
         task_id: str,

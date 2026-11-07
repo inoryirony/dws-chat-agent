@@ -50,7 +50,7 @@ class JiraSource:
         payload = await asyncio.to_thread(
             request_json,
             url,
-            params={"jql": self.jql, "maxResults": 50, "fields": "summary,description,created"},
+            params={"jql": self.jql, "maxResults": 50, "fields": "summary,description,created,reporter,assignee"},
             headers=self._auth_header(),
         )
         items: list[SourceItem] = []
@@ -61,6 +61,13 @@ class JiraSource:
             if self.projects and key.split("-")[0] not in self.projects:
                 continue
             fields = issue.get("fields") or {}
+            reporter = str(((fields.get("reporter") or {}).get("displayName")) or "")
+            assignee = str(((fields.get("assignee") or {}).get("displayName")) or "")
+            owners_line = ""
+            if reporter or assignee:
+                owners_line = (
+                    f"报告人：{reporter or '未知'}；指派人：{assignee or '无'}"
+                )
             created_raw = str(fields.get("created") or "")
             try:
                 created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
@@ -74,10 +81,18 @@ class JiraSource:
                     conversation_id=f"jira:{key}",
                     contact=_virtual_contact(f"jira:{key}", key),
                     title=str(fields.get("summary") or key),
-                    body=str(fields.get("description") or ""),
+                    body=(
+                        (owners_line + "\n" if owners_line else "")
+                        + str(fields.get("description") or "")
+                    ),
                     url=f"{os.environ.get('JIRA_URL', '').rstrip('/')}/browse/{key}",
                     created_at=created,
-                    meta={"source": "jira", "key": key},
+                    meta={
+                        "source": "jira",
+                        "key": key,
+                        "reporter": reporter,
+                        "assignee": assignee,
+                    },
                 )
             )
         return items
@@ -127,6 +142,8 @@ class GitLabSource:
                     updated = None
                 if updated is not None and updated < _aware(since):
                     continue
+                author = str(((mr.get("author") or {}).get("name")) or "")
+                owners_line = f"MR 作者：{author}" if author else ""
                 dedup = f"gitlab:{project}!{number}"
                 items.append(
                     SourceItem(
@@ -134,10 +151,18 @@ class GitLabSource:
                         conversation_id=dedup,
                         contact=_virtual_contact(dedup, f"{project}!{number}"),
                         title=str(mr.get("title") or number),
-                        body=str(mr.get("description") or ""),
+                        body=(
+                            (owners_line + "\n" if owners_line else "")
+                            + str(mr.get("description") or "")
+                        ),
                         url=str(mr.get("web_url") or ""),
                         created_at=updated,
-                        meta={"source": "gitlab", "project": project, "iid": number},
+                        meta={
+                            "source": "gitlab",
+                            "project": project,
+                            "iid": number,
+                            "author": author,
+                        },
                     )
                 )
         return items
