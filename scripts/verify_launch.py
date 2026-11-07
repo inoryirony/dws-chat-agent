@@ -61,7 +61,7 @@ def main() -> int:
                 "driver": "pi",
                 "protocol": "pi-rpc",
                 "command": ["pi"],
-                "model": os.environ.get("DWS_VERIFY_MODEL", "ccr-internal/glm-5.2"),
+                "model": os.environ.get("DWS_VERIFY_MODEL", "ccr-internal/deepseek-flash"),
                 "reasoning_effort": "high",
                 "read_only": False,
                 "timeout_seconds": 600,
