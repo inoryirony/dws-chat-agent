@@ -74,12 +74,17 @@ def _service(
         remove_emoji=AsyncMock(),
     )
     service.agent_runtime = SimpleNamespace(
+        pipeline=("gate", "front", "worker", "deliver"),
+        skill_pool={},
         has_stage=lambda name: False,
+        stage_of_kind=lambda kind: None if kind == "triage" else "worker",
+        executive_stage=Mock(return_value="worker"),
         supplement_strategy="steer",
         render_auto_message=Mock(return_value="收到，我在处理中。"),
         _stage=Mock(
             return_value=SimpleNamespace(
-                profile=SimpleNamespace(fallbacks=())
+                name="worker",
+                profile=SimpleNamespace(fallbacks=(), options={}),
             )
         ),
     )
@@ -490,19 +495,26 @@ class SyntheticRunPromptTests(unittest.TestCase):
             render_variables: list[dict] = []
             session = _DoneFakeSession()
             service.agent_runtime = SimpleNamespace(
+                pipeline=("gate", "front", "worker", "deliver"),
+                skill_pool={},
                 profile_name=Mock(return_value="pi-worker"),
                 render=Mock(
                     side_effect=lambda stage, variables: (
                         render_variables.append(variables) or "PROMPT-BASE"
                     )
                 ),
+                stage_of_kind=lambda kind: "front" if kind == "triage" else "worker",
+                executive_stage=Mock(return_value="worker"),
                 _stage=Mock(
                     return_value=SimpleNamespace(
-                        prompt_path=root / "prompts" / "worker.md"
+                        name="worker",
+                        prompt_path=root / "prompts" / "worker.md",
+                        profile=SimpleNamespace(protocol="pi-rpc", options={}),
                     )
                 ),
                 resolve_stage=Mock(
                     return_value=SimpleNamespace(
+                        name="worker",
                         profile=SimpleNamespace(protocol="pi-rpc", options={})
                     )
                 ),
@@ -1267,8 +1279,12 @@ class ActiveTasksFactsTests(unittest.TestCase):
                 now=NOW,
                 facts=[{"text": "网关白名单已扩容", "source": "agent"}],
             )
+            stage = SimpleNamespace(name="worker", profile=SimpleNamespace(options={}))
             service.agent_runtime = SimpleNamespace(
+                pipeline=("gate", "front", "worker", "deliver"),
+                skill_pool={},
                 profile_name=Mock(return_value="pi-worker"),
+                _stage=Mock(return_value=stage),
             )
             batch = [_event("message-2", "502 好了吗")]
 

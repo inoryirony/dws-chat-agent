@@ -77,7 +77,18 @@
       "timeout_seconds": 10800,
       "options": {
         "sandbox": "danger-full-access",
-        "web_search": "disabled"
+        "web_search": "disabled",
+        "mcp": {
+          "grafana-dev": true,
+          "grafana-prod-logging": true,
+          "hsj-atlassian": true,
+          "engram": true
+        },
+        "service_tools_mcp": true,
+        "skills": [
+          "humanizer-zh",
+          "answer_me_with_html"
+        ]
       }
     },
     "claude-worker": {
@@ -89,7 +100,20 @@
       "model": "sonnet",
       "reasoning_effort": "",
       "read_only": false,
-      "timeout_seconds": 10800
+      "timeout_seconds": 10800,
+      "options": {
+        "mcp": {
+          "grafana-dev": true,
+          "grafana-prod-logging": true,
+          "hsj-atlassian": true,
+          "engram": true
+        },
+        "service_tools_mcp": true,
+        "skills": [
+          "humanizer-zh",
+          "answer_me_with_html"
+        ]
+      }
     },
     "pi-worker": {
       "driver": "pi",
@@ -134,7 +158,11 @@
               "confluence_get_page"
             ]
           }
-        }
+        },
+        "skills": [
+          "humanizer-zh",
+          "answer_me_with_html"
+        ]
       }
     },
     "dsh-worker": {
@@ -150,7 +178,19 @@
       "worktree_repo": "",
       "options": {
         "dsh_profile": "headless",
-        "dsh_patches": []
+        "dsh_patches": [],
+        "service_tools_mcp": true,
+        "task_cli": true,
+        "mcp": {
+          "grafana-dev": true,
+          "grafana-prod-logging": true,
+          "hsj-atlassian": true,
+          "engram": true
+        },
+        "skills": [
+          "humanizer-zh",
+          "answer_me_with_html"
+        ]
       },
       "environment": {},
       "extra_args": [],
@@ -188,5 +228,26 @@
   },
   "security": {
     "max_message_chars": 12000
-  }
+  },
+  "watches": [
+    {
+      "source": "jira",
+      "name": "ZKAI 新 issue 指派给我",
+      "jql": "assignee = currentUser() AND created >= -1d ORDER BY created DESC",
+      "projects": [
+        "ZKAI"
+      ],
+      "instruction": "分析这个 issue：总结要点、判断优先级与影响面，把结论作为评论回写。不修改 issue 状态。"
+    },
+    {
+      "source": "gitlab",
+      "name": "zk-ai 核心仓库新 MR",
+      "projects": [
+        "xk/product/zk-ai/change-monitor",
+        "xk/product/zk-ai/zkai-gateway"
+      ],
+      "instruction": "审查这个 MR：列出变更要点与风险，把结论作为评论回写。不合并不修改。"
+    }
+  ],
+  "watch_interval_seconds": 300
 }

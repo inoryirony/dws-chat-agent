@@ -15,6 +15,9 @@ STAGE_PROMPT_VARIABLES = frozenset(
         "current_messages_json", "active_tasks_json", "now",
         # 技能与交付路径由 config 注入，提示词文件里不再硬编码绝对路径。
         "skill_humanizer", "skill_answer_html", "script_am",
+        # 节点装配的 skill 清单（options.skills → 原生挂载），
+        # 名字+描述+路径每行一条，空清单为空串。
+        "skills",
         "deliveries_dir",
     }
 )

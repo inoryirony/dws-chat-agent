@@ -15,7 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from . import mcp_catalog
+from .. import stages as stage_registry
 from ..core import MAX_IMAGES, MAX_IMAGE_BYTES, sanitize_text
+from ..skills_catalog import resolve_skills
 from ..prompts import (
     STAGE_PROMPT_VARIABLES,
     SUPPLEMENT_PROMPT_VARIABLES,
@@ -705,6 +708,8 @@ class AgentRuntime:
         supplement_prompt_path: Path,
         auto_messages: Mapping[str, Any],
         worktree_root: Path | None = None,
+        skill_pool: Mapping[str, Any] | None = None,
+        pipeline: Sequence[str] = (),
     ) -> None:
         self.name = name
         self._stages = dict(stages)
@@ -712,6 +717,13 @@ class AgentRuntime:
         self._config_dir = config_dir
         self._workspace_root = workspace_root
         self._worktree_root = worktree_root or workspace_root / "worktrees"
+        self._skill_pool = dict(skill_pool) if skill_pool else {}
+        self.skill_pool: Mapping[str, Any] = self._skill_pool
+        # 编排空间：有序 step 列表（gate/deliver 内置名 + stage 槽位名），
+        # service 主循环按序遍历。缺省推导保持"front→worker"现行为。
+        self.pipeline: tuple[str, ...] = tuple(pipeline) or (
+            "gate", "worker", "deliver"
+        )
         self.supplement_strategy = supplement_strategy
         self._supplement_prompt_path = supplement_prompt_path
         self._auto_messages = dict(auto_messages)
@@ -806,6 +818,8 @@ class AgentRuntime:
         if int(auto_messages.get("max_progress_updates", 60)) < 0:
             raise ValueError("max progress updates must not be negative")
         config_dir = config_path.resolve().parent
+        skill_pool = raw.get("skills")
+        skill_pool = dict(skill_pool) if isinstance(skill_pool, Mapping) else {}
         worktree_value = raw.get("worktree_root")
         worktree_root = (
             _resolve_path(config_dir, worktree_value) if worktree_value else None
@@ -817,13 +831,15 @@ class AgentRuntime:
             raise ValueError(
                 f"workflow supplement prompt does not exist: {supplement_prompt_path}"
             )
-        # pipeline 编排空间：worker 必填，其余 stage 名自由——preset 里写
-        # 什么键就有什么 step（front 只是缺省分诊槽位的惯例名）。service
-        # 侧经 has_stage(<name>) 探测，无配置即无该 step。
+        # pipeline 编排空间：至少一个 executive kind 的 stage（惯例名
+        # worker），其余 stage 名自由——preset 里写什么键就有什么 step。
+        # service 侧经 stage_of_kind(<kind>) 探测，无配置即无该 step。
         stages: dict[str, WorkflowStage] = {}
         stage_names = [name for name in preset if isinstance(preset.get(name), Mapping)]
-        if "worker" not in stage_names:
-            raise ValueError(f"workflow {active} requires stage: worker")
+        if not any(
+            stage_registry.stage_spec(str(name)).executive for name in stage_names
+        ):
+            raise ValueError(f"workflow {active} requires an executive stage")
         for stage_name in stage_names:
             value = preset.get(stage_name)
             if stage_name in {"supplement_prompt", "supplement_strategy", "auto_messages"}:
@@ -841,10 +857,17 @@ class AgentRuntime:
                 profile=profile,
                 prompt_path=prompt_path,
             )
-        if "front" in stages and not stages["front"].profile.read_only:
-            raise ValueError("workflow front agent must set read_only=true")
-        if stages["worker"].profile.read_only:
-            raise ValueError("workflow worker agent must set read_only=false")
+        for name, stage in stages.items():
+            spec = stage_registry.stage_spec(name)
+            if spec.kind == "triage" and not stage.profile.read_only:
+                raise ValueError(
+                    f"workflow triage stage {name} must set read_only=true"
+                )
+            if spec.executive and stage.profile.read_only:
+                raise ValueError(
+                    f"workflow executive stage {name} must set read_only=false"
+                )
+        pipeline = _resolve_pipeline(preset, stages)
         for profile in profiles.values():
             unknown = [
                 fallback
@@ -881,23 +904,28 @@ class AgentRuntime:
             ]:
                 # task_cli 运行时（如 dsh）由 prompt 指教模型经 bash 拉起
                 # task_tools.py，task_record/task_lookup 与 pi 同通路可用；
-                # report/no_reply 的收口仍只有 pi 通路，不在此放行。
+                # service_tools_mcp 挂载 dws-tools stdio server，四个服务
+                # 工具全部与 pi 同名同后端（report/no_reply 经 DWS_REPORT_FILE
+                # 与工具事件收口）。
                 cli_capable = bool(agent.options.get("task_cli"))
+                tools_mounted = bool(agent.options.get("service_tools_mcp"))
                 unsupported = {
                     name
                     for name in referenced
                     if agent.protocol != _SERVICE_TOOL_PROTOCOL
+                    and not tools_mounted
                     and not (cli_capable and name in {"task_record", "task_lookup"})
                 }
-                if unsupported:
-                    raise ValueError(
-                        f"workflow {active} stage {stage.name} prompts reference "
-                        f"service tools ({', '.join(sorted(unsupported))}) but "
-                        f"agent {agent.name} (protocol {agent.protocol}) cannot "
-                        "mount them; use a pi agent for stages whose prompts "
-                        "use these tools, enable options.task_cli for the "
-                        "task_record/task_lookup subset, or remove the "
-                        "service-tool instructions from the prompts"
+            if unsupported:
+                raise ValueError(
+                    f"workflow {active} stage {stage.name} prompts reference "
+                    f"service tools ({', '.join(sorted(unsupported))}) but "
+                    f"agent {agent.name} (protocol {agent.protocol}) cannot "
+                    "mount them; use a pi agent for stages whose prompts "
+                    "use these tools, enable options.service_tools_mcp "
+                    "(dws-tools MCP server) or options.task_cli for the "
+                    "task_record/task_lookup subset, or remove the "
+                    "service-tool instructions from the prompts"
                     )
         return cls(
             active,
@@ -909,11 +937,30 @@ class AgentRuntime:
             supplement_prompt_path,
             auto_messages,
             worktree_root=worktree_root,
+            skill_pool=skill_pool,
+            pipeline=pipeline,
         )
 
     def render(self, stage_name: str, variables: Mapping[str, Any]) -> str:
         template = self._stage(stage_name).prompt_path.read_text(encoding="utf-8")
         return _render_text(template, variables)
+
+    def stage_of_kind(self, kind: str) -> str | None:
+        """第一个属于该 kind 的 stage 槽位名（preset 键序），无则 None。
+
+        kind 语义见 stages.py：triage（惯例名 front）/ executive（惯例名
+        worker）。service 派发只认 kind，不认具体槽位名。
+        """
+        for name in self._stages:
+            if stage_registry.stage_spec(name).kind == kind:
+                return name
+        return None
+
+    def executive_stage(self) -> str:
+        stage = self.stage_of_kind("executive")
+        if stage is None:
+            raise ValueError(f"workflow {self.name} has no executive stage")
+        return stage
 
     def render_supplement(self, variables: Mapping[str, Any]) -> str:
         return _render_text(
@@ -943,6 +990,7 @@ class AgentRuntime:
         task_context: Mapping[str, Any] | None = None,
     ) -> PreparedAgent:
         stage = self.resolve_stage(stage_name, agent_override)
+        spec = stage_registry.stage_spec(stage_name)
         session_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = session_dir / "prompt.md"
         result_path = session_dir / "result.txt"
@@ -964,20 +1012,31 @@ class AgentRuntime:
                 protocol,
                 len(local_images),
             )
+        skills = resolve_skills(self._skill_pool, stage.profile.options.get("skills"))
+        # skill 通道是运行时装配（session 目录 + argv flag），协议 adapter
+        # 不感知：pi 原生 --skill 指向池内目录；其余协议先落盘再由各自
+        # 原生机制发现（dsh patch customSkillDirs / codex CODEX_HOME /
+        # claude --plugin-dir），argv 片段在这里拼。落盘必须先于
+        # mcp_config：dsh 的 session patch 要引用 skills 目录。
+        skill_args = _protocol_skill_args(protocol, skills, session_dir)
+        _prepare_protocol_skills(protocol, skills, session_dir)
         mcp_config_path = _prepare_mcp_config(
             stage.profile, protocol, session_dir, stage_name
         )
-        argv = _command(
-            stage.profile,
-            mcp_config_path,
-            model_override,
-            mount_escalate=stage_name == "front",
-        )
+        argv = [
+            *_command(
+                stage.profile,
+                mcp_config_path,
+                model_override,
+                mount_escalate=spec.mount_escalate,
+            ),
+            *skill_args,
+        ]
+        # codex 全 stage 走 per-session CODEX_HOME：front 隔离运行环境，
+        # worker 顺带获得 skills/ symlink 挂载位，不再依赖全局 ~/.codex。
         environment = self._environment(
             stage.profile,
-            session_dir / "codex-home"
-            if stage_name == "front" and protocol == "codex-app-server"
-            else None,
+            session_dir / "codex-home" if protocol == "codex-app-server" else None,
         )
         if mcp_config_path is not None:
             # pi 走 adapter：exclusive 让 --mcp-config 成为唯一来源，不串全局 server。
@@ -990,11 +1049,14 @@ class AgentRuntime:
         task_context_path: Path | None = None
         report_path: Path | None = None
         if (
-            protocol == "pi-rpc" or stage.profile.options.get("task_cli")
+            protocol == "pi-rpc"
+            or stage.profile.options.get("task_cli")
+            or stage.profile.options.get("service_tools_mcp")
         ) and task_context is not None:
             # 事项工具的作用域与运行信息只经环境变量注入执行面（pi 走
             # pi_dws_tools.ts 扩展；task_cli 运行时由 prompt 指教模型用 bash
-            # 拉起 task_tools.py），不进入 prompt，模型无法伪造其他作用域。
+            # 拉起 task_tools.py；service_tools_mcp 走 dws-tools stdio server），
+            # 不进入 prompt，模型无法伪造其他作用域。
             # DWS_TASK_CONTEXT 是会话启动时的初始快照；DWS_TASK_CONTEXT_FILE
             # 指向的文件由服务在 steer 后原子重写，task_tools.py 每次调用
             # 优先读它，证据消息集合随本运行覆盖的消息扩展。
@@ -1014,10 +1076,18 @@ class AgentRuntime:
             # 之后的最后一条 assistant 消息带 toolCall，不能当终稿）。
             report_path = session_dir / "report.json"
             environment["DWS_REPORT_FILE"] = str(report_path)
+            if stage.profile.options.get("service_tools_mcp"):
+                # dsh 的 dws-tools 经 patch yml 拉起 stdio server，
+                # 路径/解释器只能经 env 传（!!js 表达式读取）；
+                # claude/codex 走 session mcp.json，不消费这两个键。
+                environment["DWS_TOOLS_PYTHON"] = sys.executable
+                environment["DWS_TOOLS_SCRIPT"] = str(
+                    mcp_catalog.tools_script_path()
+                )
         cwd = self._workspace_root
         worktree_source: Path | None = None
         worktree_path: Path | None = None
-        if stage_name == "worker" and stage.profile.worktree_repo:
+        if spec.use_worktree and stage.profile.worktree_repo:
             worktree_source, worktree_path = self._add_worktree(
                 stage.profile.worktree_repo, session_id
             )
@@ -1222,6 +1292,69 @@ def _resolve_path(base: Path, value: Any) -> Path:
     return path.resolve() if path.is_absolute() else (base / path).resolve()
 
 
+def _protocol_skill_args(
+    protocol: str,
+    skills: Sequence[tuple[str, Path]],
+    session_dir: Path,
+) -> list[str]:
+    """skill 的 argv 片段：pi 直接 --skill 池内目录；claude 用
+    --plugin-dir 指 session 落盘目录；其余协议靠原生发现位，无 flag。"""
+    if not skills:
+        return []
+    if protocol == "pi-rpc":
+        # -ns 关掉全局/项目发现，显式 --skill 仍加载（pi cli 契约）：
+        # 节点只暴露声明的 skills，与 claude/codex 的 session 装配对等。
+        args: list[str] = ["-ns"]
+        for _name, path in skills:
+            skill_dir = path.parent if path.name == "SKILL.md" else path
+            args.extend(["--skill", str(skill_dir)])
+        return args
+    if protocol == "claude-stream-json":
+        return ["--plugin-dir", str(session_dir / "claude-plugin")]
+    return []
+
+
+def _prepare_protocol_skills(
+    protocol: str,
+    skills: Sequence[tuple[str, Path]],
+    session_dir: Path,
+) -> None:
+    """把 skill 目录落进各协议的原生发现位。
+
+    - dsh：session/skills/<name> symlink，由动态 patch 的 customSkillDirs
+      指向（dsh-skill-filesystem 运行时发现，watch 增删实时生效）。
+    - codex：codex-home/skills/<name> symlink，CODEX_HOME 原生发现。
+    - claude：claude-plugin/ 插件目录（skills/ 子目录 + plugin 清单），
+      argv 侧 --plugin-dir 挂载；claude 无 per-invocation skill flag，
+      plugin-dir 是唯一按次通道。
+    - pi：不需要落盘，argv 直接 --skill <dir> 指向池内原目录。
+    """
+    if not skills:
+        return
+    if protocol == "dsh-headless-jsonl":
+        root = session_dir / "skills"
+    elif protocol == "codex-app-server":
+        root = session_dir / "codex-home" / "skills"
+    elif protocol == "claude-stream-json":
+        root = session_dir / "claude-plugin" / "skills"
+        manifest = session_dir / "claude-plugin" / ".claude-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        if not manifest.exists():
+            manifest.write_text(
+                json.dumps({"name": "dws-session-skills", "version": "0.1.0"}),
+                encoding="utf-8",
+            )
+    else:
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    for name, path in skills:
+        target = root / name
+        source = path.parent if path.name == "SKILL.md" else path
+        if target.exists() or target.is_symlink():
+            continue
+        target.symlink_to(source.resolve())
+
+
 def _command(
     profile: AgentProfile,
     mcp_config_path: Path | None,
@@ -1232,6 +1365,54 @@ def _command(
     return _adapter_for(profile.protocol).command(
         profile, mcp_config_path, model_override, mount_escalate=mount_escalate
     )
+
+
+
+_BUILTIN_STEPS = ("gate", "deliver")
+
+
+def _resolve_pipeline(
+    preset: Mapping[str, Any], stages: Mapping[str, WorkflowStage]
+) -> tuple[str, ...]:
+    """preset 的 pipeline 字段 → 有序 step 列表（无环无并行，线性序贯）。
+
+    项 = 内置 step（gate 规则闸 / deliver 收口投递）或 preset 里的 stage
+    槽位名（按 kind 路由到 triage/executive 处理器）。缺省推导 = 现行为
+    gate → triage 槽位（如有）→ executive → deliver，老 preset 零改动。
+    deliver 不允许缺席（删了它结果无处去），声明里漏掉时自动补尾。
+    """
+    declared = preset.get("pipeline")
+    # 空列表视同未声明（面板快照的 round-trip 会带空数组），走缺省推导。
+    if declared is None or (
+        isinstance(declared, (list, tuple)) and len(declared) == 0
+    ):
+        steps = ["gate"]
+        for name in stages:
+            if stage_registry.stage_spec(name).kind == "triage":
+                steps.append(name)
+        for name in stages:
+            if stage_registry.stage_spec(name).executive:
+                steps.append(name)
+        steps.append("deliver")
+        return tuple(steps)
+    if not isinstance(declared, (list, tuple)) or not declared:
+        raise ValueError("workflow pipeline must be a non-empty list of step names")
+    if not all(isinstance(item, str) and item for item in declared):
+        raise ValueError("workflow pipeline steps must be non-empty strings")
+    steps = [str(item) for item in declared]
+    if len(set(steps)) != len(steps):
+        raise ValueError(f"workflow pipeline has duplicate steps: {steps}")
+    for item in steps:
+        if item not in _BUILTIN_STEPS and item not in stages:
+            raise ValueError(f"workflow pipeline references unknown step: {item!r}")
+    if "deliver" not in steps:
+        steps.append("deliver")
+    if not any(
+        item not in _BUILTIN_STEPS and stage_registry.stage_spec(item).executive
+        for item in steps
+    ):
+        raise ValueError("workflow pipeline requires an executive stage")
+    return tuple(steps)
 
 
 def _prepare_mcp_config(

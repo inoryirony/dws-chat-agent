@@ -25,8 +25,9 @@ class CodexAdapter:
         mount_escalate: bool = False,
     ) -> list[str]:
         # codex 的模型经 thread_options 走（含 model_override），
-        # command 层不感知；mcp 走 -c mcp_servers.* 注入。
-        return codex_command.command(profile, mount_escalate)
+        # command 层不感知；mcp 走 -c mcp_servers.* 注入
+        # （front 的 escalate 与 worker 的 options.mcp+dws-tools 同路）。
+        return codex_command.command(profile, mount_escalate, mcp_config_path)
 
     def thread_options(self, profile: Any, workspace_root: Path) -> dict[str, Any]:
         return codex_command.thread_options(profile, workspace_root)
@@ -34,14 +35,22 @@ class CodexAdapter:
     def mcp_config(
         self, profile: Any, session_dir: Path, stage_name: str
     ) -> Path | None:
-        if stage_name != "front":
+        # front 只挂 escalate（只读前台除升级外无 MCP）；worker 挂
+        # options.mcp + dws-tools 服务工具，与 pi 挂载面一致。
+        if stage_name == "front":
+            return mcp_catalog.write_session_config(
+                session_dir / "mcp.json",
+                servers={},
+                escalate_script=mcp_catalog.escalate_script_path(),
+                auto_enable_codemode=True,
+            )
+        if stage_name != "worker":
             return None
-        script = Path(__file__).parents[2] / "escalate_mcp.py"
+        servers = mcp_catalog.resolve_servers(profile.options.get("mcp"))
+        if profile.options.get("service_tools_mcp"):
+            servers["dws-tools"] = mcp_catalog.service_tools_server()
         return mcp_catalog.write_session_config(
-            session_dir / "mcp.json",
-            servers={},
-            escalate_script=script,
-            auto_enable_codemode=True,
+            session_dir / "mcp.json", servers=servers
         )
 
     async def start(self, session: Any) -> None:
@@ -121,13 +130,13 @@ class CodexAdapter:
                 if item.get("type") == "agentMessage":
                     state = session._protocol_state
                     state["item_phases"][item_id] = str(item.get("phase") or "")
-                elif session._is_escalate_tool(
-                    item.get("tool") or item.get("toolName") or item.get("name")
-                ):
-                    session._capture_escalation()
                 name = str(
                     item.get("tool") or item.get("toolName") or item.get("name") or ""
                 )
+                if session._is_escalate_tool(name):
+                    session._capture_escalation()
+                if session._is_no_reply_tool(name):
+                    session._capture_silent()
                 if name:
                     session._record_tool_start(
                         {"toolName": name, "args": item.get("arguments")}
@@ -145,6 +154,9 @@ class CodexAdapter:
         elif method == "item/completed":
             item = params.get("item")
             if isinstance(item, Mapping):
+                name = str(
+                    item.get("tool") or item.get("toolName") or item.get("name") or ""
+                )
                 if item.get("type") == "agentMessage":
                     phase = str(item.get("phase") or "")
                     text = str(item.get("text") or "")
@@ -158,10 +170,13 @@ class CodexAdapter:
                             if isinstance(part, Mapping)
                         ).strip()
                     )
-                elif session._is_escalate_tool(
-                    item.get("tool") or item.get("toolName") or item.get("name")
-                ):
+                elif session._is_escalate_tool(name):
                     session._capture_escalation()
+                # dws-tools 的 report(final/blocked) 在 server 侧写
+                # DWS_REPORT_FILE：工具项收尾时读文件按终稿收口
+                #（与 pi 的 tool_execution_end 同通路）。
+                elif session._is_report_tool(name):
+                    session._capture_report()
         elif method == "turn/completed":
             turn = params.get("turn")
             if isinstance(turn, Mapping) and (

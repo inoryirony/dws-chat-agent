@@ -1808,6 +1808,9 @@ class WorkerFallbackTests(unittest.TestCase):
     def _service_with_chain(self, fallbacks: tuple[str, ...]) -> AgentService:
         service = object.__new__(AgentService)
         service.agent_runtime = SimpleNamespace(
+            pipeline=("gate", "front", "worker", "deliver"),
+            skill_pool={},
+            executive_stage=Mock(return_value="worker"),
             _stage=Mock(
                 return_value=SimpleNamespace(
                     profile=SimpleNamespace(fallbacks=fallbacks)
@@ -3191,7 +3194,11 @@ class SilentOutcomeTests(unittest.TestCase):
         service.gate = SecurityGate(12000)
         service.dws = SimpleNamespace(history=AsyncMock(return_value=[]))
         service.agent_runtime = SimpleNamespace(
+            pipeline=("gate", "front", "worker", "deliver"),
+            skill_pool={},
             has_stage=lambda name: has_front if name == "front" else True,
+            stage_of_kind=lambda kind: "front" if (kind == "triage" and has_front) else ("worker" if kind == "executive" else None),
+            executive_stage=Mock(return_value="worker"),
             supplement_strategy="steer",
             progress_enabled=False,
             max_progress_updates=0,
@@ -3346,7 +3353,11 @@ class StreamingCardDeferralTests(unittest.TestCase):
             update_card=AsyncMock(),
         )
         service.agent_runtime = SimpleNamespace(
+            pipeline=("gate", "front", "worker", "deliver"),
+            skill_pool={},
             has_stage=lambda name: has_front if name == "front" else True,
+            stage_of_kind=lambda kind: "front" if (kind == "triage" and has_front) else ("worker" if kind == "executive" else None),
+            executive_stage=Mock(return_value="worker"),
             supplement_strategy="steer",
             progress_enabled=True,
             max_progress_updates=60,
@@ -3610,8 +3621,12 @@ class TaskSnapshotTests(unittest.TestCase):
             state_dir=root,
         )
         service.store = AuditStore(root / "audit.sqlite3")
+        stage = SimpleNamespace(name="worker", profile=SimpleNamespace(options={}))
         service.agent_runtime = SimpleNamespace(
-            profile_name=Mock(return_value="pi-worker")
+            pipeline=("gate", "front", "worker", "deliver"),
+            skill_pool={},
+            profile_name=Mock(return_value="pi-worker"),
+            _stage=Mock(return_value=stage),
         )
         return service
 
@@ -3846,17 +3861,24 @@ class SteerContextRefreshTests(unittest.TestCase):
             service.progress_card_seqs = {}
             service._write_runtime = Mock()
             service.agent_runtime = SimpleNamespace(
+                pipeline=("gate", "front", "worker", "deliver"),
+                skill_pool={},
                 profile_name=Mock(return_value="pi-worker"),
                 render=Mock(return_value="prompt"),
                 render_supplement=Mock(return_value="steer prompt"),
                 supplement_strategy="steer",
+                stage_of_kind=lambda kind: "front" if kind == "triage" else "worker",
+                executive_stage=Mock(return_value="worker"),
                 _stage=Mock(
                     return_value=SimpleNamespace(
-                        prompt_path=root / "prompts" / "worker.md"
+                        name="worker",
+                        prompt_path=root / "prompts" / "worker.md",
+                        profile=SimpleNamespace(protocol="pi-rpc", options={}),
                     )
                 ),
                 resolve_stage=Mock(
                     return_value=SimpleNamespace(
+                        name="worker",
                         profile=SimpleNamespace(
                             protocol="pi-rpc", options={}
                         )
@@ -4019,17 +4041,24 @@ class TurnNudgeTests(unittest.TestCase):
         prepared = SimpleNamespace(timeout_seconds=timeout_seconds)
         holder: dict[str, _ScriptedSession] = {}
         service.agent_runtime = SimpleNamespace(
+            pipeline=("gate", "front", "worker", "deliver"),
+            skill_pool={},
             profile_name=Mock(return_value="pi-worker"),
             render=Mock(return_value="prompt"),
             render_supplement=Mock(return_value="steer prompt"),
             supplement_strategy="steer",
+            stage_of_kind=lambda kind: "front" if kind == "triage" else "worker",
+            executive_stage=Mock(return_value="worker"),
             _stage=Mock(
                 return_value=SimpleNamespace(
-                    prompt_path=root / "prompts" / "worker.md"
+                    name="worker",
+                    prompt_path=root / "prompts" / "worker.md",
+                    profile=SimpleNamespace(protocol="pi-rpc", options={}),
                 )
             ),
             resolve_stage=Mock(
                 return_value=SimpleNamespace(
+                    name="worker",
                     profile=SimpleNamespace(protocol="pi-rpc", options={})
                 )
             ),

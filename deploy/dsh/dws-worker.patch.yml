@@ -1,6 +1,8 @@
-# dws worker patch: aimodel deepseek 模型层 + engram MCP（streamable-http）。
+# dsh worker patch（静态模型层）：aimodel deepseek provider。
 # launcher 级 --patch 逐条前置（dsh-cmdline 契约），本文件经 options.dsh_patches 注入。
 # reasoningEfforts 必须是映射（off: 空、low: low…），列表形态报 NO_ADAPTER。
+# MCP server 与 skills 已收编为节点装配面：runtime 按当次 profile 生成
+# session patch（<session>/dws-session.patch.yml），本文件不再写 mcp-* 条目。
 - id: agent-default-model
   name: "@deepseek-ai/dsh-agent-default-model"
   config:
@@ -25,12 +27,3 @@
               low: low
               medium: medium
               high: high
-- insert:
-    - id: mcp-engram
-      name: "@deepseek-ai/dsh-mcp-client"
-      config:
-        serverName: engram
-        transport: streamable-http
-        url: !!js process.env.DWS_ENGRAM_URL || ''
-        headers:
-          X-Engram-User: !!js process.env.DWS_ENGRAM_USER || ''
