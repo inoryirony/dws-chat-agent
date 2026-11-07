@@ -85,14 +85,7 @@
   }
 
   const Board = {
-    token: () => {
-      // 凭据优先级：localStorage（URL ?token= 写入）→ cookie（页面路由
-      // 每次打开都刷新，重启换 token 也不会失联）。
-      const stored = localStorage.getItem("dwsPanelToken") || "";
-      if (stored) return stored;
-      const match = document.cookie.match(/(?:^|;\s*)dws_panel_token=([^;]+)/);
-      return match ? decodeURIComponent(match[1]) : "";
-    },
+    token: () => localStorage.getItem("dwsPanelToken") || "",
     state: null,
     contacts: {},
     toastTimer: 0,
@@ -102,6 +95,20 @@
     headers() {
       const token = Board.token();
       return token ? { "X-Operator-Token": token } : {};
+    },
+    // 凭据选择：URL ?token= 写进 localStorage 作为显式凭据；服务重启
+    // 换 token 后旧值 403——丢弃它改走同源 cookie（HttpOnly，JS 读不到
+    // 但 fetch 自动携带；页面路由每次打开都刷新）。cookieMode 置位后
+    // 本会话不再探测，2s 轮询不会每次多一发 probe。
+    cookieMode: false,
+    authedHeaders: async () => {
+      const token = Board.token();
+      if (!token || Board.cookieMode) return {};
+      const probe = await fetch("/api/board", { headers: { "X-Operator-Token": token }, cache: "no-store" });
+      if (probe.ok) return { "X-Operator-Token": token };
+      localStorage.removeItem("dwsPanelToken");
+      Board.cookieMode = true;
+      return {};
     },
 
     contactName(id) {
@@ -133,7 +140,7 @@
       const response = await fetch(url, {
         method: "POST",
         cache: "no-store",
-        headers: { "Content-Type": "application/json", ...Board.headers() },
+        headers: { "Content-Type": "application/json", ...(await Board.authedHeaders()) },
         body: JSON.stringify(body || {})
       });
       let payload = {};
@@ -934,7 +941,7 @@
     async refresh() {
       const alert = document.querySelector(".dws-board-alert");
       try {
-        const response = await fetch("/api/board", { cache: "no-store", headers: Board.headers() });
+        const response = await fetch("/api/board", { cache: "no-store", headers: await Board.authedHeaders() });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         Board.render(data);
