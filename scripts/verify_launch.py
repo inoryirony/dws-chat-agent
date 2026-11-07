@@ -82,6 +82,9 @@ def main() -> int:
                         str(args.repo / "deploy" / "dsh" / "dws-worker.patch.yml")
                     ],
                     "task_cli": True,
+                    # shared.md 教 no_reply/report，dsh 需 dws-tools MCP 才
+                    # 挂载全四件服务工具（task_cli 只覆盖 task 子集）。
+                    "service_tools_mcp": True,
                 },
             },
         },
