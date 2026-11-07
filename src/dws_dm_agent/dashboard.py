@@ -728,6 +728,8 @@ class DashboardServer:
                     if not dashboard.diamond_html.is_file():
                         self.send_error(404)
                         return
+                    # 与根路径同款种 cookie：design 偏好会把 / 重定向到本路由
+                    # （theme.js syncDesignRoute），只种 / 的话换肤书签丢凭据。
                     self._send(
                         _with_asset_versions(dashboard, dashboard.diamond_html),
                         "text/html; charset=utf-8",
@@ -737,6 +739,14 @@ class DashboardServer:
                             "font-src 'self' https://fonts.gstatic.com; "
                             "script-src 'self' 'unsafe-inline'; connect-src 'self'"
                         ),
+                        extra_headers=[
+                            (
+                                "Set-Cookie",
+                                "dws_panel_token="
+                                f"{dashboard.operator_token}; "
+                                "Path=/; HttpOnly; SameSite=Strict",
+                            )
+                        ],
                     )
                     return
                 if path in {"/settings", "/settings.html"}:
