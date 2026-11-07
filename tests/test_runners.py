@@ -1165,7 +1165,7 @@ class AgentConfigStoreTests(unittest.TestCase):
             invalid = store.snapshot()
             invalid["agents"]["front-agent"]["read_only"] = False
             before = (root / "config.json").read_bytes()
-            with self.assertRaisesRegex(ValueError, "front agent"):
+            with self.assertRaisesRegex(ValueError, "triage stage front"):
                 store.save(invalid)
             self.assertEqual((root / "config.json").read_bytes(), before)
 

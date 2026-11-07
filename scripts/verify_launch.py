@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -113,6 +114,19 @@ def main() -> int:
         "dws": {"binary": "dws", "profile": "verify", "ai_tag": False, "streaming_cards": False},
         "security": {"max_message_chars": 12000},
     }
+    # 透传生产 config 的 watches 段（存在时）+ 缩短轮询间隔，E2E 验证
+    # watch 命中链路：首轮立即扫一次，无需等 300s。
+    source_config = args.repo / "config.json"
+    if source_config.is_file():
+        source = json.loads(source_config.read_text(encoding="utf-8"))
+        if isinstance(source.get("watches"), list) and os.environ.get(
+            "DWS_VERIFY_WATCHES"
+        ) != "0":
+            config["watches"] = source["watches"]
+            config["watch_interval_seconds"] = 30
+            config["watch_lookback_hours"] = int(
+                os.environ.get("DWS_VERIFY_WATCH_LOOKBACK_HOURS", 24)
+            )
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     sys.path.insert(0, str(args.repo / "src"))
@@ -127,6 +141,20 @@ def main() -> int:
         _svc._WAKE_WINDOW_CLOSE = _svc.time(23, 59, 59)
 
     settings = load_settings(config_path, args.state_dir / "verify.env")
+    # verify 直构 AgentService 不走 main() 的 configure_logging：root
+    # logger 默认 WARNING 会吞掉 INFO——E2E 要靠 "watch dispatcher
+    # ready/hit" 的 INFO 行取证，这里补基础配置。
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # watch 源（JiraSource/GitLabSource）直接读 os.environ；把 repo .env
+    # 的凭据键带上（只注入验证需要的源键，不覆盖已设值）。
+    repo_env = args.repo / ".env"
+    if repo_env.is_file():
+        for line in repo_env.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                if key.startswith(("JIRA_", "GITLAB_")):
+                    os.environ.setdefault(key, value)
     os.environ["DWS_CHAT_AGENT_DASHBOARD_PORT"] = "0"
     service = AgentService(settings, "shadow")
     token = service.dashboard.operator_token

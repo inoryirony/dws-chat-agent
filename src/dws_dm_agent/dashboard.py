@@ -258,6 +258,11 @@ class AgentConfigStore:
             if not isinstance(raw_preset, Mapping):
                 continue
             preset: dict[str, Any] = {
+                "pipeline": [
+                    str(item)
+                    for item in (raw_preset.get("pipeline") or [])
+                    if isinstance(item, str)
+                ],
                 "supplement_strategy": str(
                     raw_preset.get("supplement_strategy") or "steer"
                 ),
@@ -274,7 +279,7 @@ class AgentConfigStore:
                     if key in _AUTO_FIELDS
                 },
             }
-            for stage_name in ("front", "worker"):
+            for stage_name in _preset_stage_names(raw_preset):
                 raw_stage = raw_preset.get(stage_name)
                 if not isinstance(raw_stage, Mapping):
                     continue
@@ -415,6 +420,17 @@ class AgentConfigStore:
             preset["supplement_prompt"] = str(
                 raw_preset.get("supplement_prompt") or ""
             )
+            raw_pipeline = raw_preset.get("pipeline")
+            if raw_pipeline is not None:
+                if not isinstance(raw_pipeline, list) or not all(
+                    isinstance(item, str) and item for item in raw_pipeline
+                ):
+                    raise ValueError(
+                        f"workflow pipeline must be a list of step names: {name}"
+                    )
+                preset["pipeline"] = [str(item) for item in raw_pipeline]
+            else:
+                preset.pop("pipeline", None)
             raw_auto = raw_preset.get("auto_messages", {})
             if not isinstance(raw_auto, Mapping):
                 raise ValueError(f"workflow auto_messages must be an object: {name}")
@@ -430,7 +446,7 @@ class AgentConfigStore:
             auto.pop("progress_interval_seconds", None)
             validate_template_variables(str(auto.get("ack") or ""), _ACK_VARIABLES)
             preset["auto_messages"] = auto
-            for stage_name in ("front", "worker"):
+            for stage_name in _preset_stage_names(raw_preset):
                 raw_stage = raw_preset.get(stage_name)
                 if not isinstance(raw_stage, Mapping):
                     if stage_name == "front":
@@ -506,7 +522,7 @@ class AgentConfigStore:
             supplement = str(preset.get("supplement_prompt") or "")
             if supplement:
                 result.setdefault(supplement, set()).add("supplement")
-            for stage_name in ("front", "worker"):
+            for stage_name in _preset_stage_names(preset):
                 stage = preset.get(stage_name, {})
                 prompt = str(stage.get("prompt") or "") if isinstance(stage, Mapping) else ""
                 if prompt:
@@ -1134,3 +1150,19 @@ class DashboardServer:
             "sentToday": sent,
             "errorsToday": errors,
         }
+
+
+def _preset_stage_names(raw_preset: Any) -> list[str]:
+    """preset 里的 stage 槽位键（保持配置键序）。
+
+    与 runtime 的解析规则一致：Mapping 值即槽位，supplement/auto_messages
+    等元数据键除外。面板按这份清单编辑任意 node，不再锁死 front/worker。
+    """
+    non_stage = {"supplement_prompt", "supplement_strategy", "auto_messages"}
+    if not isinstance(raw_preset, Mapping):
+        return []
+    return [
+        str(key)
+        for key, value in raw_preset.items()
+        if key not in non_stage and isinstance(value, Mapping)
+    ]

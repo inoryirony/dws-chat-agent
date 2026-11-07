@@ -118,8 +118,15 @@ class PromptVariablesTests(unittest.TestCase):
             state_dir=root / "state",
         )
         service.store = AuditStore(root / "audit.sqlite3")
+        stage = SimpleNamespace(
+            name="worker",
+            profile=SimpleNamespace(options={}),
+        )
         service.agent_runtime = SimpleNamespace(
-            profile_name=Mock(return_value="pi-worker")
+            pipeline=("gate", "front", "worker", "deliver"),
+            skill_pool={},
+            profile_name=Mock(return_value="pi-worker"),
+            _stage=Mock(return_value=stage),
         )
         return service
 

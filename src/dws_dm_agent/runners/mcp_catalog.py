@@ -46,6 +46,118 @@ CATALOG: dict[str, dict[str, Any]] = {
 
 # 目录里不存在的名字也可以直接用完整定义（含 command/args/url/headers），
 # 便于临时接入而不改代码。
+def escalate_script_path() -> Path:
+    """escalate_mcp.py 的单点路径：adapters 与 runners 共用，不再各自数 parents。"""
+    return Path(__file__).with_name("escalate_mcp.py")
+
+
+def tools_script_path() -> Path:
+    return Path(__file__).with_name("dws_tools_mcp.py")
+
+
+def service_tools_server() -> dict[str, Any]:
+    """非 pi 协议的服务工具挂载形态：本地 stdio server dws-tools。
+
+    工具名（no_reply/report/task_record/task_lookup）与 pi 扩展完全同名，
+    runtime 的 _is_no_reply_tool/_is_report_tool 按 __<name> 后缀匹配，
+    mcp__dws-tools__no_reply 形态天然兼容；task 后端复用 task_tools.py，
+    与 pi/bash 通路共用全部边界校验与幂等收据。
+    """
+    return {
+        "type": "stdio",
+        "command": sys.executable,
+        "args": [str(tools_script_path())],
+    }
+
+
+def _yaml_scalar(value: Any) -> str:
+    """标量安全序列化：字符串走 JSON 双引号（JSON 字符串是合法 YAML
+    标量），布尔/数字直写，列表转 JSON 流序列。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return json.dumps([str(item) for item in value], ensure_ascii=False)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def write_dsh_session_patch(
+    path: Path,
+    *,
+    servers: dict[str, dict[str, Any]],
+    skills_dir: Path | None = None,
+) -> Path | None:
+    """生成 dsh 的 session 级 patch yml（MCP server + skills 目录）。
+
+    与静态 deploy patch 的分工：模型层（provider/model）留静态文件由
+    options.dsh_patches 注入；MCP 与 skills 是节点装配面，按当次 profile
+    动态生成，值在生成时已解析（不再依赖 !!js process.env）。stdio
+    command 必须绝对路径（dsh-acp 校验），生成期 fail-loud。
+    """
+    entries: list[tuple[str, str, dict[str, Any]]] = []
+    for name, server in servers.items():
+        if "command" in server:
+            command = str(server["command"])
+            if not Path(command).is_absolute():
+                raise ValueError(
+                    f"dsh stdio MCP server {name!r} command must be an "
+                    f"absolute path: {command!r}"
+                )
+            config: dict[str, Any] = {
+                "serverName": name,
+                "transport": "stdio",
+                "command": command,
+                "args": [str(item) for item in server.get("args", [])],
+            }
+            env = server.get("env")
+            if isinstance(env, dict) and env:
+                config["env"] = {str(k): str(v) for k, v in env.items()}
+        elif "url" in server:
+            config = {
+                "serverName": name,
+                "transport": "streamable-http",
+                "url": str(server["url"]),
+            }
+            headers = server.get("headers")
+            if isinstance(headers, dict) and headers:
+                config["headers"] = {str(k): str(v) for k, v in headers.items()}
+        else:
+            raise ValueError(
+                f"dsh MCP server {name!r} has neither command nor url"
+            )
+        entries.append((f"mcp-{name}", "@deepseek-ai/dsh-mcp-client", config))
+    if skills_dir is not None:
+        # 覆盖 dsh-base 的默认 skill-filesystem 条目（同 id 后置覆盖）：
+        # 默认 provider 扫 ~/.agents 等全局根会把非声明 skill 泄漏进节点，
+        # 这里改写成只认 session/skills 一个根。dshHome/agentsHome 是必填
+        # 键（zod schema 无默认值），显式指向 session 目录。
+        entries.append(
+            (
+                "skill-filesystem",
+                "@deepseek-ai/dsh-skill-filesystem",
+                {
+                    "customSkillDirs": [str(skills_dir)],
+                    "includeDefaultRoots": False,
+                    "dshHome": str(skills_dir.parent),
+                    "agentsHome": str(skills_dir.parent),
+                },
+            )
+        )
+    if not entries:
+        return None
+    lines = ["- insert:"]
+    for entry_id, plugin, config in entries:
+        lines.append(f"    - id: {_yaml_scalar(entry_id)}")
+        lines.append(f"      name: {_yaml_scalar(plugin)}")
+        lines.append("      config:")
+        for key, value in config.items():
+            lines.append(f"        {key}: {_yaml_scalar(value)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 _ALLOWED_KEYS = {
     "command",
     "args",

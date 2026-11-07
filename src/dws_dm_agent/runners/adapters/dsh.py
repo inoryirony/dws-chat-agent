@@ -22,8 +22,9 @@
 - 无运行中 steer：runner 是 followup(task) + whenIdle() 单驱动；
   补充消息走 --session-id adopt 新进程 = restart_with_context 等价物。
 - 无 abort 命令：退化为杀进程树（runtime 已有 _terminate_process_tree）。
-- MCP/扩展不按命令行注入，由 dsh profile 插件层叠决定；mcp_config
-  返回 None，profile options.dsh_patch 是文档性占位，不在本层消费。
+- MCP/扩展不按命令行注入，由 dsh profile 插件层叠决定：节点装配面
+  （options.mcp / service_tools_mcp / skills）经 mcp_config 生成
+  session patch，模型层 provider 留 options.dsh_patches 静态注入。
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+
+from .. import mcp_catalog
 
 # turn_end reason.kind → 会话收口动作。error 含结构化 LlmFailure；
 # aborted/blocked/max-tokens/interrupted/forked 均按非正常收口记录，
@@ -43,7 +46,9 @@ class DshAdapter:
     protocol = "dsh-headless-jsonl"
     images = "embed"
     native_steer = False  # 运行中不可注入；补充消息由服务层重启续跑
-    service_tools = False  # 服务工具无 dsh 挂载形态，提示词校验会拦
+    # 服务工具经 options.service_tools_mcp → dws-tools patch（stdio）挂载，
+    # 与 pi 同名同后端；校验按 options 放行，协议级能力位保持 False。
+    service_tools = False
 
     def command(
         self,
@@ -65,6 +70,10 @@ class DshAdapter:
         result.extend(["--profile", str(profile.options.get("dsh_profile") or "headless")])
         for patch in profile.options.get("dsh_patches", ()):
             result.extend(["--patch", str(patch)])
+        # 节点装配 patch（MCP/skills）在静态模型层 patch 之后追加，
+        # 命名不冲突（静态文件用 id: mcp-* 之外的 id）。
+        if mcp_config_path is not None:
+            result.extend(["--patch", str(mcp_config_path)])
         if profile.options.get("dsh_session_arg"):
             # 由配置方决定是否 adopt 既有 Session 续跑。
             result.extend(["--session-id", str(profile.options["dsh_session_arg"])])
@@ -78,7 +87,19 @@ class DshAdapter:
     def mcp_config(
         self, profile: Any, session_dir: Path, stage_name: str
     ) -> Path | None:
-        return None
+        # 节点装配 patch：options.mcp 目录 server + service_tools_mcp 的
+        # dws-tools + skills 目录（skills_dir 由 runtime 在调用前落盘；
+        # 这里只接 session_dir/skills 的既定约定）。模型层 provider 不在
+        # 此层，仍走 options.dsh_patches 静态文件。
+        servers = mcp_catalog.resolve_servers(profile.options.get("mcp"))
+        if profile.options.get("service_tools_mcp"):
+            servers["dws-tools"] = mcp_catalog.service_tools_server()
+        skills_dir = session_dir / "skills"
+        return mcp_catalog.write_dsh_session_patch(
+            session_dir / "dws-session.patch.yml",
+            servers=servers,
+            skills_dir=skills_dir if skills_dir.is_dir() else None,
+        )
 
     async def start(self, session: Any) -> None:
         # headless runner 见 task="-" 时阻塞读 stdin 到 EOF 作为完整任务
@@ -129,7 +150,21 @@ class DshAdapter:
                 session._tool_args_summary(event.get("input")),
                 name=tool_name,
             )
+            # 服务工具信号在调用时刻捕获（与 pi 的 tool_execution_end
+            # 对齐到"模型已决定"语义；dsh 工具事件没有独立的收尾阶段）。
+            # report(final/blocked) 的收口延迟到 tool_result——文件在
+            # server 侧执行时才落盘。
+            if session._is_no_reply_tool(tool_name):
+                session._capture_silent()
         elif event_type == "tool_result":
+            state = session._protocol_state
+            tool_name = state.get("dsh_tool_names", {}).get(
+                str(event.get("callId") or ""), ""
+            )
+            if session._is_report_tool(tool_name):
+                # final/blocked 的正文此刻已在 DWS_REPORT_FILE；progress
+                # 不写文件，_capture_report 对缺失文件静默忽略。
+                session._capture_report()
             session._record_tool_result(
                 str(event.get("callId") or ""),
                 bool(event.get("status") == "error"),

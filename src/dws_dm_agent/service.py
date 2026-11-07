@@ -29,6 +29,11 @@ else:
     import fcntl
 
 from .runners.runtime import AgentRuntime, AgentSession, WorktreeError
+from . import stages as stage_registry
+from .channels import channel_for
+from .sources import GitLabSource, JiraSource, SourceItem
+from .watches import parse_watches, rule_for_item
+from .skills_catalog import resolve_skills, skills_prompt_block
 from .prompts import (
     neutralize_structural_tags,
     SHARED_PROMPT_NAME,
@@ -50,6 +55,7 @@ from .core import (
     parse_local_datetime,
     sanitize_text,
     sha256_text,
+    TaskScope,
 )
 from .config import (
     DEFAULT_CONFIG,
@@ -102,6 +108,31 @@ _TIME_WAKE_MAX_DISPATCHES = 3
 # 重放（crash 后的合成输入最多迟 30 分钟，绝不丢）。
 _STALE_CLAIM_AGE = timedelta(minutes=30)
 
+
+
+
+class _TurnContext:
+    """一轮决策中 step 间共享的可变状态（编排空间的传递面）。
+
+    batch 会被 supplement 合并改写；result 由 triage step 提前回答或
+    executive step 产出；prior_attempt 是下一步的接力说明。step 处理器
+    只读写本对象，不直接摸循环变量。
+    """
+
+    __slots__ = ("batch", "prior_attempt", "attempt", "recent_context", "result")
+
+    def __init__(
+        self,
+        batch: list[IncomingEvent],
+        prior_attempt: str,
+        attempt: int,
+        recent_context: Sequence[Mapping[str, str]] = (),
+    ) -> None:
+        self.batch = batch
+        self.prior_attempt = prior_attempt
+        self.attempt = attempt
+        self.recent_context = recent_context
+        self.result: AgentResult | None = None
 
 class _BatchOutcome:
     """_handle_batch 一个决策分支的显式结果。
@@ -481,6 +512,9 @@ class AgentService:
         self.runtime_heartbeat = asyncio.create_task(
             self._keep_runtime_alive(), name="runtime-heartbeat"
         )
+        self.watch_dispatcher = asyncio.create_task(
+            self._consume_watches(), name="watch-dispatcher"
+        )
         await self.stop_event.wait()
         LOG.info("stopping listeners gracefully")
         for task in self.listeners:
@@ -491,6 +525,7 @@ class AgentService:
         self.outbox_dispatcher.cancel()
         self.wake_dispatcher.cancel()
         self.runtime_heartbeat.cancel()
+        self.watch_dispatcher.cancel()
         await asyncio.gather(
             *self.listeners,
             *self.workers.values(),
@@ -498,6 +533,7 @@ class AgentService:
             self.outbox_dispatcher,
             self.wake_dispatcher,
             self.runtime_heartbeat,
+            self.watch_dispatcher,
             return_exceptions=True,
         )
 
@@ -1308,53 +1344,83 @@ class AgentService:
     ) -> "_BatchOutcome":
         batch, history, latest_manual = await self._stabilize(batch)
         recent_context, _ = self._recent_context(history, batch)
-        self._set_runtime(batch, "screening", attempt=attempt + 1)
-        earliest = min(item.created_at for item in batch)
+        ctx = _TurnContext(batch, prior_attempt, attempt, recent_context)
+        # 稳定化后人工在接管期：整轮停止，pipeline 不再进入任何 step。
+        earliest = min(item.created_at for item in ctx.batch)
         if self._human_owns_conversation(latest_manual, earliest):
             await self._close_active_streaming_card(
-                batch[0].conversation_id, "已停止自动处理，已转人工。"
+                ctx.batch[0].conversation_id, "已停止自动处理，已转人工。"
             )
             self._record_without_agent(
-                batch,
+                ctx.batch,
                 status="human_cooldown",
                 action="no_reply",
                 handled="人工会话仍在接管期，未自动回复",
                 reason="manual_message_within_cooldown",
             )
             self.store.update_event_status(
-                (item.message_id for item in batch), "skipped", "human_cooldown"
+                (item.message_id for item in ctx.batch), "skipped", "human_cooldown"
             )
             return _BatchOutcome("stop")
+        for step in self.agent_runtime.pipeline:
+            outcome = await self._run_pipeline_step(step, ctx)
+            if outcome is not None:
+                return outcome
+        # pipeline 走完仍无 deliver：视图层无终稿（如 triage 直接回答
+        # 被移出 pipeline），按缺终稿兜底。
+        if ctx.result is not None:
+            return _BatchOutcome("deliver", batch=ctx.batch, result=ctx.result)
+        return _BatchOutcome("stop")
 
-        gate = self.gate.inspect([item.content for item in batch])
+    async def _run_pipeline_step(
+        self, step: str, ctx: "_TurnContext"
+    ) -> "_BatchOutcome | None":
+        """执行 pipeline 的一个 step；None = 继续下一个。
+
+        内置 step：gate（规则闸：接管/丢弃/拒绝/频控）、deliver（投递
+        收口）。stage 槽位名按 kind 路由：triage 走只读分诊处理器，
+        executive 走执行 + fallback 链 + 终态收口。
+        """
+        if step == "gate":
+            return await self._step_gate(ctx)
+        if step == "deliver":
+            return await self._step_deliver(ctx)
+        spec = stage_registry.stage_spec(step)
+        if spec.kind == "triage":
+            return await self._step_triage(ctx)
+        return await self._step_executive(ctx)
+
+    async def _step_gate(self, ctx: "_TurnContext") -> "_BatchOutcome | None":
+        self._set_runtime(ctx.batch, "screening", attempt=ctx.attempt + 1)
+        gate = self.gate.inspect([item.content for item in ctx.batch])
         if gate.action == "drop":
             await self._close_active_streaming_card(
-                batch[0].conversation_id, "处理已结束。"
+                ctx.batch[0].conversation_id, "处理已结束。"
             )
             self._record_without_agent(
-                batch,
+                ctx.batch,
                 status="no_reply",
                 action="no_reply",
                 handled="无需回复",
                 reason=gate.reason,
             )
             self.store.update_event_status(
-                (item.message_id for item in batch), "processed", gate.reason
+                (item.message_id for item in ctx.batch), "processed", gate.reason
             )
             return _BatchOutcome("stop")
         if gate.action == "refuse":
             refusal_session = f"code-{uuid.uuid4().hex[:12]}"
             outcome = await self._send_after_freshness_check(
-                batch,
+                ctx.batch,
                 gate.reply,
                 session_id=refusal_session,
             )
             if outcome == "supplement":
                 return _BatchOutcome(
-                    "replan", batch=await self._merge_latest(batch), pause=False
+                    "replan", batch=await self._merge_latest(ctx.batch), pause=False
                 )
             self._record_without_agent(
-                batch,
+                ctx.batch,
                 status="refused" if outcome in {"sent", "shadow"} else outcome,
                 action="refuse",
                 handled="拒绝高风险请求",
@@ -1363,144 +1429,129 @@ class AgentService:
             )
             if outcome != "delivery_pending":
                 self.store.update_event_status(
-                    (item.message_id for item in batch), "processed", gate.reason
+                    (item.message_id for item in ctx.batch), "processed", gate.reason
                 )
             return _BatchOutcome("stop")
-
-        if self._agent_rate_limited(batch[0].contact):
+        if self._agent_rate_limited(ctx.batch[0].contact):
             await self._close_active_streaming_card(
-                batch[0].conversation_id, "处理已结束。"
+                ctx.batch[0].conversation_id, "处理已结束。"
             )
             self._record_without_agent(
-                batch,
+                ctx.batch,
                 status="no_reply",
                 action="no_reply",
                 handled="触发本地 Agent 频率保护，未自动回复",
                 reason="agent_rate_limit",
             )
             self.store.update_event_status(
-                (item.message_id for item in batch), "skipped", "agent_rate_limit"
+                (item.message_id for item in ctx.batch), "skipped", "agent_rate_limit"
             )
             return _BatchOutcome("stop")
+        return None
 
-        result: AgentResult | None = None
-        if (
-            self.agent_runtime.has_stage("front")
-            and not _image_resources(batch)
-        ):
-            self._set_runtime(batch, "routing", attempt=attempt + 1)
-            front_result = await self._run_agent(
-                batch,
-                prior_attempt,
-                front=True,
-                recent_context=recent_context,
+    async def _step_triage(self, ctx: "_TurnContext") -> "_BatchOutcome | None":
+        # 图片批不走分诊（多模态直进 executive），与既有行为一致。
+        if _image_resources(ctx.batch):
+            return None
+        self._set_runtime(ctx.batch, "routing", attempt=ctx.attempt + 1)
+        front_result = await self._run_agent(
+            ctx.batch,
+            ctx.prior_attempt,
+            front=True,
+            recent_context=ctx.recent_context,
+        )
+        if front_result.consumed_supplements:
+            ctx.batch = self._deduplicate(
+                [*ctx.batch, *front_result.consumed_supplements]
             )
-            if front_result.consumed_supplements:
-                batch = self._deduplicate(
-                    [*batch, *front_result.consumed_supplements]
-                )
-            if front_result.manual_takeover:
-                # 人工接管后不再新建对外卡片通知；接管事实由人工消息本身
-                # 传达，但已存在的处理中卡片必须安全收口，不能悬在会话里。
-                await self._close_active_streaming_card(
-                    batch[0].conversation_id, "已停止自动处理，已转人工。"
-                )
-                self._record_agent_result(
-                    batch, front_result, status="human_cooldown"
-                )
-                self.store.update_event_status(
-                    (item.message_id for item in batch),
-                    "skipped",
-                    "manual_takeover",
-                )
-                return _BatchOutcome("stop")
-            if front_result.supplements:
-                return _BatchOutcome(
-                    "replan",
-                    batch=self._deduplicate(
-                        [*batch, *front_result.supplements]
-                    ),
-                    prior_attempt="前台收到补充消息，已按完整上下文重新处理。",
-                )
-            if front_result.silent:
-                # 前台判定无需回复：成功终态，不进 worker、不发送、不通知。
-                await self._finish_silent(batch, front_result)
-                return _BatchOutcome("stop")
-            if front_result.reply is not None and not front_result.escalated:
-                result = front_result
-            else:
-                prior_attempt = (
-                    "前台已升级，由执行 Agent 处理完整请求。"
-                    if front_result.escalated
-                    else f"前台失败：{front_result.error}"
-                )
-
-        if result is None:
-            self._set_runtime(batch, "worker", attempt=attempt + 1)
-            result = await self._run_worker_with_fallback(
-                batch,
-                prior_attempt,
-                recent_context=recent_context,
+        if front_result.manual_takeover:
+            # 人工接管后不再新建对外卡片通知；接管事实由人工消息本身
+            # 传达，但已存在的处理中卡片必须安全收口，不能悬在会话里。
+            await self._close_active_streaming_card(
+                ctx.batch[0].conversation_id, "已停止自动处理，已转人工。"
             )
-            if result.consumed_supplements:
-                batch = self._deduplicate(
-                    [*batch, *result.consumed_supplements]
-                )
+            self._record_agent_result(
+                ctx.batch, front_result, status="human_cooldown"
+            )
+            self.store.update_event_status(
+                (item.message_id for item in ctx.batch),
+                "skipped",
+                "manual_takeover",
+            )
+            return _BatchOutcome("stop")
+        if front_result.supplements:
+            return _BatchOutcome(
+                "replan",
+                batch=self._deduplicate([*ctx.batch, *front_result.supplements]),
+                prior_attempt="前台收到补充消息，已按完整上下文重新处理。",
+            )
+        if front_result.silent:
+            # 前台判定无需回复：成功终态，不进 worker、不发送、不通知。
+            await self._finish_silent(ctx.batch, front_result)
+            return _BatchOutcome("stop")
+        if front_result.reply is not None and not front_result.escalated:
+            ctx.result = front_result
+        else:
+            ctx.prior_attempt = (
+                "前台已升级，由执行 Agent 处理完整请求。"
+                if front_result.escalated
+                else f"前台失败：{front_result.error}"
+            )
+        return None
 
+    async def _step_executive(self, ctx: "_TurnContext") -> "_BatchOutcome | None":
+        if ctx.result is not None:
+            return None
+        self._set_runtime(ctx.batch, "worker", attempt=ctx.attempt + 1)
+        result = await self._run_worker_with_fallback(
+            ctx.batch,
+            ctx.prior_attempt,
+            recent_context=ctx.recent_context,
+        )
+        if result.consumed_supplements:
+            ctx.batch = self._deduplicate(
+                [*ctx.batch, *result.consumed_supplements]
+            )
+        ctx.result = result
         if result.manual_takeover:
             await self._close_active_streaming_card(
-                batch[0].conversation_id, "已停止自动处理，已转人工。"
+                ctx.batch[0].conversation_id, "已停止自动处理，已转人工。"
             )
-            self._record_agent_result(batch, result, status="human_cooldown")
+            self._record_agent_result(ctx.batch, result, status="human_cooldown")
             self.store.update_event_status(
-                (item.message_id for item in batch), "skipped", "manual_takeover"
+                (item.message_id for item in ctx.batch), "skipped", "manual_takeover"
             )
             return _BatchOutcome("stop")
         if result.supplements:
-            self._record_agent_result(batch, result, status="stale_supplement")
+            self._record_agent_result(ctx.batch, result, status="stale_supplement")
             return _BatchOutcome(
                 "replan",
-                batch=self._deduplicate([*batch, *result.supplements]),
+                batch=self._deduplicate([*ctx.batch, *result.supplements]),
                 prior_attempt="对方补充了消息，按新的完整上下文继续。",
             )
         if result.silent:
             # 模型显式选择沉默：成功终态，不触发兜底回复、不写发送队列。
-            await self._finish_silent(batch, result)
+            await self._finish_silent(ctx.batch, result)
             return _BatchOutcome("stop")
         if result.reply is None:
             # 失败要通知联系人：卡片在此时点才创建（见 _ensure_streaming_card）。
             stream_card_id = await self._ensure_streaming_card(
-                batch, result.session_id
+                ctx.batch, result.session_id
             )
             await self._safe_update_streaming_card(
                 stream_card_id, "处理失败，请稍后重试或转人工处理。", 5
             )
-            self._record_agent_result(batch, result, status="error")
+            self._record_agent_result(ctx.batch, result, status="error")
             self.store.update_event_status(
-                (item.message_id for item in batch), "error", result.error[:200]
+                (item.message_id for item in ctx.batch), "error", result.error[:200]
             )
             return _BatchOutcome("stop")
+        return None
 
-        return _BatchOutcome("deliver", batch=batch, result=result)
-        return
-
-        stream_card_id = await self._ensure_streaming_card(
-        batch, f"code-{uuid.uuid4().hex[:12]}"
-        )
-        await self._safe_update_streaming_card(
-        stream_card_id, "补充消息过多，本轮已停止自动处理。", 5
-        )
-        self._record_without_agent(
-        batch,
-        status="no_reply",
-        action="no_reply",
-        handled="对方持续补充消息，本轮未抢答",
-        reason="max_replans_reached",
-        )
-        self.store.update_event_status(
-        (item.message_id for item in batch), "skipped", "max_replans_reached"
-        )
-
+    async def _step_deliver(self, ctx: "_TurnContext") -> "_BatchOutcome | None":
+        if ctx.result is None or ctx.result.reply is None:
+            return None
+        return _BatchOutcome("deliver", batch=ctx.batch, result=ctx.result)
 
     def _agent_rate_limited(self, contact: Contact) -> bool:
         limits = self.settings.raw.get("rate_limit", {})
@@ -1865,6 +1916,12 @@ class AgentService:
             "skill_humanizer": _skill_path("humanizer_zh"),
             "skill_answer_html": _skill_path("answer_me_with_html"),
             "script_am": _skill_path("answer_me_script"),
+            "skills": skills_prompt_block(
+                resolve_skills(
+                    self.agent_runtime.skill_pool,
+                    self.agent_runtime._stage(stage).profile.options.get("skills"),
+                )
+            ),
             "deliveries_dir": str(self.settings.state_dir / "deliveries"),
         }
 
@@ -1877,7 +1934,7 @@ class AgentService:
         退回纯阶段模板，提示词文件可独立部署。front 未启用，维持单模板。
         """
         rendered = self.agent_runtime.render(stage, variables)
-        if stage != "worker":
+        if not stage_registry.is_executive(stage):
             return rendered
         shared_path = (
             self.agent_runtime._stage(stage).prompt_path.parent
@@ -1902,7 +1959,9 @@ class AgentService:
             prior_attempt,
             recent_context=recent_context,
         )
-        fallbacks = self.agent_runtime._stage("worker").profile.fallbacks
+        fallbacks = self.agent_runtime._stage(
+            self.agent_runtime.executive_stage()
+        ).profile.fallbacks
         for index, agent_name in enumerate(fallbacks, start=1):
             if (
                 result.reply is not None
@@ -1938,7 +1997,11 @@ class AgentService:
         recent_context: Sequence[Mapping[str, str]] = (),
         agent_override: str | None = None,
     ) -> AgentResult:
-        stage = "front" if front else "worker"
+        stage = (
+            self.agent_runtime.stage_of_kind("triage") or "front"
+            if front
+            else self.agent_runtime.executive_stage()
+        )
         profile = re.sub(
             r"[^a-z0-9]+",
             "-",
@@ -2616,6 +2679,8 @@ class AgentService:
         if row is None:
             return False
         send_uuid = str(row["send_uuid"])
+        conversation_id = str(row["conversation_id"])
+        channel = channel_for(conversation_id, self.dws)
         contact = next(
             (
                 item
@@ -2625,6 +2690,18 @@ class AgentService:
             None,
         )
         if contact is None:
+            # 外部通道（jira:/gitlab:）的联系人不在 settings.contacts：
+            # 投递身份 = conversation_id 本身（issue key / project!mr）。
+            if channel is not self.dws and ":" in conversation_id:
+                from .core import Contact as _Contact
+
+                contact = _Contact(
+                    alias=conversation_id.split(":", 1)[1],
+                    display_name=conversation_id,
+                    user_id=conversation_id,
+                    open_dingtalk_id="",
+                )
+        if contact is None:
             await self._safe_update_streaming_card(
                 str(row["card_biz_id"] or ""), "处理已结束。", 5
             )
@@ -2633,9 +2710,14 @@ class AgentService:
             )
             return True
         try:
-            history = await self.dws.history(contact)
-            latest_manual = self._register_manual_messages(history)
             source_received_at = datetime.fromisoformat(row["source_received_at"])
+            if getattr(channel, "supports_freshness", True) is False:
+                # 外部通道（jira/gitlab）没有"本人手打接管"信号：新鲜度
+                # 与补充消息检查是 dws 专属，这里直接进发送段。
+                history = []
+            else:
+                history = await self.dws.history(contact)
+            latest_manual = self._register_manual_messages(history)
             if self._human_owns_conversation(latest_manual, source_received_at):
                 await self._safe_update_streaming_card(
                     str(row["card_biz_id"] or ""),
@@ -2674,7 +2756,9 @@ class AgentService:
             message_id = ""
             card_flow_status: int | None = None
             card_biz_id = str(row["card_biz_id"] or "")
-            if not card_biz_id and getattr(self.dws, "streaming_cards", False):
+            if not card_biz_id and channel is self.dws and getattr(
+                self.dws, "streaming_cards", False
+            ):
                 # 卡片是投递的一部分：人工接管与补充消息的最终检查都已
                 # 通过，此刻才创建；创建后绑定投递行，网络重试复用同卡。
                 card_biz_id = await self._start_delivery_card(
@@ -2696,14 +2780,10 @@ class AgentService:
                         row["session_id"],
                         sanitize_text(str(exc), 300),
                     )
-                    message_id, _ = await self.dws.send(
-                        contact, content, send_uuid, retry_network=True
-                    )
+                    message_id, _ = await channel.send(contact, content, send_uuid)
                     card_flow_status = 5
             else:
-                message_id, _ = await self.dws.send(
-                    contact, content, send_uuid, retry_network=True
-                )
+                message_id, _ = await channel.send(contact, content, send_uuid)
             self.store.mark_delivery_sent(
                 send_uuid,
                 message_id,
@@ -2729,6 +2809,139 @@ class AgentService:
     # 循环只做三件事：扫时刻、排空终态事件、把到点 wake 合成输入进联系人
     # 队列；合成轮复用 _handle_batch 全链，message_id 带 wake- 前缀标记。
     # ------------------------------------------------------------------
+
+    async def _consume_watches(self) -> None:
+        """Watch 规则轮询：外部源变化 → 建 task + 合成事件开处理轮。
+
+        容错骨架照 _consume_wakes：异常全吞记日志，下一轮重试；去重靠
+        events 表 claim（dedup_key 当 message_id，UNIQUE 幂等），重复
+        命中天然只处理一次。
+        """
+        self._watch_rules = parse_watches(self.settings.raw.get("watches"))
+        rules = self._watch_rules
+        if not rules:
+            LOG.info("watch dispatcher idle: no watch rules configured")
+            return
+        sources = self._build_watch_sources(rules)
+        if not sources:
+            LOG.info("watch dispatcher idle: no reachable sources")
+            return
+        interval = max(
+            60,
+            int(self.settings.raw.get("watch_interval_seconds", 300)),
+        )
+        # 冷启动回看窗：首轮要能看到"规则上线前就存在"的对象（JQL
+        # 自带时间窗，这里只做源侧粗滤的基准线）；之后 since 随命中
+        # 的 created_at 前移，不重复处理旧对象。
+        lookback = int(self.settings.raw.get("watch_lookback_hours", 24))
+        since = datetime.now(self.settings.timezone) - timedelta(hours=lookback)
+        LOG.info("watch dispatcher ready rules=%d interval=%ds", len(rules), interval)
+        while not self.stop_event.is_set():
+            try:
+                for rule_name, source in sources:
+                    items = await source.poll(since)
+                    for item in items:
+                        since = max(
+                            since,
+                            item.created_at or datetime.now(self.settings.timezone),
+                        )
+                        await self._handle_watch_hit(rule_name, item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("watch poll failed")
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval)
+
+    def _build_watch_sources(
+        self, rules: list
+    ) -> list:
+        """规则 → (规则名, 源实例)；Jira 按 jql 去重成一源，GitLab 按
+        projects 并集。凭据缺失的源跳过并告警（不炸启动，照"可配置
+        缺省"原则），生产补 .env 即生效。"""
+        jira_jqls = {rule.jql for rule in rules if rule.source == "jira"}
+        jira_projects = {
+            project
+            for rule in rules
+            if rule.source == "jira"
+            for project in rule.projects
+        }
+        gitlab_projects = {
+            project
+            for rule in rules
+            if rule.source == "gitlab"
+            for project in rule.projects
+        }
+        built = []
+        if jira_jqls:
+            # JQL 合并：ORDER BY 全局一份（放尾），其余括号 OR 连接——
+            # (x ORDER BY a) OR (y ORDER BY b) 会被 Jira 判 400。
+            clauses = []
+            order = "created DESC"
+            for item in sorted(jira_jqls):
+                parts = item.rsplit("ORDER BY", 1)
+                clauses.append(f"({parts[0].strip().rstrip(',').strip()})")
+                if len(parts) == 2:
+                    order = parts[1].strip()
+            jql = " OR ".join(clauses) + f" ORDER BY {order}"
+            built.append(("jira", JiraSource(jql, sorted(jira_projects))))
+        if gitlab_projects:
+            built.append(("gitlab", GitLabSource(sorted(gitlab_projects))))
+        if not os.environ.get("JIRA_USERNAME"):
+            LOG.warning("watch: JIRA_USERNAME missing; jira source disabled")
+            built = [entry for entry in built if entry[0] != "jira"]
+        if not built:
+            return []
+        return built
+
+    async def _handle_watch_hit(self, rule_name: str, item: SourceItem) -> None:
+        """一次 Watch 命中：建 task（面板可见）+ 合成事件入队开轮。
+
+        蓝图铁律 3：命中必须可观测——task 落库 + LOG，不静默起轮。
+        蓝图铁律 1：投递出口由 conversation_id 前缀锁死（jira:/gitlab:
+        → 评论），无对外 DM 授权泄漏面。
+        """
+        rules = self._watch_rules
+        rule = rule_for_item(rules, item) if rules else None
+        instruction = rule.instruction if rule else "处理此事件。"
+        origin = rule.origin if rule else f"watch-{rule_name}"
+        event = IncomingEvent(
+            event_id=f"watch-{sha256_text(item.dedup_key)[:12]}",
+            message_id=item.dedup_key,
+            conversation_id=item.conversation_id,
+            contact=item.contact,
+            content=(
+                f"【Watch 命中：{rule.name if rule else rule_name}】{item.title}\n"
+                f"{item.body[:2000]}\n{item.url}\n\n{instruction}"
+            ),
+            created_at=item.created_at or datetime.now(self.settings.timezone),
+            origin=origin,
+        )
+        if not self.store.claim_event(event):
+            return
+        scope = TaskScope(
+            self_id=self.settings.self_open_id,
+            contact_id=item.contact.identity,
+            conversation_id=item.conversation_id,
+        )
+        now = datetime.now(self.settings.timezone)
+        self.store.record_task(
+            scope=scope,
+            goal=f"{rule.name if rule else rule_name}: {item.title}"[:2000],
+            status="open",
+            evidence_summary=item.url,
+            evidence_message_ids=[item.dedup_key],
+            resources=[],
+            evidence_at=now,
+            now=now,
+        )
+        LOG.info(
+            "watch hit rule=%s key=%s conversation=%s",
+            rule.name if rule else rule_name,
+            item.dedup_key,
+            item.conversation_id,
+        )
+        self._enqueue(event)
 
     async def _consume_wakes(self) -> None:
         interval = float(

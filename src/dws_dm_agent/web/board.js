@@ -26,10 +26,11 @@
     stale_supplement: ["补充后重算", "info"], invalid_reply: ["回复重算", "info"]
   };
 
+  // 顺序表：rail 段序只活在这里；文案单点在后端（run.phase_label，
+  // service.py 的 labels 字典），前端只在后端没送时用 key 兜底。
   const PHASES = [
-    ["stabilizing", "合并消息"], ["screening", "规则检查"], ["routing", "前置节点"],
-    ["acknowledged", "已确认"], ["worker", "执行节点"], ["steering", "补充已合并"],
-    ["verifying", "代码核验"], ["freshness", "发送前复查"], ["sending", "发送"]
+    "stabilizing", "screening", "routing", "acknowledged", "worker",
+    "steering", "verifying", "freshness", "sending"
   ];
 
   function icon(name, cls) {
@@ -586,9 +587,11 @@
           // 当前段露标签。没有里程碑时它就是唯一"现在跑到哪"的依据。
           const rail = node("div", "dws-rail");
           const steps = node("div", "steps");
-          const stepEls = PHASES.map(([key, label]) => {
+          const stepEls = PHASES.map((key) => {
             const step = node("div", "step");
-            step.append(node("div", "step-line"), node("div", "step-label", label));
+            const label = node("div", "step-label", key);
+            label.dataset.phase = key;
+            step.append(node("div", "step-line"), label);
             steps.append(step);
             return step;
           });
@@ -650,7 +653,7 @@
           row._time.className = "dws-run-elapsed";
           row.classList.toggle("is-waiting", run.status === "waiting");
 
-          const index = Math.max(0, PHASES.findIndex(([key]) => key === run.phase));
+          const index = Math.max(0, PHASES.indexOf(run.phase));
           row._meta.textContent = "";
           if (run.status === "waiting") row._meta.append(node("span", "", "等外部条件"));
           if (run.recent_progress && run.recent_progress.length > 0) {
@@ -658,7 +661,7 @@
           }
 
           // 阶段条：即使模型没报里程碑，也要能看出跑到第几步。
-          const hasPhase = Boolean(run.phase) && PHASES[index][0] === run.phase;
+          const hasPhase = Boolean(run.phase) && PHASES[index] === run.phase;
           row._rail.hidden = !hasPhase;
           if (hasPhase) {
             const railKey = `${run.phase}`;
@@ -667,6 +670,9 @@
               row._stepEls.forEach((step, stepIndex) => {
                 step.className = `step ${stepIndex < index ? "done" : stepIndex === index ? "current" : ""}`.trim();
               });
+              // 激活段文案用后端单点 phaseLabel，改文案只动 service.py。
+              const active = row._rail.querySelector(`.step-label[data-phase="${run.phase}"]`);
+              if (active && run.phase_label) active.textContent = run.phase_label;
             }
           }
 
