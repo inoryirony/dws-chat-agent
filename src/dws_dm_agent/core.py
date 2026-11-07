@@ -2088,6 +2088,21 @@ class AuditStore:
         ).fetchone()
         return row is not None
 
+    def wake_dispatch_count(self, origin_task_id: str, waiting_on: str) -> int:
+        """同任务同一 waiting_on 值已派发（含失败）的 wake 总数。
+
+        时刻唤醒的机械封顶依据：模型侧 task_record 闭环不可靠时，
+        同一时刻不允许无限重发（每次重发都是一轮真实模型运行）。
+        """
+        row = self.connection.execute(
+            """
+            SELECT count(*) FROM wakes
+            WHERE origin_task_id = ? AND waiting_on = ?
+            """,
+            (origin_task_id, waiting_on),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def time_waiting_tasks(self) -> list[dict[str, Any]]:
         """全部 waiting_on=@时刻 的未归档 waiting 事项，不设条数上限。
 

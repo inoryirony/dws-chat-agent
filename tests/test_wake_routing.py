@@ -194,7 +194,14 @@ class TerminalWakeTests(unittest.TestCase):
 
             # 事件只排空一次：重复 drain 不重复唤醒。
             service._drain_terminal_events(NOW + timedelta(seconds=5))
-            self.assertEqual(len(service.store.due_wakes(NOW)), 2)
+            self.assertEqual(
+                len(
+                    service.store.due_wakes(
+                        datetime.now(tz=ZoneInfo("Asia/Shanghai"))
+                    )
+                ),
+                2,
+            )
             service.store.close()
     def test_cancelled_task_wakes_with_cancel_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -324,6 +331,29 @@ class TimeWakeTests(unittest.TestCase):
             service._scan_time_wakes(datetime(2026, 11, 9, 12, 0, tzinfo=TZ))
 
             self.assertEqual(service.store.due_wakes(NOW), [])
+            service.store.close()
+
+    def test_time_wake_dispatch_capped_at_three(self) -> None:
+        """任务停在 waiting 且时刻已过：重发封顶 3 轮，绝不 5s 一轮烧钱。"""
+        with tempfile.TemporaryDirectory() as directory:
+            service = _service(Path(directory))
+            task_id = self._waiting_at(service.store, "@2026-11-07 10:00")
+
+            at = datetime(2026, 11, 7, 10, 0, tzinfo=TZ)
+            for _ in range(6):
+                service._scan_time_wakes(at)
+                # 模拟派发循环：把 due wake 全部 claim+finish（无论成败，
+                # 派发计数都应累计），任务保持 waiting 不闭环。
+                for wake in service.store.due_wakes(at):
+                    self.store = service.store
+                    service.store.claim_wake(int(wake["id"]), now=at)
+                    service.store.finish_wake(int(wake["id"]), now=at)
+
+            self.assertEqual(
+                service.store.wake_dispatch_count(task_id, "@2026-11-07 10:00"),
+                3,
+            )
+            self.assertEqual(service.store.due_wakes(at), [])
             service.store.close()
 
 
@@ -676,7 +706,11 @@ class OperatorPanelTests(unittest.TestCase):
                 [(fact["text"], fact["source"]) for fact in facts],
                 [("同意灰度发布", "human")],
             )
-            wakes = service.store.due_wakes(NOW)
+            # answer_task 的 wake due_at 用真实墙钟：用当前时间取 due，
+            # 固定常量 NOW 会在墙钟越过它之后把 due wake 全滤成空。
+            wakes = service.store.due_wakes(
+                datetime.now(tz=ZoneInfo("Asia/Shanghai"))
+            )
             self.assertEqual(
                 {(wake["contact_id"], wake["text"]) for wake in wakes},
                 {
@@ -692,7 +726,14 @@ class OperatorPanelTests(unittest.TestCase):
             self.assertEqual(
                 service.store.facts_for_task(other["task"]["id"]), []
             )
-            self.assertEqual(len(service.store.due_wakes(NOW)), 2)
+            self.assertEqual(
+                len(
+                    service.store.due_wakes(
+                        datetime.now(tz=ZoneInfo("Asia/Shanghai"))
+                    )
+                ),
+                2,
+            )
             service.store.close()
 
     def test_board_snapshot_projects_waiting_operator_and_runs(self) -> None:
