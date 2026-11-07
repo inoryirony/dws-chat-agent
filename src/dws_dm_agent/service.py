@@ -3028,25 +3028,21 @@ class AgentService:
         if not self._watch_rule_allows_notify(conversation):
             return
         verb = "已完成" if str(event["status"]) == "completed" else "已取消"
+        target = self._watch_notify_target(str(event["task_id"]))
         text = (
             f"Watch 任务{verb}：{event['goal']}。"
             f"处理结果已作为评论发回 {conversation.split(':', 1)[1]}。"
         )
-        notify_self = Contact(
-            alias=self.settings.self_name,
-            display_name=self.settings.self_name,
-            user_id="",
-            open_dingtalk_id=self.settings.self_open_id,
-        )
         try:
             send_uuid = f"watch-notify-{event['task_id']}-{event['id']}"
             delivered = asyncio.get_event_loop().create_task(
-                self.dws.send(notify_self, text, send_uuid)
+                self.dws.send(target, text, send_uuid)
             )
             delivered.add_done_callback(
                 lambda task: LOG.info(
-                    "watch terminal notify task=%s ok=%s",
+                    "watch terminal notify task=%s to=%s ok=%s",
                     event["task_id"],
+                    target.alias,
                     task.result()[0] is not None if not task.exception() else False,
                 )
             )
@@ -3054,6 +3050,29 @@ class AgentService:
             LOG.exception(
                 "watch terminal notify failed task=%s", event["task_id"]
             )
+
+    def _watch_notify_target(self, task_id: str) -> Contact:
+        """终态通知收件人：worker 写的「完成后通知：<姓名>」优先。
+
+        姓名按白名单联系人的 display_name / alias 双向模糊匹配（display
+        形如「子画-倪吉」，写「子画」「倪吉」都能命中）；找不到指定
+        联系人时兜底本人——人不看 issue，完成信号必须送达。
+        """
+        waiting_on = self.store.task_waiting_on(task_id)
+        marker = "完成后通知："
+        if waiting_on.startswith(marker):
+            name = waiting_on[len(marker):].strip()
+            for contact in self.settings.contacts:
+                if name and (
+                    name in contact.display_name or contact.alias in name
+                ):
+                    return contact
+        return Contact(
+            alias=self.settings.self_name,
+            display_name=self.settings.self_name,
+            user_id="",
+            open_dingtalk_id=self.settings.self_open_id,
+        )
 
     def _watch_rule_allows_notify(self, conversation: str) -> bool:
         """命中任务所属 watch 规则的 notify 开关（缺省 dm 通知本人）。

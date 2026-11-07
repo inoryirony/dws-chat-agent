@@ -281,3 +281,73 @@ class WatchNotifyTests(unittest.TestCase):
             # create_task 在 drive() 返回后未 await：不强制等 send 完成，
             # 只验证 notify 路径不炸（send 本身是 dws 层契约，有独立测试）。
             store.close()
+
+
+class WatchNotifyTargetTests(unittest.TestCase):
+    """「完成后通知：<姓名>」协议：worker 决策收件人，服务侧解析发钉钉。"""
+
+    def _service_stub(self, contacts):
+        from types import SimpleNamespace
+        from dws_dm_agent.core import Contact
+        return SimpleNamespace(
+            store=None,
+            settings=SimpleNamespace(
+                timezone=None, self_name="我", self_open_id="self-open",
+                contacts=tuple(contacts),
+            ),
+        )
+
+    def test_target_resolves_notify_name_to_whitelist_contact(self) -> None:
+        from dws_dm_agent.core import AuditStore, Contact, TaskScope
+        from dws_dm_agent.service import AgentService
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("Asia/Shanghai")
+        contacts = [
+            Contact("子画", "子画-倪吉", "u-niji", "open-niji"),
+            Contact("杨培", "夏桐-杨培", "u-yangpei", "open-yangpei"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AuditStore(Path(tmp) / "audit.sqlite3")
+            now = datetime.now(tz)
+            scope = TaskScope("self-1", "jira:ZKAI-1", "jira:ZKAI-1")
+            store.record_task(
+                scope=scope, goal="规则: 修问题",
+                status="completed", waiting_on="完成后通知：杨培",
+                evidence_summary="", evidence_message_ids=[], resources=[],
+                evidence_at=now, now=now,
+            )
+            tasks = store.lookup_tasks(scope=scope)
+            svc = AgentService.__new__(AgentService)
+            svc.store = store
+            svc.settings = self._service_stub(contacts).settings
+
+            # 姓名命中白名单：发给对应联系人。
+            target = svc._watch_notify_target(tasks[0]["id"])
+            self.assertEqual(target.user_id, "u-yangpei")
+
+            # display_name 部分匹配（写"倪吉"也能命中"子画-倪吉"）。
+            store.record_task(
+                scope=TaskScope("self-1", "jira:ZKAI-2", "jira:ZKAI-2"),
+                goal="规则: 另一个", status="completed",
+                waiting_on="完成后通知：倪吉",
+                evidence_summary="", evidence_message_ids=[], resources=[],
+                evidence_at=now, now=now,
+            )
+            scope2 = TaskScope("self-1", "jira:ZKAI-2", "jira:ZKAI-2")
+            task2 = store.lookup_tasks(scope=scope2)[0]
+            target2 = svc._watch_notify_target(task2["id"])
+            self.assertEqual(target2.user_id, "u-niji")
+
+            # 白名单外姓名 / 无指定：兜底本人。
+            store.record_task(
+                scope=TaskScope("self-1", "jira:ZKAI-3", "jira:ZKAI-3"),
+                goal="规则: 第三个", status="completed", waiting_on="等部署完成",
+                evidence_summary="", evidence_message_ids=[], resources=[],
+                evidence_at=now, now=now,
+            )
+            task3 = store.lookup_tasks(scope=TaskScope("self-1", "jira:ZKAI-3", "jira:ZKAI-3"))[0]
+            target3 = svc._watch_notify_target(task3["id"])
+            self.assertEqual(target3.open_dingtalk_id, "self-open")
+            store.close()
