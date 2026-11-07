@@ -96,6 +96,8 @@ _OPERATOR_INSTRUCTION_DISCLAIMER = (
     "这是操作者本人下达的指令，按最高授权执行。"
 )
 _TIME_WAITING_PATTERN = re.compile(r"^@(.+)$")
+# 时刻唤醒机械封顶：同一任务同一时刻最多派发这么多轮（含失败）。
+_TIME_WAKE_MAX_DISPATCHES = 3
 # claimed wake 超过该时长未收口视为派发进程已死：启动扫尾回置 pending
 # 重放（crash 后的合成输入最多迟 30 分钟，绝不丢）。
 _STALE_CLAIM_AGE = timedelta(minutes=30)
@@ -1990,11 +1992,13 @@ class AgentService:
                 multimodal_model = stage_profile.profile.options.get("multimodal_model")
                 if multimodal_model:
                     model_override = str(multimodal_model)
-            # 事项工具上下文只注入 pi-rpc：作用域隔离由后端强制，重放按
-            # (run_id, tool_call_id) 幂等；其他协议不提供事项工具。
+            # 事项工具上下文注入 pi-rpc（扩展直接吃 env）与 task_cli 运行时
+            # （dsh 洗 env，改经 prompt 模板变量嵌固定路径 + context 文件）：
+            # 作用域隔离由后端强制，重放按 (run_id, tool_call_id) 幂等。
             task_context = (
                 self._task_context_for(batch, (), session_id)
                 if stage_profile.profile.protocol == "pi-rpc"
+                or stage_profile.profile.options.get("task_cli")
                 else None
             )
             # open_session 内含 worktree 建立 subprocess（最长 600s）：
@@ -2765,6 +2769,14 @@ class AgentService:
             if now < effective:
                 continue
             if self.store.wake_exists(task["id"], task["waiting_on"]):
+                continue
+            # 机械封顶：worker 侧 task_record 闭环不可靠（模型不调用、或
+            # 运行时没有任务工具），同一时刻最多派发 _TIME_WAKE_MAX_DISPATCHES
+            # 轮真实模型运行，之后只留在面板上等人，绝不 5s 一轮烧钱。
+            if (
+                self.store.wake_dispatch_count(task["id"], task["waiting_on"])
+                >= _TIME_WAKE_MAX_DISPATCHES
+            ):
                 continue
             contact_ids = task["contact_ids"] or [task["contact_id"]]
             self.store.enqueue_wake(

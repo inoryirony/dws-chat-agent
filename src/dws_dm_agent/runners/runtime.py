@@ -879,14 +879,25 @@ class AgentRuntime:
                 stage.profile,
                 *(profiles[name] for name in stage.profile.fallbacks),
             ]:
-                if agent.protocol != _SERVICE_TOOL_PROTOCOL:
+                # task_cli 运行时（如 dsh）由 prompt 指教模型经 bash 拉起
+                # task_tools.py，task_record/task_lookup 与 pi 同通路可用；
+                # report/no_reply 的收口仍只有 pi 通路，不在此放行。
+                cli_capable = bool(agent.options.get("task_cli"))
+                unsupported = {
+                    name
+                    for name in referenced
+                    if agent.protocol != _SERVICE_TOOL_PROTOCOL
+                    and not (cli_capable and name in {"task_record", "task_lookup"})
+                }
+                if unsupported:
                     raise ValueError(
                         f"workflow {active} stage {stage.name} prompts reference "
-                        f"service tools ({', '.join(sorted(referenced))}) but "
+                        f"service tools ({', '.join(sorted(unsupported))}) but "
                         f"agent {agent.name} (protocol {agent.protocol}) cannot "
                         "mount them; use a pi agent for stages whose prompts "
-                        "use these tools, or remove the service-tool "
-                        "instructions from the prompts"
+                        "use these tools, enable options.task_cli for the "
+                        "task_record/task_lookup subset, or remove the "
+                        "service-tool instructions from the prompts"
                     )
         return cls(
             active,
@@ -978,12 +989,15 @@ class AgentRuntime:
             )
         task_context_path: Path | None = None
         report_path: Path | None = None
-        if protocol == "pi-rpc" and task_context is not None:
-            # 事项工具的作用域与运行信息只经环境变量注入 pi_dws_tools.ts，
-            # 不进入 prompt，模型无法伪造其他作用域。DWS_TASK_CONTEXT 是
-            # 会话启动时的初始快照；DWS_TASK_CONTEXT_FILE 指向的文件由
-            # 服务在 steer 后原子重写，task_tools.py 每次调用优先读它，
-            # 证据消息集合随本运行覆盖的消息扩展。
+        if (
+            protocol == "pi-rpc" or stage.profile.options.get("task_cli")
+        ) and task_context is not None:
+            # 事项工具的作用域与运行信息只经环境变量注入执行面（pi 走
+            # pi_dws_tools.ts 扩展；task_cli 运行时由 prompt 指教模型用 bash
+            # 拉起 task_tools.py），不进入 prompt，模型无法伪造其他作用域。
+            # DWS_TASK_CONTEXT 是会话启动时的初始快照；DWS_TASK_CONTEXT_FILE
+            # 指向的文件由服务在 steer 后原子重写，task_tools.py 每次调用
+            # 优先读它，证据消息集合随本运行覆盖的消息扩展。
             environment["DWS_TASK_PYTHON"] = sys.executable
             environment["DWS_TASK_SCRIPT"] = str(
                 Path(__file__).with_name("task_tools.py").resolve()

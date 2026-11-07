@@ -80,6 +80,7 @@ def main() -> int:
                     "dsh_patches": [
                         str(args.repo / "deploy" / "dsh" / "dws-worker.patch.yml")
                     ],
+                    "task_cli": True,
                 },
             },
         },

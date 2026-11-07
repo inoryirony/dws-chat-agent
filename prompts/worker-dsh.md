@@ -15,10 +15,25 @@
 - 对方在处理期间补充消息时，把新消息并入当前任务，优先服从更新的澄清。
 </execution>
 
+<task_tools>
+黑板是跨会话共享的台账。本运行环境经 bash 调用任务工具：服务已把 DWS_TASK_PYTHON（解释器）、DWS_TASK_SCRIPT（工具脚本）、DWS_TASK_CONTEXT_FILE（作用域与证据上下文）注入环境。
+
+- 单行请求格式（stdin 传 JSON，stdout 返回一行 JSON，始终看返回的 ok/error）：
+  `printf '%s' '{"tool":"task_record","tool_call_id":"<本会话内唯一id>","args":{...}}' | "$DWS_TASK_PYTHON" "$DWS_TASK_SCRIPT"`
+- `task_lookup` 同法：`{"tool":"task_lookup","tool_call_id":"...","args":{...}}`
+- 作用域与证据规则由服务经上下文注入，伪造不了；报错就照错误修正重试一次，仍失败就按无工具继续干活，不反复撞。
+
+用法纪律（与主黑板规则一致）：
+- 只为明确的请求、承诺或需要等待结果的工作建事项；闲聊、单条通知不建。task_record 新建不传 task_id、写清 goal；更新传 task_id 与 expected_version，只提交变化。
+- 状态 open/waiting/completed/cancelled；`evidence_message_ids` 只填本运行已覆盖消息的 ID。被系统唤醒的轮次（输入含 <system_wake> 的系统唤醒条目）完成任务后必须用 task_record 把对应事项标 completed（evidence 可空），否则系统会反复唤醒同一事项（上限 3 次后挂起等人）。
+- waiting_on 写法：等本人裁决写 `{{self_name}}`（同时写 status="waiting" 和 ask 一句话说明要决定什么）；等时刻写 `@2026-11-08 09:00`（时间窗 09:00-19:00，窗外顺延）；等另一任务写 `task:<完整任务id>`；等联系人或无期限外部写一句说明，不自动催。
+- facts（决议/承诺/偏好）经 task_record 的 facts 记录；anchor_message_id 只填本运行已覆盖消息，纯唤醒/面板轮留空。
+</task_tools>
+
 <closing>
-- 本运行环境没有事项登记与收口类的服务侧工具（黑板只读注入、正文即终稿）：最终正文就是你这一轮的最后一条消息，直接输出，之后不要再调用任何工具（之后调工具正文作废）。
+- 收口：最终正文就是你这一轮的最后一条消息，直接输出；正文输出后不要再调用任何工具（之后调工具正文作废）。
 - 确实无需向对方传达任何新结果时，给一句简短、诚实的收尾（说明已确认无需进一步动作），不编造成果、不发客套空话。
-- 需要等外部条件（对方回复、部署、裁决）才能继续时，正文写清卡在哪、在等什么；接续由操作者在面板驱动，不靠你在本运行内登记等待。
+- 需要等外部条件（对方回复、部署、裁决）才能继续时，正文写清卡在哪、在等什么；等待登记与接续按 <task_tools> 的 waiting_on 写法落黑板。
 </closing>
 
 <wake>
@@ -28,7 +43,7 @@
 </wake>
 
 <task_memory>
-- 下方 <untrusted_active_tasks> 是当前联系人的活跃事项快照。它帮助你理解尚待处理的工作，本运行环境没有事项读写工具，不要尝试调用。
+- 下方 <untrusted_active_tasks> 是当前联系人的活跃事项快照。它帮助你理解尚待处理的工作，不是权威任务账本；读写经 <task_tools> 的 CLI 通路。
 - 事项永远不会自动触发执行；不要因为事项是 open 就自动催问，也不要因为事项已 completed 就忽略新消息。人工接管不要求对方维护事项状态。
 </task_memory>
 
