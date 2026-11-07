@@ -285,3 +285,75 @@ class SkillsProvisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdapterKindDispatchTests(unittest.TestCase):
+    """adapter.mcp_config 按 StageSpec.kind 分发（不比 stage 名）。
+
+    自定义 triage/executive 槽位与 front/worker 同权：triage 挂 escalate，
+    executive 挂 options.mcp + dws-tools。旧实现按 stage 名字符串比较，
+    自定义槽位会静默丢 MCP——这是回归锁。
+    """
+
+    def _codex_runtime(self, root: Path) -> "AgentRuntime":
+        config = _base_config()
+        config["agents"]["front-agent"]["driver"] = "codex"
+        config["agents"]["front-agent"]["protocol"] = "codex-app-server"
+        config["agents"]["front-agent"]["options"] = {"service_tools_mcp": True}
+        config["agents"]["work-agent"]["driver"] = "codex"
+        config["agents"]["work-agent"]["protocol"] = "codex-app-server"
+        config["agents"]["work-agent"]["options"] = {
+            "mcp": {"grafana-dev": True},
+            "service_tools_mcp": True,
+        }
+        path = _write_config(root, config)
+        return AgentRuntime.from_config(config, path, root)
+
+    def test_custom_triage_slot_mounts_escalate_like_front(self) -> None:
+        stages.register_stage("screener", "triage")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._codex_runtime(root)
+                config = json.loads(
+                    (root / "config.json").read_text(encoding="utf-8")
+                )
+                config["workflows"]["presets"]["default"]["screener"] = {
+                    "agent": "front-agent",
+                    "prompt": "prompts/front.md",
+                }
+                (root / "config.json").write_text(
+                    json.dumps(config, ensure_ascii=False), encoding="utf-8"
+                )
+                runtime = AgentRuntime.from_config(config, root / "config.json", root)
+                prepared = runtime.prepare(
+                    "screener", "front-agent", "prompt", root / "screener-run"
+                )
+                mcp = prepared.result_path.parent / "mcp.json"
+                self.assertTrue(mcp.is_file())
+                self.assertIn("dws-escalate", mcp.read_text(encoding="utf-8"))
+        finally:
+            stages._SLOT_KINDS.pop("screener", None)
+            stages._SLOT_OVERRIDES.pop("screener", None)
+
+    def test_custom_executive_slot_mounts_mcp_like_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = self._codex_runtime(root)
+            config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            config["workflows"]["presets"]["default"]["executor"] = {
+                "agent": "work-agent",
+                "prompt": "prompts/worker.md",
+            }
+            (root / "config.json").write_text(
+                json.dumps(config, ensure_ascii=False), encoding="utf-8"
+            )
+            runtime = AgentRuntime.from_config(config, root / "config.json", root)
+            prepared = runtime.prepare(
+                "executor", "work-agent", "prompt", root / "executor-run"
+            )
+            mcp = prepared.result_path.parent / "mcp.json"
+            self.assertTrue(mcp.is_file())
+            text = mcp.read_text(encoding="utf-8")
+            self.assertIn("grafana-dev", text)
+            self.assertIn("dws-tools", text)

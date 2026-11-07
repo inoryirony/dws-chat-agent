@@ -20,6 +20,7 @@ from .. import stages as stage_registry
 from ..core import MAX_IMAGES, MAX_IMAGE_BYTES, sanitize_text
 from ..skills_catalog import resolve_skills
 from ..prompts import (
+    SHARED_PROMPT_NAME,
     STAGE_PROMPT_VARIABLES,
     SUPPLEMENT_PROMPT_VARIABLES,
     render_prompt as _render_text,
@@ -879,23 +880,34 @@ class AgentRuntime:
                     f"agent {profile.name} references unknown fallback agents: "
                     f"{', '.join(unknown)}"
                 )
-        # 服务工具只在 pi-rpc 挂载。校验按阶段进行：只有该阶段实际看到的
-        # 提示词（阶段提示词，加上会 steer 进任一在跑阶段会话的补充提示词）
-        # 引用了服务工具，该阶段实际执行的 agent（阶段 agent 及其备用链）
-        # 才要求全部是 pi 协议；提示词不引用服务工具的阶段不受影响，可以
-        # 继续使用其他协议。全局合并所有提示词校验会把没有工具指令的阶段
-        # 一并锁死在 pi 上。
+        # 服务工具校验按阶段进行：只有该阶段实际看到的提示词（executive
+        # 阶段的 shared.md 公共段 + 阶段提示词，加上会 steer 进任一在跑
+        # 阶段会话的补充提示词）引用了服务工具，该阶段实际执行的 agent
+        # （阶段 agent 及其备用链）才要求全部能挂载；提示词不引用服务
+        # 工具的阶段不受影响。全局合并所有提示词校验会把没有工具指令
+        # 的阶段一并锁死。挂载通路有三条：pi 原生扩展、service_tools_mcp
+        # （dws-tools stdio server）、task_cli（bash 拉起 task_tools.py，
+        # 覆盖 task_record/task_lookup 子集）。
         supplement_referenced = {
             name
             for name in _SERVICE_TOOL_NAMES
             if name in supplement_prompt_path.read_text(encoding="utf-8")
         }
         for stage in stages.values():
-            referenced = supplement_referenced | {
+            referenced = set(supplement_referenced)
+            referenced.update(
                 name
                 for name in _SERVICE_TOOL_NAMES
                 if name in stage.prompt_path.read_text(encoding="utf-8")
-            }
+            )
+            if stage_registry.stage_spec(stage.name).executive:
+                shared_path = stage.prompt_path.parent / SHARED_PROMPT_NAME
+                if shared_path.is_file():
+                    referenced.update(
+                        name
+                        for name in _SERVICE_TOOL_NAMES
+                        if name in shared_path.read_text(encoding="utf-8")
+                    )
             if not referenced:
                 continue
             for agent in [

@@ -98,6 +98,13 @@ async def _evaluate_case(
                 # 评测联系人不带事项记忆：注入空快照，保持提示词变量契约完整。
                 "active_tasks_json": "[]",
                 "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "skill_humanizer": "",
+                "skill_answer_html": "",
+                "script_am": "",
+                "skills": "",
+                "deliveries_dir": "",
+                "task_memory_limits": "",
+                "wake_example": "",
             },
         )
         started = time.monotonic()

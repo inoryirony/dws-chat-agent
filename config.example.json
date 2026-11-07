@@ -81,7 +81,15 @@
         "mcp": {
           "grafana-dev": true,
           "grafana-prod-logging": true,
-          "hsj-atlassian": true,
+          "hsj-atlassian": {
+            "directTools": [
+              "jira_get_issue",
+              "jira_search",
+              "jira_get_transitions",
+              "confluence_search",
+              "confluence_get_page"
+            ]
+          },
           "engram": true
         },
         "service_tools_mcp": true,
@@ -105,7 +113,15 @@
         "mcp": {
           "grafana-dev": true,
           "grafana-prod-logging": true,
-          "hsj-atlassian": true,
+          "hsj-atlassian": {
+            "directTools": [
+              "jira_get_issue",
+              "jira_search",
+              "jira_get_transitions",
+              "confluence_search",
+              "confluence_get_page"
+            ]
+          },
           "engram": true
         },
         "service_tools_mcp": true,
@@ -157,10 +173,11 @@
               "confluence_search",
               "confluence_get_page"
             ]
-          }
+          },
+          "engram": true
         },
         "skills": [
-          "humanizer-zh",
+          "humanizer_zh",
           "answer_me_with_html"
         ]
       }
@@ -178,13 +195,23 @@
       "worktree_repo": "",
       "options": {
         "dsh_profile": "headless",
-        "dsh_patches": [],
+        "dsh_patches": [
+          "deploy/dsh/dws-worker.patch.yml"
+        ],
         "service_tools_mcp": true,
         "task_cli": true,
         "mcp": {
           "grafana-dev": true,
           "grafana-prod-logging": true,
-          "hsj-atlassian": true,
+          "hsj-atlassian": {
+            "directTools": [
+              "jira_get_issue",
+              "jira_search",
+              "jira_get_transitions",
+              "confluence_search",
+              "confluence_get_page"
+            ]
+          },
           "engram": true
         },
         "skills": [

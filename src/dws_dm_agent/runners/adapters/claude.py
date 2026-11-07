@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from .. import claude as claude_command
 from .. import mcp_catalog
+from ...stages import stage_spec
 
 
 class ClaudeAdapter:
@@ -36,20 +37,26 @@ class ClaudeAdapter:
     def mcp_config(
         self, profile: Any, session_dir: Path, stage_name: str
     ) -> Path | None:
-        # front：escalate 专用 mcp.json，command() 经 --strict-mcp-config
-        # 独占消费（只读前台除了升级别无 MCP）。
-        # worker：options.mcp 目录 server + dws-tools 服务工具，与 pi 的
-        # 挂载面一致；空目录 + 无服务工具时维持不写文件。
-        if stage_name == "front" and profile.read_only:
+        # kind 驱动（不比 stage 名，自定义槽位与 front/worker 同权）：
+        # triage 是 escalate 专用 mcp.json，command() 经 --strict-mcp-config
+        # 独占消费（只读节点除了升级别无 MCP）。
+        # executive：options.mcp 目录 server + dws-tools 服务工具，与 pi
+        # 的挂载面一致；空目录 + 无服务工具时维持不写文件。
+        kind = stage_spec(stage_name).kind
+        if kind == "triage" and profile.read_only:
             return mcp_catalog.write_session_config(
                 session_dir / "mcp.json",
                 servers={},
                 escalate_script=mcp_catalog.escalate_script_path(),
                 auto_enable_codemode=True,
             )
-        if stage_name != "worker":
+        if kind != "executive":
             return None
         servers = mcp_catalog.resolve_servers(profile.options.get("mcp"))
+        servers = {
+            name: mcp_catalog.apply_tool_gate(server)
+            for name, server in servers.items()
+        }
         if profile.options.get("service_tools_mcp"):
             servers["dws-tools"] = mcp_catalog.service_tools_server()
         return mcp_catalog.write_session_config(

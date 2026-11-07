@@ -29,6 +29,7 @@ else:
     import fcntl
 
 from .runners.runtime import AgentRuntime, AgentSession, WorktreeError
+from .runners.task_tools import TASK_MEMORY_LIMITS_TEXT
 from . import stages as stage_registry
 from .channels import channel_for
 from .sources import GitLabSource, JiraSource, SourceItem
@@ -1923,6 +1924,11 @@ class AgentService:
                 )
             ),
             "deliveries_dir": str(self.settings.state_dir / "deliveries"),
+            # 截断上限与唤醒示例：数字与日期不在模板里手写（单源）。
+            "task_memory_limits": TASK_MEMORY_LIMITS_TEXT,
+            "wake_example": datetime.now(self.settings.timezone).strftime(
+                "%Y-%m-%d 09:00"
+            ),
         }
 
     def _render_stage_prompt(
@@ -3006,9 +3012,64 @@ class AgentService:
 
         单事件单事务（store.fan_out_terminal_event）：wakes 生成与事件
         标记 handled 同生共死，处理中崩溃只会整体重试，不会半提交。
+
+        watch 来源（task conversation 是 jira:/gitlab: 前缀）的任务终态
+        额外给本人发一条钉钉 DM：回执评论落在外部系统上，人不看 issue，
+        完成信号必须主动送达（规则 notify="none" 可关）。
         """
         for event in self.store.pending_terminal_events():
+            self._notify_watch_terminal(event, now)
             self.store.fan_out_terminal_event(int(event["id"]), now=now)
+
+    def _notify_watch_terminal(self, event: Mapping[str, Any], now: datetime) -> None:
+        conversation = self.store.task_conversation(str(event["task_id"]))
+        if not conversation.startswith(("jira:", "gitlab:")):
+            return
+        if not self._watch_rule_allows_notify(conversation):
+            return
+        verb = "已完成" if str(event["status"]) == "completed" else "已取消"
+        text = (
+            f"Watch 任务{verb}：{event['goal']}。"
+            f"处理结果已作为评论发回 {conversation.split(':', 1)[1]}。"
+        )
+        notify_self = Contact(
+            alias=self.settings.self_name,
+            display_name=self.settings.self_name,
+            user_id="",
+            open_dingtalk_id=self.settings.self_open_id,
+        )
+        try:
+            send_uuid = f"watch-notify-{event['task_id']}-{event['id']}"
+            delivered = asyncio.get_event_loop().create_task(
+                self.dws.send(notify_self, text, send_uuid)
+            )
+            delivered.add_done_callback(
+                lambda task: LOG.info(
+                    "watch terminal notify task=%s ok=%s",
+                    event["task_id"],
+                    task.result()[0] is not None if not task.exception() else False,
+                )
+            )
+        except Exception:
+            LOG.exception(
+                "watch terminal notify failed task=%s", event["task_id"]
+            )
+
+    def _watch_rule_allows_notify(self, conversation: str) -> bool:
+        """命中任务所属 watch 规则的 notify 开关（缺省 dm 通知本人）。
+
+        规则按 source 对齐 conversation 前缀（jira:/gitlab:），同源全部
+        notify="none" 才静默；有任一默认规则即通知。
+        """
+        source = conversation.split(":", 1)[0]
+        rules = [
+            rule
+            for rule in (self._watch_rules or [])
+            if rule.source == source
+        ]
+        if not rules:
+            return True
+        return any(rule.notify != "none" for rule in rules)
 
     async def _steer_live_session(self, contact_id: str, text: str) -> bool:
         """把唤醒文本 steer 进该联系人正在跑的会话；成功返回 True。

@@ -973,7 +973,7 @@ class PlainAgentFlowTests(unittest.TestCase):
         # 都不再含 JSON Schema 时代的指令。
         shared = (root / "prompts" / "shared.md").read_text(encoding="utf-8")
         self.assertIn("<output_contract>", shared)
-        self.assertIn("最终输出会作为正文发给联系人", shared)
+        self.assertIn("最终输出会作为正文发出", shared)
         self.assertNotIn("最终输出严格符合提供的 JSON Schema", worker)
         self.assertNotIn("最终输出严格符合提供的 JSON Schema", shared)
 
@@ -3710,13 +3710,21 @@ class TaskSnapshotTests(unittest.TestCase):
         worker = (root / "prompts" / "worker.md").read_text(encoding="utf-8")
         supplement = (root / "prompts" / "supplement.md").read_text(encoding="utf-8")
 
-        for name, text in (("front", front), ("worker", worker)):
+        shared = (root / "prompts" / "shared.md").read_text(encoding="utf-8")
+        # worker 收成薄模板：行为段全在 shared.md，数据块留在阶段模板。
+        for name, text in (
+            ("front", front),
+            ("worker", worker),
+            ("shared", shared),
+        ):
             validate_template_variables(text, STAGE_PROMPT_VARIABLES)
+            self.assertNotIn("vision_query", text, name)
+        for name, text in (("front", front), ("shared", shared)):
             self.assertIn("no_reply()", text, name)
             self.assertIn("task_record", text, name)
             self.assertIn("task_lookup", text, name)
-            self.assertIn("{{active_tasks_json}}", text, name)
-            self.assertNotIn("vision_query", text, name)
+        self.assertIn("{{active_tasks_json}}", front)
+        self.assertIn("{{active_tasks_json}}", worker)
         self.assertIn("escalate()", front)
         self.assertIn("no_reply()", supplement)
         self.assertNotIn("vision_query", supplement)

@@ -344,7 +344,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(front["extra_args"], [])
         self.assertTrue(front["read_only"])
         self.assertEqual(front["timeout_seconds"], 0)
-        self.assertIn("Bash/CLI、skills、extensions、MCP", prompt)
+        self.assertIn("Bash/CLI 和已挂载的只读工具", prompt)
         self.assertIn("`glab api` 时必须显式指定 `--method GET`", prompt)
         self.assertIn("工具可见不代表获得写权限", prompt)
         self.assertNotIn("预计耗时", prompt)
@@ -949,6 +949,8 @@ class PiDwsToolsMountTests(unittest.TestCase):
             self.assertTrue((runners_dir / name).is_file(), name)
 
     def test_non_pi_protocols_do_not_receive_task_environment(self) -> None:
+        # task env 注入条件 = pi-rpc / task_cli / service_tools_mcp 任一；
+        # 无任何一条的非 pi 阶段（如 codex front）不注入。
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = AgentRuntimeTests()._runtime(root, "codex")
@@ -961,6 +963,19 @@ class PiDwsToolsMountTests(unittest.TestCase):
 
             self.assertNotIn("DWS_TASK_CONTEXT", front.environment)
             self.assertNotIn("DWS_TASK_SCRIPT", front.environment)
+
+            # service_tools_mcp 打开后，非 pi worker 拿到 task env
+            # （dws-tools 后端经 env 定位作用域与证据上下文）。
+            runtime_mcp = AgentRuntimeTests()._runtime(
+                root / "codex-mcp", "codex",
+                worker_extra={"options": {"service_tools_mcp": True}},
+            )
+            worker = runtime_mcp.prepare(
+                "worker", "worker", "prompt", root / "worker-run",
+                task_context=task_context,
+            )
+            self.assertIn("DWS_TASK_CONTEXT", worker.environment)
+            self.assertIn("DWS_TASK_SCRIPT", worker.environment)
 
 
 class ServiceToolPromptConstraintTests(unittest.TestCase):
