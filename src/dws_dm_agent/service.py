@@ -120,7 +120,14 @@ class _TurnContext:
     只读写本对象，不直接摸循环变量。
     """
 
-    __slots__ = ("batch", "prior_attempt", "attempt", "recent_context", "result")
+    __slots__ = (
+        "batch",
+        "prior_attempt",
+        "attempt",
+        "recent_context",
+        "result",
+        "adopt_session_id",
+    )
 
     def __init__(
         self,
@@ -128,12 +135,16 @@ class _TurnContext:
         prior_attempt: str,
         attempt: int,
         recent_context: Sequence[Mapping[str, str]] = (),
+        adopt_session_id: str | None = None,
     ) -> None:
         self.batch = batch
         self.prior_attempt = prior_attempt
         self.attempt = attempt
         self.recent_context = recent_context
         self.result: AgentResult | None = None
+        # 上一次 supplement_restart 留下的协议会话身份（dsh）：
+        # 重启的 worker 用它 adopt，不再从零冷启。
+        self.adopt_session_id = adopt_session_id
 
 class _BatchOutcome:
     """_handle_batch 一个决策分支的显式结果。
@@ -146,7 +157,14 @@ class _BatchOutcome:
     pipeline step 按事件类型选择性跳过（编排空间的判定基础）。
     """
 
-    __slots__ = ("kind", "batch", "result", "prior_attempt", "pause")
+    __slots__ = (
+        "kind",
+        "batch",
+        "result",
+        "prior_attempt",
+        "pause",
+        "adopt_session_id",
+    )
 
     def __init__(
         self,
@@ -156,6 +174,7 @@ class _BatchOutcome:
         result: "AgentResult | None" = None,
         prior_attempt: str = "",
         pause: bool = True,
+        adopt_session_id: str | None = None,
     ) -> None:
         self.kind = kind
         self.batch = batch
@@ -164,6 +183,9 @@ class _BatchOutcome:
         # supplement 链要过 quiet_window 等对方说完；gate refuse 的
         # supplement 合并原逻辑即回循环顶，不等待。
         self.pause = pause
+        # replan 携带的协议会话身份（dsh supplement_restart）：下一次
+        # worker 启动 --session-id adopt，接上被中止 run 的上下文。
+        self.adopt_session_id = adopt_session_id
 
 
 def _is_synthetic_event(event: IncomingEvent) -> bool:
@@ -342,6 +364,9 @@ class AgentResult:
     # 不可重试的失败（如 worktree 隔离建立失败）：禁止 fallback 链在
     # 未隔离的环境里重试同一段写操作。
     fatal: bool = False
+    # 协议层会话身份（dsh 的 sessionId）：supplement_restart 续跑时
+    # 用它 --session-id adopt，重启的进程接上原有模型上下文而非冷启。
+    protocol_session_id: str = ""
 
     @property
     def outcome(self) -> str:
@@ -1270,16 +1295,20 @@ class AgentService:
     async def _handle_batch(self, initial_batch: list[IncomingEvent]) -> None:
         batch = initial_batch
         prior_attempt = ""
+        # 协议会话身份跨 attempt 存活（dsh supplement_restart 的 adopt 链）。
+        adopt_session_id: str | None = None
         max_replans = int(self.settings.raw.get("max_replans", 5))
         for attempt in range(max_replans):
             outcome = await self._handle_batch_once(
-                batch, prior_attempt, attempt
+                batch, prior_attempt, attempt, adopt_session_id
             )
             if outcome.kind == "stop":
                 return
             if outcome.kind == "replan":
                 batch = outcome.batch or batch
                 prior_attempt = outcome.prior_attempt or prior_attempt
+                if outcome.adopt_session_id:
+                    adopt_session_id = outcome.adopt_session_id
                 if outcome.pause:
                     await asyncio.sleep(self.settings.quiet_window)
                 continue
@@ -1342,10 +1371,14 @@ class AgentService:
         batch: list[IncomingEvent],
         prior_attempt: str,
         attempt: int,
+        adopt_session_id: str | None = None,
     ) -> "_BatchOutcome":
         batch, history, latest_manual = await self._stabilize(batch)
         recent_context, _ = self._recent_context(history, batch)
-        ctx = _TurnContext(batch, prior_attempt, attempt, recent_context)
+        ctx = _TurnContext(
+            batch, prior_attempt, attempt, recent_context,
+            adopt_session_id=adopt_session_id,
+        )
         # 稳定化后人工在接管期：整轮停止，pipeline 不再进入任何 step。
         earliest = min(item.created_at for item in ctx.batch)
         if self._human_owns_conversation(latest_manual, earliest):
@@ -1513,6 +1546,7 @@ class AgentService:
             ctx.batch,
             ctx.prior_attempt,
             recent_context=ctx.recent_context,
+            adopt_session_id=ctx.adopt_session_id,
         )
         if result.consumed_supplements:
             ctx.batch = self._deduplicate(
@@ -1530,8 +1564,11 @@ class AgentService:
             return _BatchOutcome("stop")
         if result.supplements:
             self._record_agent_result(ctx.batch, result, status="stale_supplement")
+            # 协议会话身份留给重启续跑：dsh 的 --session-id adopt 让新进程
+            # 接上被中止 run 的模型上下文，重启不再从零冷启。
             return _BatchOutcome(
                 "replan",
+                adopt_session_id=result.protocol_session_id or None,
                 batch=self._deduplicate([*ctx.batch, *result.supplements]),
                 prior_attempt="对方补充了消息，按新的完整上下文继续。",
             )
@@ -1963,12 +2000,14 @@ class AgentService:
         prior_attempt: str,
         *,
         recent_context: Sequence[Mapping[str, str]] = (),
+        adopt_session_id: str | None = None,
     ) -> AgentResult:
         """按主 worker + fallbacks 链执行；无回复视为该 agent 失败，切换链上下一个。"""
         result = await self._run_agent(
             batch,
             prior_attempt,
             recent_context=recent_context,
+            adopt_session_id=adopt_session_id,
         )
         fallbacks = self.agent_runtime._stage(
             self.agent_runtime.executive_stage()
@@ -2003,6 +2042,7 @@ class AgentService:
                 prior_attempt,
                 recent_context=recent_context,
                 agent_override=agent_name,
+                adopt_session_id=adopt_session_id,
             )
         return result
 
@@ -2014,6 +2054,7 @@ class AgentService:
         front: bool = False,
         recent_context: Sequence[Mapping[str, str]] = (),
         agent_override: str | None = None,
+        adopt_session_id: str | None = None,
     ) -> AgentResult:
         stage = (
             self.agent_runtime.stage_of_kind("triage") or "front"
@@ -2092,6 +2133,7 @@ class AgentService:
                 model_override=model_override,
                 agent_override=agent_override,
                 task_context=task_context,
+                adopt_session_id=adopt_session_id,
             )
             if task_context is not None:
                 # 写入租约先于会话启动登记：task_tools.py 直连审计库的
@@ -2313,6 +2355,9 @@ class AgentService:
                                 consumed.values(), key=lambda item: item.created_at
                             ),
                             error="supplement_restart",
+                            protocol_session_id=str(
+                                session._protocol_state.get("dsh_session_id") or ""
+                            ),
                         )
             if session.silent:
                 # no_reply 是模型的显式控制动作且已成功执行：即使其后出现

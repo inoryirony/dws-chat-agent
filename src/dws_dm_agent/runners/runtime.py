@@ -11,6 +11,7 @@ import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
+from dataclasses import replace as dataclasses_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -1000,6 +1001,7 @@ class AgentRuntime:
         model_override: str | None = None,
         agent_override: str | None = None,
         task_context: Mapping[str, Any] | None = None,
+        adopt_session_id: str | None = None,
     ) -> PreparedAgent:
         stage = self.resolve_stage(stage_name, agent_override)
         spec = stage_registry.stage_spec(stage_name)
@@ -1032,6 +1034,22 @@ class AgentRuntime:
         # mcp_config：dsh 的 session patch 要引用 skills 目录。
         skill_args = _protocol_skill_args(protocol, skills, session_dir)
         _prepare_protocol_skills(protocol, skills, session_dir)
+        if adopt_session_id:
+            # 无 native_steer 的协议（dsh）重启续跑：--session-id adopt 既有
+            # Session，模型上下文不丢。放进 profile.options 而不是加 argv
+            # 参数，是因为 _command 只认 profile——不改每个 adapter 签名。
+            stage = WorkflowStage(
+                name=stage.name,
+                label=stage.label,
+                profile=dataclasses_replace(
+                    stage.profile,
+                    options={
+                        **stage.profile.options,
+                        "dsh_session_arg": adopt_session_id,
+                    },
+                ),
+                prompt_path=stage.prompt_path,
+            )
         mcp_config_path = _prepare_mcp_config(
             stage.profile, protocol, session_dir, stage_name
         )
@@ -1166,6 +1184,7 @@ class AgentRuntime:
         model_override: str | None = None,
         agent_override: str | None = None,
         task_context: Mapping[str, Any] | None = None,
+        adopt_session_id: str | None = None,
     ) -> AgentSession:
         return AgentSession(
             self.prepare(
@@ -1177,6 +1196,7 @@ class AgentRuntime:
                 model_override=model_override,
                 agent_override=agent_override,
                 task_context=task_context,
+                adopt_session_id=adopt_session_id,
             ),
             session_id,
         )

@@ -16,7 +16,7 @@
   "recent_context_messages": 100,
   "recent_context_chars": 12000,
   "monitor_interval_seconds": 5,
-  "max_replans": 5,
+  "max_replans": 12,
   "max_parallel_conversations": 10,
   "max_reply_chars": 4000,
   "rate_limit": {
