@@ -1481,6 +1481,11 @@ class AgentService:
             )
             return _BatchOutcome("stop")
         if front_result.supplements:
+            # 与 executive 的 stale_supplement 同构：前台轮被补充消息作废，
+            # 不记录的话 board_runs 里这行前台会话就成了永远 running 的孤儿。
+            self._record_agent_result(
+                ctx.batch, front_result, status="stale_supplement"
+            )
             return _BatchOutcome(
                 "replan",
                 batch=self._deduplicate([*ctx.batch, *front_result.supplements]),
@@ -1979,6 +1984,13 @@ class AgentService:
                 # silent 与正常回复同为成功终态，不能触发 fallback 兜底发送；
                 # fatal（隔离建立失败等）不允许在未隔离环境重试同一段写操作。
                 return result
+            # 每个被放弃的中间结果都已 register_run 落过黑板行；不在这里
+            # 收口的话，行会永远停在 running（面板显示"跑了两小时"的孤儿）。
+            self.store.close_run(
+                result.session_id,
+                _BOARD_CLOSE_OUTCOME.get(result.outcome, "failed"),
+                now=datetime.now(self.settings.timezone),
+            )
             LOG.warning(
                 "worker fallback engaged agent=%s attempt=%d/%d error=%s",
                 agent_name,
