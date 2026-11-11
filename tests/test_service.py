@@ -1832,8 +1832,8 @@ class WorkerFallbackTests(unittest.TestCase):
         service = self._service_with_chain(("backup-a", "backup-b"))
         calls: list[str | None] = []
 
-        async def fake_run_agent(batch, prior_attempt, *, recent_context=(),
-                                 agent_override=None):
+        async def fake_run_agent(batch, prior_attempt, *, recent_context=(), agent_override=None,
+                                 adopt_session_id=None):
             calls.append(agent_override)
             return self._failed_result()
 
@@ -1849,8 +1849,8 @@ class WorkerFallbackTests(unittest.TestCase):
         service = self._service_with_chain(("backup-a",))
         calls: list[str | None] = []
 
-        async def fake_run_agent(batch, prior_attempt, *, recent_context=(),
-                                 agent_override=None):
+        async def fake_run_agent(batch, prior_attempt, *, recent_context=(), agent_override=None,
+                                 adopt_session_id=None):
             calls.append(agent_override)
             return AgentResult(
                 "session", "这是回复", 0,
@@ -1869,8 +1869,8 @@ class WorkerFallbackTests(unittest.TestCase):
         service = self._service_with_chain(("backup-a",))
         calls: list[str | None] = []
 
-        async def fake_run_agent(batch, prior_attempt, *, recent_context=(),
-                                 agent_override=None):
+        async def fake_run_agent(batch, prior_attempt, *, recent_context=(), agent_override=None,
+                                 adopt_session_id=None):
             calls.append(agent_override)
             return AgentResult(
                 "session", None, None,
@@ -1892,8 +1892,8 @@ class WorkerFallbackTests(unittest.TestCase):
         service = self._service_with_chain(("backup-a",))
         calls: list[str | None] = []
 
-        async def fake_run_agent(batch, prior_attempt, *, recent_context=(),
-                                 agent_override=None):
+        async def fake_run_agent(batch, prior_attempt, *, recent_context=(), agent_override=None,
+                                 adopt_session_id=None):
             calls.append(agent_override)
             return AgentResult(
                 "session", None, None,
@@ -3297,7 +3297,8 @@ class SilentOutcomeTests(unittest.TestCase):
             calls: list[str | None] = []
 
             async def fake_run_agent(batch, prior_attempt, *, front=False,
-                                     recent_context=(), agent_override=None):
+                                     recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
                 calls.append(agent_override)
                 return self._silent_result()
 
@@ -3319,7 +3320,8 @@ class SilentOutcomeTests(unittest.TestCase):
             calls: list[bool] = []
 
             async def fake_run_agent(batch, prior_attempt, *, front=False,
-                                     recent_context=(), agent_override=None):
+                                     recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
                 calls.append(front)
                 return self._silent_result()
 
@@ -3353,7 +3355,8 @@ class SilentOutcomeTests(unittest.TestCase):
             calls: list[str | None] = []
 
             async def fake_run_agent(batch, prior_attempt, *, front=False,
-                                     recent_context=(), agent_override=None):
+                                     recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
                 calls.append(agent_override)
                 return self._silent_result()
 
@@ -3449,7 +3452,8 @@ class StreamingCardDeferralTests(unittest.TestCase):
 
     def _run(self, service: AgentService, result: AgentResult) -> None:
         async def fake_run_agent(batch, prior_attempt, *, front=False,
-                                 recent_context=(), agent_override=None):
+                                 recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
             return result
 
         with patch.object(AgentService, "_run_agent", side_effect=fake_run_agent):
@@ -3539,7 +3543,8 @@ class StreamingCardDeferralTests(unittest.TestCase):
             )
 
             async def fake_run_agent(batch, prior_attempt, *, front=False,
-                                     recent_context=(), agent_override=None):
+                                     recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
                 return AgentResult("session-reply", "最终正文", 0, at, at)
 
             with patch.object(AgentService, "_run_agent",
@@ -3563,7 +3568,8 @@ class StreamingCardDeferralTests(unittest.TestCase):
             self.assertEqual([tuple(row) for row in delivery], [("cancelled", None)])
 
             async def fake_silent_agent(batch, prior_attempt, *, front=False,
-                                        recent_context=(), agent_override=None):
+                                        recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
                 return AgentResult(
                     "session-silent", None, 0, at, at, silent=True
                 )
@@ -3603,7 +3609,8 @@ class StreamingCardDeferralTests(unittest.TestCase):
             at = datetime.now(TZ)
 
             async def fake_run_agent(batch, prior_attempt, *, front=False,
-                                     recent_context=(), agent_override=None):
+                                     recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
                 return AgentResult("session-silent", None, 0, at, at, silent=True)
 
             with patch.object(AgentService, "_run_agent",
@@ -3632,7 +3639,8 @@ class StreamingCardDeferralTests(unittest.TestCase):
             at = datetime.now(TZ)
 
             async def fake_run_agent(batch, prior_attempt, *, front=False,
-                                     recent_context=(), agent_override=None):
+                                     recent_context=(), agent_override=None,
+                                     adopt_session_id=None):
                 return AgentResult(
                     "session-manual", None, 0, at, at, manual_takeover=True
                 )

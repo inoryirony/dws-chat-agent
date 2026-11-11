@@ -105,14 +105,36 @@ def service_tools_server() -> dict[str, Any]:
 
 def _yaml_scalar(value: Any) -> str:
     """标量安全序列化：字符串走 JSON 双引号（JSON 字符串是合法 YAML
-    标量），布尔/数字直写，列表转 JSON 流序列。"""
+    标量），布尔/数字直写，列表/字典转 JSON 流序列——dsh 对 headers
+    等 config 字段校验的是结构化对象，序列化成 Python repr 字符串会
+    整条 MCP 声明激活失败（曾让 engram 每次启动都挂）。"""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
+    if isinstance(value, Mapping):
+        return json.dumps(
+            {str(k): _yaml_scalar_item(v) for k, v in value.items()},
+            ensure_ascii=False,
+        )
     if isinstance(value, (list, tuple)):
-        return json.dumps([str(item) for item in value], ensure_ascii=False)
+        return json.dumps(
+            [_yaml_scalar_item(item) for item in value], ensure_ascii=False
+        )
     return json.dumps(str(value), ensure_ascii=False)
+
+
+def _yaml_scalar_item(value: Any) -> Any:
+    """JSON 值递归归一：JSON 能表达的类型原样，其余降级为字符串。"""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _yaml_scalar_item(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_yaml_scalar_item(item) for item in value]
+    return str(value)
 
 
 def write_dsh_session_patch(
