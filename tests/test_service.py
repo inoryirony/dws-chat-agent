@@ -35,6 +35,7 @@ from dws_dm_agent.service import (
     AgentResult,
     AgentService,
     DwsClient,
+    _TurnContext,
     _apply_image_context,
     _find_dws_error_code,
     _load_timezone,
@@ -1817,6 +1818,8 @@ class WorkerFallbackTests(unittest.TestCase):
                 )
             )
         )
+        service.settings = SimpleNamespace(timezone=TZ)
+        service.store = Mock()
         return service
 
     def _failed_result(self) -> AgentResult:
@@ -1906,6 +1909,74 @@ class WorkerFallbackTests(unittest.TestCase):
 
         self.assertTrue(result.fatal)
         self.assertEqual(calls, [None])
+
+    def test_fallback_closes_abandoned_board_run_before_retry(self) -> None:
+        # 中间结果被链丢弃前必须 close_run：register_run 已落黑板行，
+        # 不收口就永远 running（面板"跑了两小时"孤儿）。
+        service = self._service_with_chain(("backup-a",))
+        sessions = ["session-primary", "session-backup"]
+        outcomes: list[tuple[str, str]] = []
+        calls: list[str | None] = []
+
+        async def fake_run_agent(batch, prior_attempt, *, recent_context=(), agent_override=None,
+                                 adopt_session_id=None):
+            session_id = sessions[len(calls)]
+            calls.append(agent_override)
+            if agent_override is None:
+                return AgentResult(
+                    session_id, None, None,
+                    datetime.now(TZ), datetime.now(TZ), error="agent_result_missing",
+                )
+            return AgentResult(
+                session_id, "兜底成功", 0,
+                datetime.now(TZ), datetime.now(TZ),
+            )
+
+        def fake_close_run(session_id, outcome, *, now):
+            outcomes.append((session_id, outcome))
+
+        calls.clear()
+        service.store.close_run.side_effect = fake_close_run
+        with patch.object(AgentService, "_run_agent", side_effect=fake_run_agent):
+            result = asyncio.run(
+                service._run_worker_with_fallback([self._event()], "")
+            )
+
+        self.assertEqual(result.reply, "兜底成功")
+        self.assertEqual(calls, [None, "backup-a"])
+        self.assertEqual(outcomes, [("session-primary", "failed")])
+
+    def test_front_supplement_replan_closes_front_board_run(self) -> None:
+        # 前台轮被补充消息作废走 replan 时，前台会话的 board_runs 行
+        # 必须收口，否则永远停在 running 显示成孤儿。
+        service = object.__new__(AgentService)
+        service.settings = SimpleNamespace(timezone=TZ)
+        service.store = Mock()
+        recorded: list[tuple[str, str]] = []
+
+        def fake_record(batch, result, *, status):
+            recorded.append((result.session_id, status))
+
+        front_result = AgentResult(
+            "session-front", None, None,
+            datetime.now(TZ), datetime.now(TZ),
+            supplements=[self._event()],
+        )
+        ctx = _TurnContext([self._event()], "", 0)
+
+        async def fake_run_agent(batch, prior_attempt, *, front=False,
+                                 recent_context=(), agent_override=None,
+                                 adopt_session_id=None):
+            return front_result
+
+        with patch.object(AgentService, "_run_agent", side_effect=fake_run_agent), \
+             patch.object(AgentService, "_set_runtime"), \
+             patch.object(AgentService, "_record_agent_result", side_effect=fake_record), \
+             patch("dws_dm_agent.service._image_resources", return_value=()):
+            outcome = asyncio.run(service._step_triage(ctx))
+
+        self.assertEqual(outcome.kind, "replan")
+        self.assertEqual(recorded, [("session-front", "stale_supplement")])
 
 
 
