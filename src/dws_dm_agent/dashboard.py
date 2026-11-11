@@ -840,12 +840,20 @@ class DashboardServer:
                 self.send_error(404)
 
             def _origin_allowed(self) -> bool:
+                # CSRF 防护的实际语义是"Origin 与请求到达的本服务同源"。
+                # 逐字白名单（127.0.0.1:port / localhost:port）在 port=0
+                # 随机绑定（self.port 不回填真实端口）与非 loopback 访问面
+                # （手机隧道、本机 IP）下全数误拒——面板写操作 403
+                # "不允许的请求来源"就是这里发出来的。凭据校验另有
+                # _operator_authorized，此处只管来源。
                 origin = self.headers.get("Origin")
-                allowed_origins = {
-                    dashboard.url,
-                    f"http://localhost:{dashboard.port}",
-                }
-                return not origin or origin in allowed_origins
+                if not origin:
+                    return True
+                host = self.headers.get("Host", "")
+                if not host:
+                    return False
+                origin_host = urlsplit(origin).netloc
+                return secrets.compare_digest(origin_host, host)
 
             def _operator_authorized(self) -> bool:
                 supplied = self.headers.get("X-Operator-Token", "")
@@ -1025,6 +1033,9 @@ class DashboardServer:
                 return
 
         self.server = LocalThreadingHTTPServer((self.host, self.port), Handler)
+        # port=0 随机绑定后回填真实端口：url/tokened_url 与日志里的入口
+        # 才能用（verify_launch 靠 READY 行拿随机端口）。
+        self.port = self.server.server_address[1]
         self.thread = threading.Thread(
             target=self.server.serve_forever,
             name="dws-agent-dashboard",

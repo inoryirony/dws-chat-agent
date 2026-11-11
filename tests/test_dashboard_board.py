@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from dws_dm_agent.config import Settings
@@ -264,6 +265,41 @@ class BoardEndpointTests(unittest.TestCase):
                 "/api/task/answer",
                 {"task_id": 7, "answer": "同意"},
                 origin="https://outside.example",
+                token=self.server_ref.operator_token,
+            )
+        self.assertEqual(raised.exception.code, 403)
+        self.assertEqual(service.calls, [])
+
+    def test_board_write_allows_same_origin_via_host(self) -> None:
+        # port=0 随机绑定 + 任意访问面（隧道域名）下，Origin 与请求 Host
+        # 同源即放行——否则面板写操作一律 403"不允许的请求来源"。
+        service = FakeService()
+        base = self.start_server(service)
+        parsed = urlsplit(base)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        result = self.post_json(
+            base,
+            "/api/task/answer",
+            {"task_id": 7, "answer": "同意"},
+            origin=origin,
+            token=self.server_ref.operator_token,
+        )
+        self.assertEqual(result.get("ok"), True)
+        self.assertEqual(len(service.calls), 1)
+        # 隧道域名：Host 跟随请求地址，同源放行。
+        self.assertEqual(
+            self.server_ref.port, self.server_ref.server.server_address[1]
+        )
+
+    def test_board_write_rejects_origin_host_mismatch(self) -> None:
+        service = FakeService()
+        base = self.start_server(service)
+        with self.assertRaises(HTTPError) as raised:
+            self.post_json(
+                base,
+                "/api/task/answer",
+                {"task_id": 7, "answer": "同意"},
+                origin="http://127.0.0.1:1",
                 token=self.server_ref.operator_token,
             )
         self.assertEqual(raised.exception.code, 403)
