@@ -30,7 +30,9 @@ from dws_dm_agent.runners import task_tools
 from dws_dm_agent.service import AgentService, AgentResult
 
 TZ = ZoneInfo("Asia/Shanghai")
-NOW = datetime(2026, 11, 7, 10, 0, tzinfo=TZ)
+# 动态合成时钟：board_snapshot/自动归档内部用真实时钟开窗口（24h 最近
+# 完成、inactive_days 归档），写死日期会让用例在日期过期后成批炸掉。
+NOW = datetime.now(TZ).replace(microsecond=0)
 ALICE = Contact("alice", "Alice", "user-alice", "open-alice")
 BOB = Contact("bob", "Bob", "user-bob", "open-bob")
 SELF_OPEN_ID = "self-open"
