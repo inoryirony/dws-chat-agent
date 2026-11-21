@@ -1,0 +1,24 @@
+docs/meeting-assistant-design-20261115.md
+  d895e234fa74da88 1-313
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "bcc45be7dbbbe3484a9970c3fd216ca413952467",
+  "prompts": {
+    "d895e234fa74da88": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1f341-1fc0-7e72-b447-ba61c0b095c2",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Codex",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 313,
+      "overriden_lines": 0,
+      "messages_url": "https://git-ai.hsjdata.com/cas/cb773493bec2b8f522633dd1db2ea24e0531818431d21265ed8696da282cf813"
+    }
+  }
+}
