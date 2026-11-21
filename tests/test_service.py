@@ -1812,7 +1812,7 @@ class PlainAgentFlowTests(unittest.TestCase):
             receipt = service.store.delivery_receipts()[0]
             self.assertEqual(receipt["delivery_status"], "remote_uncertain")
             self.assertEqual(receipt["receipt_status"], "remote_uncertain")
-            self.assertIn("operator", receipt["last_error"])
+            self.assertIn("needs_operator_reconciliation: legacy_row_without_marker", receipt["last_error"])
             service.store.close()
 
     def test_reconciled_external_receipt_confirms_without_post(self) -> None:
@@ -1937,7 +1937,7 @@ class PlainAgentFlowTests(unittest.TestCase):
             external.send.assert_not_awaited()
             receipt = service.store.delivery_receipts()[0]
             self.assertEqual(receipt["delivery_status"], "cancelled")
-            self.assertIn("authority", receipt["last_error"])
+            self.assertIn("watch_authority_revoked", receipt["last_error"])
             service.store.close()
 
     def test_persisted_supplement_cancels_pending_external_comment(self) -> None:
@@ -2098,7 +2098,7 @@ class PlainAgentFlowTests(unittest.TestCase):
             service.dws.send.assert_not_awaited()
             receipt = service.store.delivery_receipts()[0]
             self.assertEqual(receipt["delivery_status"], "cancelled")
-            self.assertIn("authority", receipt["last_error"])
+            self.assertIn("watch_authority_revoked", receipt["last_error"])
             service.store.close()
 
     def test_revoked_inflight_watch_notification_stays_uncertain_without_resend(self) -> None:
@@ -2131,7 +2131,7 @@ class PlainAgentFlowTests(unittest.TestCase):
             receipt = service.store.delivery_receipts()[0]
             self.assertEqual(receipt["delivery_status"], "remote_uncertain")
             self.assertEqual(receipt["receipt_status"], "remote_uncertain")
-            self.assertIn("authority", receipt["last_error"])
+            self.assertIn("needs_operator_reconciliation: watch_authority_revoked_inflight", receipt["last_error"])
             service.store.close()
 
     def test_manual_takeover_cancels_pending_delivery(self) -> None:

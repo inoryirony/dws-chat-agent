@@ -1013,6 +1013,8 @@ class AuditStore:
         event_ids: Sequence[str],
     ) -> tuple[str, str]:
         """Persist one reviewed MR-head merge intent after fencing its live run."""
+        from .channels.gitlab_merge import _merge_targets
+
         normalized_host = _normalize_gitlab_host(host)
         conversation_id = f"gitlab:{project}!{iid}"
         if (
@@ -1030,7 +1032,7 @@ class AuditStore:
             or not watch_authority
             or not assessment.strip()
             or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_sha)
-            or target_ref not in {"dev", "main"}
+            or target_ref not in _merge_targets()
             or list(event_ids) != [source_event.message_id]
         ):
             raise ValueError("merge_source_mismatch")

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
+
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,14 +23,14 @@ PROJECT = "team/repo"
 CONVERSATION = f"gitlab:{PROJECT}!7"
 
 
-def _rule() -> WatchRule:
+def _rule(merge_targets: tuple[str, ...] = ("main",)) -> WatchRule:
     return WatchRule(
         name="merge",
         source="gitlab",
         instruction="review",
         projects=(PROJECT,),
         notify="none",
-        merge_targets=("main",),
+        merge_targets=merge_targets,
     )
 
 
@@ -74,6 +77,65 @@ def _store_with_merge(path: Path) -> tuple[AuditStore, IncomingEvent, WatchRule,
     )
     assert status == "pending"
     return store, event, rule, action_id
+
+
+def test_store_rejects_target_outside_configured_merge_targets(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = AuditStore(Path(tmp) / "store.db", self_id="self")
+        rule = _rule(merge_targets=("test",))
+        event = IncomingEvent(
+            event_id="event-1",
+            message_id="message-1",
+            conversation_id=CONVERSATION,
+            contact=Contact("mr", "MR", CONVERSATION, ""),
+            content="review",
+            created_at=NOW,
+            origin="watch-gitlab",
+            watch_authority=rule.authority_key,
+            source_revision=HEAD_SHA,
+            target_branch="test",
+        )
+        assert store.claim_event(event)
+        store.register_task_run("run-1", NOW)
+        store.register_run(
+            "run-1",
+            contact_id=CONVERSATION,
+            stage="executive",
+            now=NOW,
+            event_ids=[event.message_id],
+        )
+        # env 未放宽时，store 层拒绝 test 目标（与 client 层同源判定）。
+        monkeypatch.delenv("GITLAB_MERGE_TARGETS", raising=False)
+        with pytest.raises(ValueError, match="merge_source_mismatch"):
+            store.enqueue_gitlab_merge(
+                event,
+                host="git.example.com",
+                project=PROJECT,
+                iid=7,
+                source_ref="feature",
+                target_ref="test",
+                expected_sha=HEAD_SHA,
+                assessment="reviewed",
+                watch_authority=rule.authority_key,
+                session_id="run-1",
+                event_ids=[event.message_id],
+            )
+        # env 放宽后，store 层与 client 层放行一致。
+        monkeypatch.setenv("GITLAB_MERGE_TARGETS", "test,dev,main")
+        action_id, status = store.enqueue_gitlab_merge(
+            event,
+            host="git.example.com",
+            project=PROJECT,
+            iid=7,
+            source_ref="feature",
+            target_ref="test",
+            expected_sha=HEAD_SHA,
+            assessment="reviewed",
+            watch_authority=rule.authority_key,
+            session_id="run-1",
+            event_ids=[event.message_id],
+        )
+        assert status == "pending"
 
 
 def _service(store: AuditStore, rule: WatchRule) -> AgentService:
