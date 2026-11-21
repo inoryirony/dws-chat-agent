@@ -188,11 +188,10 @@ const taskLookup = defineTool({
 	name: "task_lookup",
 	label: "Read the board",
 	description:
-		"Read the task board across contacts: open/waiting tasks by default, " +
+		"Read tasks visible in this source conversation: open/waiting by default, " +
 		"completed/cancelled with include_done=true (for later follow-ups), " +
 		"archived tasks with include_archived=true (needed to restore one). " +
-		"Filter by a contact_id from a previous result to see one contact's " +
-		"tasks. Each task carries its latest facts; looking up does not " +
+		"Each task carries its latest visible facts; looking up does not " +
 		"extend a task's lifetime.",
 	parameters: Type.Object(
 		{
@@ -302,4 +301,15 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(taskRecord);
 	pi.registerTool(taskLookup);
 	pi.registerTool(report);
+	if (JSON.parse(process.env.DWS_TASK_CONTEXT || "{}").merge_review) {
+		pi.registerTool(defineTool({
+			name: "gitlab_merge_request",
+			label: "Request reviewed GitLab merge",
+			description: "Queue the reviewed MR for the service to recheck and merge. Explain why its complete diff is small and focused. Queued is not confirmation.",
+			parameters: Type.Object({ assessment: Type.String({ minLength: 1, maxLength: 1000 }) }, { additionalProperties: false }),
+			async execute(toolCallId: string, params: { assessment: string }) {
+				return textResult(await callTaskTool({ tool: "gitlab_merge_request", tool_call_id: toolCallId, args: params }));
+			},
+		}));
+	}
 }

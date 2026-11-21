@@ -271,6 +271,73 @@ class AgentRuntimeTests(unittest.TestCase):
                 description["availableAgents"][0]["launchCommand"], ["ccr", "code"]
             )
 
+    def test_configured_pi_worker_keeps_shell_extensions_mcp_and_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = self._runtime(root, "pi")
+            raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            raw["agents"]["worker-agent"]["options"] = {
+                "tools": "read,bash,edit,write",
+                "extensions": [
+                    "/tmp/project-extension.ts",
+                    "/tmp/pi-mcp-adapter/index.ts",
+                ],
+                "mcp": {
+                    "project-tools": {
+                        "command": "/tmp/project-mcp",
+                        "directTools": ["project_test"],
+                    }
+                },
+            }
+            raw["agents"]["worker-agent"]["extra_args"] = ["--custom-project-flag"]
+            raw["agents"]["backup-agent"] = {
+                **raw["agents"]["worker-agent"],
+                "driver": "codex",
+                "binary": "codex",
+            }
+            raw["agents"]["worker-agent"]["fallbacks"] = ["backup-agent"]
+            runtime = AgentRuntime.from_config(raw, root / "config.json", root)
+
+            prepared = runtime.prepare("worker", "jira-run", "prompt", root / "run")
+
+            tools = prepared.argv[prepared.argv.index("--tools") + 1].split(",")
+            self.assertIn("bash", tools)
+            self.assertIn("edit", tools)
+            self.assertIn("/tmp/project-extension.ts", prepared.argv)
+            self.assertIn("--custom-project-flag", prepared.argv)
+            self.assertEqual(
+                prepared.stage.profile.options["mcp"],
+                {
+                    "project-tools": {
+                        "command": "/tmp/project-mcp",
+                        "directTools": ["project_test"],
+                    }
+                },
+            )
+            self.assertEqual(prepared.stage.profile.fallbacks, ("backup-agent",))
+
+    def test_configured_non_pi_worker_profile_and_fallback_are_not_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._runtime(root, "codex")
+            raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            raw["agents"]["worker-agent"]["options"]["service_tools_mcp"] = True
+            raw["agents"]["backup-agent"] = {
+                **raw["agents"]["worker-agent"],
+                "model": "backup-model",
+            }
+            raw["agents"]["worker-agent"]["fallbacks"] = ["backup-agent"]
+            runtime = AgentRuntime.from_config(raw, root / "config.json", root)
+
+            prepared = runtime.prepare(
+                "worker", "jira-non-pi-run", "prompt", root / "run"
+            )
+
+            self.assertEqual(prepared.protocol, "codex-app-server")
+            self.assertEqual(prepared.thread_options["sandbox"], "workspace-write")
+            self.assertTrue(prepared.stage.profile.options["service_tools_mcp"])
+            self.assertEqual(prepared.stage.profile.fallbacks, ("backup-agent",))
+
     def test_front_mounts_escalate_adapter_and_worker_stays_plain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

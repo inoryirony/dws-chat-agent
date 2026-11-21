@@ -27,10 +27,14 @@ config 形态（service 层读 raw["watches"]）：
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
+from .channels.gitlab_merge import _merge_targets
 from .sources.base import SourceItem
+from .sources.registry import SOURCE_TYPES
 
 
 @dataclass(frozen=True)
@@ -44,10 +48,19 @@ class WatchRule:
     # 终态通知：命中任务完成/取消后给本人发钉钉 DM（人不看 issue，完成
     # 信号必须主动送达）。"none" 关闭通知；缺省即通知。
     notify: str = "dm"
+    merge_targets: tuple[str, ...] = ()
 
     @property
     def origin(self) -> str:
         return f"watch-{self.source}"
+
+    @property
+    def authority_key(self) -> str:
+        fields = asdict(self)
+        if not self.merge_targets:
+            fields.pop("merge_targets")  # Preserve authority for existing review-only rules.
+        snapshot = json.dumps(fields, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(snapshot.encode()).hexdigest()
 
 
 def parse_watches(raw: Any) -> list[WatchRule]:
@@ -65,12 +78,25 @@ def parse_watches(raw: Any) -> list[WatchRule]:
         instruction = str(entry.get("instruction") or "")
         if not source:
             raise ValueError("watch entry requires a source")
+        if source not in SOURCE_TYPES:
+            raise ValueError(
+                f"watch {name!r}: unknown source {source!r}; "
+                f"known: {sorted(SOURCE_TYPES)}"
+            )
         if not instruction:
             raise ValueError(f"watch {name!r} requires an instruction")
         notify = str(entry.get("notify") or "dm")
         if notify not in {"dm", "none"}:
             raise ValueError(f"watch {name!r} notify must be 'dm' or 'none'")
         projects = tuple(str(item) for item in (entry.get("projects") or []))
+        merge_targets = entry.get("merge_targets", [])
+        if not isinstance(merge_targets, list) or any(branch not in _merge_targets() for branch in merge_targets):
+            raise ValueError(
+                f"watch {name!r}: merge_targets must be a list of branches from "
+                f"GITLAB_MERGE_TARGETS (default dev/main)"
+            )
+        if merge_targets and (source != "gitlab" or not projects):
+            raise ValueError(f"watch {name!r}: merge_targets requires an explicit GitLab project list")
         rules.append(
             WatchRule(
                 name=name,
@@ -79,6 +105,7 @@ def parse_watches(raw: Any) -> list[WatchRule]:
                 jql=str(entry.get("jql") or ""),
                 projects=projects,
                 notify=notify,
+                merge_targets=tuple(sorted(set(merge_targets))),
             )
         )
     return rules

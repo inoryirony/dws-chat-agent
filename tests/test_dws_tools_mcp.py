@@ -45,6 +45,19 @@ class DwsToolsMcpTests(unittest.TestCase):
             names, {"no_reply", "report", "task_record", "task_lookup"}
         )
 
+    def test_reviewed_gitlab_context_exposes_merge_action(self) -> None:
+        responses = _run_server(
+            [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}],
+            env_extra={
+                "DWS_TASK_CONTEXT": json.dumps(
+                    {"merge_review": {"message_id": "gitlab:event-1"}}
+                )
+            },
+        )
+
+        names = {tool["name"] for tool in responses[0]["result"]["tools"]}
+        self.assertIn("gitlab_merge_request", names)
+
     def test_no_reply_returns_ok_without_context(self) -> None:
         responses = _run_server(
             [

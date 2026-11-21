@@ -21,7 +21,10 @@ class Channel(Protocol):
     name: str
     # 能力位：False 时 service 层跳过对应分支（卡片/表情/文件/新鲜度）。
     streaming_cards: bool
+    processing_reactions: bool
     supports_freshness: bool
+    retry_safe: bool
+    supports_reconciliation: bool
 
     async def send(
         self, contact: Contact, content: str, send_uuid: str
@@ -33,18 +36,25 @@ class Channel(Protocol):
         """会话历史；manual 信号检测与补充消息检查的数据源。"""
         ...
 
+    async def find_receipt(self, contact: Contact, send_uuid: str) -> str | None:
+        """Return the remote id for a previously accepted logical action."""
+        ...
+
 
 def channel_for(conversation_id: str, default: Channel) -> Channel:
     """按 conversation_id 前缀选投递通道。
 
-    `jira:` / `gitlab:` 前缀映射到对应实现；由 service 在构造时把注册表
-    传进来（这里只做名字解析，避免 import 环）。
+    `jira:` / `gitlab:` 前缀映射到对应实现，空前缀 / `dm:` / `panel:`
+    走恒等工厂返回 default。未登记的非空前缀直接抛错——静默落到默认
+    通道会把外部系统的消息投给钉钉。registry 惰性 import，避免环。
     """
     from .registry import CHANNEL_PREFIXES
 
     prefix = conversation_id.split(":", 1)[0] + ":" if ":" in conversation_id else ""
-    channel = CHANNEL_PREFIXES.get(prefix)
-    return channel if channel is not None else default
+    factory = CHANNEL_PREFIXES.get(prefix)
+    if factory is None:
+        raise ValueError(f"unregistered channel prefix: {prefix}")
+    return factory(default)
 
 
 __all__ = ["Channel", "channel_for"]

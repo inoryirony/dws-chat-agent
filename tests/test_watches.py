@@ -77,6 +77,62 @@ class ParseWatchesTests(unittest.TestCase):
         self.assertIsNone(rule_for_item(rules, _item("OTHER-9")))
         self.assertIsNone(rule_for_item(rules, _item("1", source="gitlab")))
 
+    def test_unknown_source_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown source 'sms'"):
+            parse_watches([{"source": "sms", "instruction": "i"}])
+
+
+class ChannelRegistryTests(unittest.TestCase):
+    """前缀 → 通道：未知前缀必须炸；dws 默认由恒等工厂显式表达。"""
+
+    def _dws(self):
+        return SimpleNamespace()
+
+    def test_unknown_prefix_raises(self) -> None:
+        from dws_dm_agent.channels import channel_for
+
+        with self.assertRaisesRegex(ValueError, "unregistered channel prefix"):
+            channel_for("http://evil", self._dws())
+
+    def test_dm_and_empty_prefix_resolve_to_dws(self) -> None:
+        from dws_dm_agent.channels import channel_for
+
+        dws = self._dws()
+        self.assertIs(channel_for("dm:alice", dws), dws)
+        self.assertIs(channel_for("", dws), dws)
+        self.assertIs(channel_for("panel:x", dws), dws)
+
+    def test_external_channels_never_stream_cards(self) -> None:
+        from dws_dm_agent.channels import channel_for
+
+        dws = self._dws()
+        dws.streaming_cards = True
+        self.assertIs(channel_for("jira:PROJ-1", dws).streaming_cards, False)
+        self.assertIs(channel_for("gitlab:g/p!1", dws).streaming_cards, False)
+
+    def test_read_path_degrades_to_dws_on_unknown_prefix(self) -> None:
+        """读历史遇到未注册前缀降级到 dws；发送路径仍 fail loud。"""
+        import asyncio
+
+        from dws_dm_agent.core import Contact
+        from dws_dm_agent.service import AgentService
+
+        class _FakeDws:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def history(self, contact):
+                self.calls += 1
+                return []
+
+        service = AgentService.__new__(AgentService)
+        service.dws = _FakeDws()
+        contact = Contact(
+            alias="someone", display_name="someone", user_id="u1", open_dingtalk_id=""
+        )
+        self.assertEqual(asyncio.run(service._history(contact, "legacy:abc")), [])
+        self.assertEqual(service.dws.calls, 1)
+
 
 class WatchHitTests(unittest.TestCase):
     def _service(self, root: Path):
@@ -114,8 +170,8 @@ class WatchHitTests(unittest.TestCase):
             queued: list[IncomingEvent] = []
             service._enqueue = lambda event: queued.append(event)
 
-            asyncio.run(service._handle_watch_hit("jira", _item()))
-            asyncio.run(service._handle_watch_hit("jira", _item()))
+            asyncio.run(service._handle_watch_hit(service._watch_rules[0], _item()))
+            asyncio.run(service._handle_watch_hit(service._watch_rules[0], _item()))
 
             from dws_dm_agent.core import IncomingEvent as E
 
@@ -139,6 +195,43 @@ class WatchHitTests(unittest.TestCase):
         service.stop_event = asyncio.Event()
         self.assertIsNone(asyncio.run(service._consume_watches()))
         service.store.close()
+
+    def test_two_goals_on_one_issue_remain_independent_across_repoll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(Path(tmp))
+            self.addCleanup(service.store.close)
+            service._enqueue = Mock()
+            item = _item()
+            rules = parse_watches([
+                {"source": "jira", "name": "修复", "instruction": "修复并验证问题"},
+                {"source": "jira", "name": "客户说明", "instruction": "准备面向客户的说明"},
+            ])
+            for rule in rules * 2:
+                asyncio.run(service._handle_watch_hit(rule, item))
+            first, second = [call.args[0] for call in service._enqueue.call_args_list]
+            self.assertEqual(first.conversation_id, second.conversation_id)
+            self.assertNotEqual(first.message_id, second.message_id)
+            self.assertEqual({first.watch_authority, second.watch_authority}, {r.authority_key for r in rules})
+            tasks = service.store.board_tasks()
+            self.assertEqual({task["goal"].split(":")[0] for task in tasks}, {"客户说明", "修复"})
+            for task in tasks:
+                source, = service.store.task_sources(task["id"])
+                self.assertEqual(source["conversation_id"], item.conversation_id)
+
+    def test_upgrade_does_not_restart_a_watch_goal_already_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(Path(tmp))
+            self.addCleanup(service.store.close)
+            service._enqueue = Mock()
+            item = _item()
+            rule = service._watch_rules[0]
+            old = IncomingEvent("old-watch", item.dedup_key, item.conversation_id, item.contact,
+                                f"【Watch 命中：{rule.name}】{item.title}", item.created_at)
+            service.store.claim_event(old)
+            service.store.connection.execute("UPDATE events SET input_v1 = NULL")
+            service.store.connection.commit()
+            asyncio.run(service._handle_watch_hit(rule, item))
+            service._enqueue.assert_not_called()
 
 
 class GitLabSourceTests(unittest.TestCase):
@@ -204,82 +297,188 @@ class WatchNotifyTests(unittest.TestCase):
                 {"source": "jira", "instruction": "处理。", "notify": "sms"},
             ])
 
-    def test_rule_allows_notify_by_source(self) -> None:
-        import asyncio
+    def test_rule_allows_notify_by_linked_watch_authority(self) -> None:
         from types import SimpleNamespace
         from dws_dm_agent.service import AgentService
         from dws_dm_agent.watches import WatchRule
 
         rules = [
             WatchRule(name="r1", source="jira", instruction="x", notify="none"),
+            WatchRule(name="r2", source="jira", instruction="y", notify="dm"),
         ]
-        service = SimpleNamespace(_watch_rules=rules)
-        # 同源唯一规则 notify=none：静默。
-        self.assertFalse(
-            AgentService._watch_rule_allows_notify(service, "jira:ZKAI-1")
-        )
-        # 不同源（无规则声明）：默认通知。
-        self.assertTrue(
-            AgentService._watch_rule_allows_notify(service, "gitlab:x!1")
-        )
-        service._watch_rules = rules + [
-            WatchRule(name="r2", source="jira", instruction="y")
+        store = SimpleNamespace(task_watch_authorities=Mock(return_value=[]))
+        service = SimpleNamespace(_watch_rules=rules, store=store)
+        self.assertFalse(AgentService._watch_rule_allows_notify(service, "task-1"))
+        store.task_watch_authorities.return_value = [rules[0].authority_key]
+        self.assertFalse(AgentService._watch_rule_allows_notify(service, "task-1"))
+        store.task_watch_authorities.return_value = [rules[1].authority_key]
+        self.assertTrue(AgentService._watch_rule_allows_notify(service, "task-1"))
+        store.task_watch_authorities.return_value = [
+            rules[0].authority_key, rules[1].authority_key,
         ]
-        # 同源任一规则默认 dm：通知。
-        self.assertTrue(
-            AgentService._watch_rule_allows_notify(service, "jira:ZKAI-1")
-        )
+        self.assertFalse(AgentService._watch_rule_allows_notify(service, "task-1"))
 
-    def test_drain_notifies_self_for_watch_task_terminal(self) -> None:
+    def test_later_cross_conversation_source_cannot_grant_watch_notify(self) -> None:
         from datetime import datetime
         from zoneinfo import ZoneInfo
-        from dws_dm_agent.core import AuditStore, TaskScope
+        from dws_dm_agent.core import AuditStore, Contact, TaskScope
+        from dws_dm_agent.watches import WatchRule
+
+        tz = ZoneInfo("Asia/Shanghai")
+        now = datetime.now(tz)
+        original_rule = WatchRule(
+            name="silent", source="jira", instruction="x", notify="none"
+        )
+        linked_rule = WatchRule(
+            name="notify", source="jira", instruction="y", notify="dm"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AuditStore(Path(tmp) / "audit.sqlite3", self_id="self-1")
+            original = IncomingEvent(
+                "watch-1", "message-1", "jira:ZKAI-1",
+                Contact("ZKAI-1", "jira:ZKAI-1", "jira:ZKAI-1", ""),
+                "原始命中", now, "watch-jira", original_rule.authority_key,
+            )
+            linked = IncomingEvent(
+                "watch-2", "message-2", "jira:ZKAI-2",
+                Contact("ZKAI-2", "jira:ZKAI-2", "jira:ZKAI-2", ""),
+                "后来关联", now, "watch-jira", linked_rule.authority_key,
+            )
+            store.claim_event(original)
+            store.claim_event(linked)
+            recorded = store.record_task(
+                scope=TaskScope("self-1", "jira:ZKAI-1", "jira:ZKAI-1"),
+                goal="处理 ZKAI-1", status="open",
+                evidence_message_ids=[original.message_id], evidence_at=now, now=now,
+            )
+            task_id = recorded["task"]["id"]
+            self.assertTrue(store.link_task_source(task_id, linked.message_id, "self-1"))
+
+            self.assertEqual(
+                store.task_watch_authorities(task_id),
+                [original_rule.authority_key],
+            )
+            store.close()
+
+    def test_drain_queues_persistent_notification_for_explicit_recipient(self) -> None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from dws_dm_agent.core import AuditStore, Contact, TaskScope
         from dws_dm_agent.service import AgentService
         from dws_dm_agent.watches import WatchRule
 
         tz = ZoneInfo("Asia/Shanghai")
         with tempfile.TemporaryDirectory() as tmp:
-            store = AuditStore(Path(tmp) / "audit.sqlite3")
+            store = AuditStore(Path(tmp) / "audit.sqlite3", self_id="self-1")
             now = datetime.now(tz)
             scope = TaskScope("self-1", "jira:ZKAI-1", "jira:ZKAI-1")
-            store.record_task(
+            rule = WatchRule(name="r", source="jira", instruction="x")
+            source = IncomingEvent(
+                "watch-event", "watch-message", "jira:ZKAI-1",
+                Contact("ZKAI-1", "jira:ZKAI-1", "jira:ZKAI-1", ""),
+                "处理 issue", now, origin="watch-jira",
+                watch_authority=rule.authority_key,
+            )
+            store.claim_event(source)
+            recorded = store.record_task(
                 scope=scope, goal="规则A: 修问题", status="completed",
-                evidence_summary="", evidence_message_ids=[], resources=[],
+                waiting_on="完成后通知：联系人A",
+                evidence_summary="", evidence_message_ids=[source.message_id], resources=[],
                 evidence_at=now, now=now,
             )
             store._drain_pending_terminal = None  # 未消费标记用
             events = store.pending_terminal_events()
             self.assertEqual(len(events), 1)
 
-            sent: list[tuple[str, str]] = []
-
-            async def fake_send(contact, content, send_uuid):
-                sent.append((contact.open_dingtalk_id, content))
-                return (send_uuid, None)
-
-            service = SimpleNamespace(
-                store=store,
-                settings=SimpleNamespace(
-                    timezone=tz, self_name="我", self_open_id="self-open",
-                ),
-                dws=SimpleNamespace(send=fake_send),
-                _watch_rules=[WatchRule(name="r", source="jira", instruction="x")],
-                _notify_watch_terminal=lambda *a, **k: None,
+            target = __import__("dws_dm_agent.core", fromlist=["Contact"]).Contact(
+                "联系人A", "联系人A", "u-contact-a", "open-contact-a"
             )
-            # 直接调用核心路径：terminal 事件 fan_out 前 notify。
-            # 用 asyncio.run 驱动 service 侧的 create_task 路径。
             svc = AgentService.__new__(AgentService)
             svc.store = store
-            svc.settings = service.settings
-            svc.dws = service.dws
-            svc._watch_rules = service._watch_rules
+            svc.settings = SimpleNamespace(
+                timezone=tz,
+                self_name="我",
+                self_open_id="self-open",
+                contacts=(target,),
+            )
+            svc._watch_rules = [rule]
+            svc.outbox_wakeup = asyncio.Event()
 
-            async def drive():
-                svc._notify_watch_terminal(events[0], now)
+            svc._drain_terminal_events(now)
 
-            asyncio.run(drive())
-            # create_task 在 drive() 返回后未 await：不强制等 send 完成，
-            # 只验证 notify 路径不炸（send 本身是 dws 层契约，有独立测试）。
+            receipts = store.delivery_receipts()
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0]["target_kind"], "watch_notification")
+            self.assertEqual(receipts[0]["destination"], "u-contact-a")
+            self.assertEqual(receipts[0]["delivery_status"], "pending")
+            self.assertNotIn("已作为评论发回", store.connection.execute(
+                "SELECT payload_text FROM outgoing WHERE send_uuid = ?",
+                (receipts[0]["action_id"],),
+            ).fetchone()["payload_text"])
+            self.assertEqual(store.pending_terminal_events(), [])
+            self.assertTrue(recorded["ok"])
+            store.close()
+
+    def test_confirmed_comment_and_failed_dm_keep_independent_receipts(self) -> None:
+        from zoneinfo import ZoneInfo
+        from dws_dm_agent.core import Contact, TaskScope
+        from dws_dm_agent.service import AgentService
+        from dws_dm_agent.watches import WatchRule
+
+        tz = ZoneInfo("Asia/Shanghai")
+        now = datetime.now(tz)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AuditStore(Path(tmp) / "audit.sqlite3", self_id="self")
+            jira_contact = Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", "")
+            source = IncomingEvent(
+                "jira-event", "jira-message", "jira:ZKAI-505", jira_contact,
+                "处理 issue", now, origin="watch-jira",
+            )
+            rule = WatchRule(name="r", source="jira", instruction="x")
+            source = IncomingEvent(
+                source.event_id, source.message_id, source.conversation_id,
+                source.contact, source.content, source.created_at, source.origin,
+                rule.authority_key,
+            )
+            store.claim_event(source)
+            store.enqueue_delivery(
+                "jira-comment-action", source, "已确认修复", "watch-run",
+                event_ids=[source.message_id],
+            )
+            store.mark_delivery_sent("jira-comment-action", "comment-505")
+            recorded = store.record_task(
+                scope=TaskScope("self", "jira:ZKAI-505", "jira:ZKAI-505"),
+                goal="修复 ZKAI-505", status="completed",
+                waiting_on="完成后通知：联系人A",
+                evidence_message_ids=[source.message_id], evidence_at=now, now=now,
+            )
+            target = Contact("联系人A", "联系人A", "u-contact-a", "open-contact-a")
+            svc = AgentService.__new__(AgentService)
+            svc.mode = "live"
+            svc.store = store
+            svc.settings = SimpleNamespace(
+                timezone=tz, self_name="我", self_open_id="self-open",
+                contacts=(target,), raw={}, cooldown=600,
+            )
+            svc._watch_rules = [rule]
+            svc.outbox_wakeup = asyncio.Event()
+            svc.streaming_card_send_uuids = {}
+            svc._history_events = Mock(return_value=[])
+            svc.dws = SimpleNamespace(
+                name="dws", streaming_cards=False, supports_freshness=True,
+                retry_safe=True, supports_reconciliation=False,
+                history=AsyncMock(return_value=[]),
+                send=AsyncMock(side_effect=RuntimeError("dm unavailable")),
+            )
+
+            svc._drain_terminal_events(now)
+            asyncio.run(svc._dispatch_due_delivery())
+
+            receipts = {item["action_id"]: item for item in store.delivery_receipts()}
+            notify_id = f"watch-notify-{recorded['task']['id']}-1"
+            self.assertEqual(receipts["jira-comment-action"]["receipt_status"], "confirmed")
+            self.assertEqual(receipts[notify_id]["delivery_status"], "retry_wait")
+            self.assertEqual(receipts[notify_id]["receipt_status"], "pending")
             store.close()
 
 
@@ -327,7 +526,7 @@ class WatchNotifyTargetTests(unittest.TestCase):
             target = svc._watch_notify_target(tasks[0]["id"])
             self.assertEqual(target.user_id, "u-contact-a")
 
-            # display_name 部分匹配（写"联系人N"也能命中"联系人N-联系人N"）。
+            # 非精确显示名不匹配，避免同名/部分命中误发。
             store.record_task(
                 scope=TaskScope("self-1", "jira:ZKAI-2", "jira:ZKAI-2"),
                 goal="规则: 另一个", status="completed",
@@ -338,9 +537,9 @@ class WatchNotifyTargetTests(unittest.TestCase):
             scope2 = TaskScope("self-1", "jira:ZKAI-2", "jira:ZKAI-2")
             task2 = store.lookup_tasks(scope=scope2)[0]
             target2 = svc._watch_notify_target(task2["id"])
-            self.assertEqual(target2.user_id, "u-contact-x")
+            self.assertIsNone(target2)
 
-            # 白名单外姓名 / 无指定：兜底本人。
+            # 白名单外姓名 / 无指定：不隐式改发本人。
             store.record_task(
                 scope=TaskScope("self-1", "jira:ZKAI-3", "jira:ZKAI-3"),
                 goal="规则: 第三个", status="completed", waiting_on="等部署完成",
@@ -349,5 +548,5 @@ class WatchNotifyTargetTests(unittest.TestCase):
             )
             task3 = store.lookup_tasks(scope=TaskScope("self-1", "jira:ZKAI-3", "jira:ZKAI-3"))[0]
             target3 = svc._watch_notify_target(task3["id"])
-            self.assertEqual(target3.open_dingtalk_id, "self-open")
+            self.assertIsNone(target3)
             store.close()

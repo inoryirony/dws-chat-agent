@@ -158,7 +158,7 @@ class PromptVariablesTests(unittest.TestCase):
                 "worker", "session-1", self._batch(), "", []
             )
 
-            # ~ 前缀展开成可用路径，deliveries 指向 state 目录下固定子目录。
+            # ~ 前缀展开成可用路径，附件目录按运行会话隔离。
             self.assertEqual(
                 variables["skill_humanizer"],
                 str(Path("~/skills/humanizer-zh/SKILL.md").expanduser()),
@@ -172,7 +172,7 @@ class PromptVariablesTests(unittest.TestCase):
             )
             self.assertEqual(
                 variables["deliveries_dir"],
-                str(root / "state" / "deliveries"),
+                str((root / "state" / "deliveries" / "session-1").resolve()),
             )
             service.store.close()
 
@@ -194,7 +194,7 @@ class PromptVariablesTests(unittest.TestCase):
             self.assertEqual(variables["script_am"], "")
             self.assertEqual(
                 variables["deliveries_dir"],
-                str(root / "state" / "deliveries"),
+                str((root / "state" / "deliveries" / "session-1").resolve()),
             )
             shared = render_prompt(
                 (PROMPTS_DIR / "shared.md").read_text(encoding="utf-8"),

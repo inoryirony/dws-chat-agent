@@ -264,16 +264,17 @@
       "projects": [
         "ZKAI"
       ],
-      "instruction": "分析这个 issue：总结要点、判断优先级与影响面，把结论作为评论回写。不修改 issue 状态。"
+      "instruction": "分析这个 issue：总结要点、判断优先级与影响面。不修改 issue 状态。最终正文由服务作为评论回写，不要自行调用 Jira 评论接口。"
     },
     {
       "source": "gitlab",
+      "merge_targets": [],
       "name": "zk-ai 核心仓库新 MR",
       "projects": [
         "xk/product/zk-ai/change-monitor",
         "xk/product/zk-ai/zkai-gateway"
       ],
-      "instruction": "审查这个 MR：列出变更要点与风险，把结论作为评论回写。不合并不修改。"
+      "instruction": "审查这个 MR：列出变更要点与风险。不合并不修改。最终正文由服务作为评论回写，不要自行调用 GitLab 评论接口。"
     }
   ],
   "watch_interval_seconds": 300

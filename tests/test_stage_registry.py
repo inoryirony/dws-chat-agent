@@ -251,6 +251,7 @@ class SkillsProvisionTests(unittest.TestCase):
             service.settings = SimpleNamespace(
                 timezone=__import__("zoneinfo").ZoneInfo("Asia/Shanghai"),
                 self_name="Op",
+                self_open_id="self-open",
                 workspace_root=root,
                 worktree_root=root,
                 state_dir=root / "state",

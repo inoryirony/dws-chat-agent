@@ -64,7 +64,7 @@ def _service(
         worktree_root=root,
         state_dir=root,
     )
-    service.store = AuditStore(root / "audit.sqlite3")
+    service.store = AuditStore(root / "audit.sqlite3", self_id=SELF_OPEN_ID)
     service.gate = SecurityGate(12000)
     service.dws = SimpleNamespace(
         history=AsyncMock(return_value=[]),
@@ -194,7 +194,7 @@ class TerminalWakeTests(unittest.TestCase):
                 {(wake["contact_id"], wake["text"]) for wake in wakes},
                 {
                     (ALICE.identity, "任务完成：上线支付回调，结果见 board"),
-                    (BOB.identity, "任务完成：上线支付回调，结果见 board"),
+                    (BOB.identity, "关联事项已有进展，请核对本事项。"),
                 },
             )
             self.assertTrue(all(w["origin_task_id"] == task_a for w in wakes))
@@ -220,7 +220,7 @@ class TerminalWakeTests(unittest.TestCase):
 
             texts = {wake["text"] for wake in service.store.due_wakes(NOW)}
             self.assertEqual(
-                texts, {"任务取消：上线支付回调，结果见 board"}
+                texts, {"任务取消：上线支付回调，结果见 board", "关联事项已有进展，请核对本事项。"}
             )
             service.store.close()
 
@@ -268,8 +268,7 @@ class TimeWakeTests(unittest.TestCase):
             now=NOW - timedelta(hours=2),
         )
         task_id = created["task"]["id"]
-        # 多人一事的 contact_ids 由触碰自动累积；写入按作用域隔离，
-        # 这里直接落库两联系人，验证到点只唤醒主联系人（首位）。
+        # 旧数据里即使另一个联系人排首位，仍只唤醒事项的原始会话。
         store.connection.execute(
             "UPDATE tasks SET contact_ids = ? WHERE id = ?",
             ('["user-bob", "user-alice"]', task_id),
@@ -277,10 +276,10 @@ class TimeWakeTests(unittest.TestCase):
         store.connection.commit()
         return task_id
 
-    def test_due_moment_inside_window_wakes_primary_contact_once(self) -> None:
+    def test_due_moment_inside_window_wakes_source_contact_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = _service(Path(directory))
-            self._waiting_at(service.store, "@2026-11-07 10:00")
+            task_id = self._waiting_at(service.store, "@2026-11-07 10:00")
 
             service._scan_time_wakes(datetime(2026, 11, 7, 9, 59, tzinfo=TZ))
             self.assertEqual(service.store.due_wakes(NOW), [])
@@ -289,7 +288,7 @@ class TimeWakeTests(unittest.TestCase):
             wakes = service.store.due_wakes(NOW)
             self.assertEqual(
                 [(wake["contact_id"], wake["text"]) for wake in wakes],
-                [(BOB.identity, "到点检查：周四早上提醒验证")],
+                [(ALICE.identity, f"到点检查 [{task_id}]：周四早上提醒验证")],
             )
 
             # 同一等待只入队一次：重复扫描不重复唤醒。
@@ -314,7 +313,7 @@ class TimeWakeTests(unittest.TestCase):
                         datetime(2026, 11, 8, 9, 0, tzinfo=TZ)
                     )
                 ],
-                [BOB.identity],
+                [ALICE.identity],
             )
             service.store.close()
 
@@ -340,8 +339,8 @@ class TimeWakeTests(unittest.TestCase):
             self.assertEqual(service.store.due_wakes(NOW), [])
             service.store.close()
 
-    def test_time_wake_dispatch_capped_at_three(self) -> None:
-        """任务停在 waiting 且时刻已过：重发封顶 3 轮，绝不 5s 一轮烧钱。"""
+    def test_completed_time_wake_is_not_dispatched_again(self) -> None:
+        """同一等待条件只有一次到点事件，后续扫描不重复投递。"""
         with tempfile.TemporaryDirectory() as directory:
             service = _service(Path(directory))
             task_id = self._waiting_at(service.store, "@2026-11-07 10:00")
@@ -352,13 +351,15 @@ class TimeWakeTests(unittest.TestCase):
                 # 模拟派发循环：把 due wake 全部 claim+finish（无论成败，
                 # 派发计数都应累计），任务保持 waiting 不闭环。
                 for wake in service.store.due_wakes(at):
-                    self.store = service.store
                     service.store.claim_wake(int(wake["id"]), now=at)
                     service.store.finish_wake(int(wake["id"]), now=at)
 
             self.assertEqual(
-                service.store.wake_dispatch_count(task_id, "@2026-11-07 10:00"),
-                3,
+                service.store.connection.execute(
+                    "SELECT COUNT(*) FROM wakes WHERE origin_task_id = ? AND status = 'done'",
+                    (task_id,),
+                ).fetchone()[0],
+                1,
             )
             self.assertEqual(service.store.due_wakes(at), [])
             service.store.close()
@@ -727,10 +728,7 @@ class OperatorPanelTests(unittest.TestCase):
             )
             self.assertEqual(
                 {(wake["contact_id"], wake["text"]) for wake in wakes},
-                {
-                    (ALICE.identity, "操作者已答复：同意灰度发布"),
-                    (BOB.identity, "操作者已答复：同意灰度发布"),
-                },
+                {(ALICE.identity, "操作者已答复：同意灰度发布")},
             )
             # 等的不是本人：拒绝作答，也不产生事实或唤醒。
             rejected = asyncio.run(
@@ -746,7 +744,7 @@ class OperatorPanelTests(unittest.TestCase):
                         datetime.now(tz=ZoneInfo("Asia/Shanghai"))
                     )
                 ),
-                2,
+                1,
             )
             service.store.close()
 
@@ -1136,6 +1134,7 @@ class WakeSteerTests(unittest.TestCase):
                 "run-live", contact_id=ALICE.identity, stage="worker", now=NOW
             )
             service.live_sessions["run-live"] = session
+            service.runtime_states[f"dm:{ALICE.identity}"] = {"sessionId": "run-live"}
             wake = self._wake(service)
 
             asyncio.run(service._dispatch_wake(wake, NOW + timedelta(seconds=1)))

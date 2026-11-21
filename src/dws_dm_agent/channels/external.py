@@ -28,7 +28,7 @@ def _request(
     payload: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     timeout: float = 30,
-) -> dict[str, Any]:
+) -> Any:
     data = None
     effective_headers = {"Accept": "application/json"}
     if headers:
@@ -47,10 +47,27 @@ def _basic_auth(username: str, token: str) -> dict[str, str]:
     return {"Authorization": f"Basic {pair}"}
 
 
+def _action_marker(send_uuid: str) -> str:
+    return f"<!-- dws-action:{send_uuid} -->"
+
+
+def _identity_values(value: Any) -> set[str]:
+    if not isinstance(value, dict):
+        return set()
+    return {
+        str(value.get(field))
+        for field in ("id", "accountId", "key", "name", "username", "emailAddress")
+        if value.get(field) not in (None, "")
+    }
+
+
 class JiraChannel:
     name = "jira"
     streaming_cards = False
+    processing_reactions = False
     supports_freshness = False
+    retry_safe = False
+    supports_reconciliation = True
 
     def _auth(self) -> tuple[str, dict[str, str]]:
         username = os.environ.get("JIRA_USERNAME", "")
@@ -67,9 +84,37 @@ class JiraChannel:
         _user, headers = self._auth()
         url = f"{os.environ.get('JIRA_URL', '').rstrip('/')}/rest/api/2/issue/{issue_key}/comment"
         payload = await asyncio.to_thread(
-            _request, url, method="POST", payload={"body": content}, headers=headers
+            _request,
+            url,
+            method="POST",
+            payload={"body": f"{content}\n\n{_action_marker(send_uuid)}"},
+            headers=headers,
         )
         return str(payload.get("id") or ""), payload
+
+    async def find_receipt(self, contact: Contact, send_uuid: str) -> str | None:
+        _user, headers = self._auth()
+        base = os.environ.get('JIRA_URL', '').rstrip('/')
+        current_user = await asyncio.to_thread(
+            _request, f"{base}/rest/api/2/myself", headers=headers
+        )
+        identities = _identity_values(current_user)
+        if not identities:
+            return None
+        url = (
+            f"{base}/rest/api/2/issue/"
+            f"{contact.alias}/comment"
+        )
+        data = await asyncio.to_thread(_request, url, headers=headers)
+        marker = _action_marker(send_uuid)
+        for item in data.get("comments", []):
+            body = item.get("body") or ""
+            if (
+                marker in (body if isinstance(body, str) else json.dumps(body))
+                and identities.intersection(_identity_values(item.get("author")))
+            ):
+                return str(item.get("id") or "") or None
+        return None
 
     async def history(self, contact: Contact) -> list[HistoryMessage]:
         issue_key = contact.alias
@@ -101,7 +146,10 @@ class JiraChannel:
 class GitLabChannel:
     name = "gitlab"
     streaming_cards = False
+    processing_reactions = False
     supports_freshness = False
+    retry_safe = False
+    supports_reconciliation = True
 
     def _headers(self) -> dict[str, str]:
         token = os.environ.get("GITLAB_TOKEN", "")
@@ -121,10 +169,31 @@ class GitLabChannel:
             _request,
             url,
             method="POST",
-            payload={"body": content},
+            payload={"body": f"{content}\n\n{_action_marker(send_uuid)}"},
             headers=self._headers(),
         )
         return str(payload.get("id") or ""), payload
+
+    async def find_receipt(self, contact: Contact, send_uuid: str) -> str | None:
+        project, _, number = contact.alias.partition("!")
+        host = os.environ.get("GITLAB_HOST", "git.youshu.com.cn")
+        encoded = project.replace("/", "%2F")
+        current_user = await asyncio.to_thread(
+            _request, f"https://{host}/api/v4/user", headers=self._headers()
+        )
+        identities = _identity_values(current_user)
+        if not identities:
+            return None
+        url = f"https://{host}/api/v4/projects/{encoded}/merge_requests/{number}/notes"
+        notes = await asyncio.to_thread(_request, url, headers=self._headers())
+        marker = _action_marker(send_uuid)
+        for item in notes:
+            if (
+                marker in str(item.get("body") or "")
+                and identities.intersection(_identity_values(item.get("author")))
+            ):
+                return str(item.get("id") or "") or None
+        return None
 
     async def history(self, contact: Contact) -> list[HistoryMessage]:
         return []

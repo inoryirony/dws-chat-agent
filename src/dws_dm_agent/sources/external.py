@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
@@ -20,6 +21,8 @@ from typing import Any
 from ..core import Contact
 from .base import SourceItem
 from .http import request_json
+
+LOG = logging.getLogger("dws-chat-agent")
 
 
 class JiraSource:
@@ -32,6 +35,32 @@ class JiraSource:
     def __init__(self, jql: str, projects: list[str] | None = None) -> None:
         self.jql = jql
         self.projects = projects or []
+
+    @classmethod
+    def build(cls, rules: list) -> "JiraSource | None":
+        jqls = {rule.jql for rule in rules if rule.source == cls.name}
+        if not jqls:
+            return None
+        # JQL 合并：ORDER BY 全局一份（放尾），其余括号 OR 连接——
+        # (x ORDER BY a) OR (y ORDER BY b) 会被 Jira 判 400。
+        clauses = []
+        order = "created DESC"
+        for item in sorted(jqls):
+            parts = item.rsplit("ORDER BY", 1)
+            clauses.append(f"({parts[0].strip().rstrip(',').strip()})")
+            if len(parts) == 2:
+                order = parts[1].strip()
+        jql = " OR ".join(clauses) + f" ORDER BY {order}"
+        if not os.environ.get("JIRA_USERNAME"):
+            LOG.warning("watch: JIRA_USERNAME missing; jira source disabled")
+            return None
+        projects = {
+            project
+            for rule in rules
+            if rule.source == cls.name
+            for project in rule.projects
+        }
+        return cls(jql, sorted(projects))
 
     def _auth_header(self) -> dict[str, str]:
         from .http import basic_auth_header
@@ -109,6 +138,18 @@ class GitLabSource:
     def __init__(self, projects: list[str]) -> None:
         self.projects = projects
 
+    @classmethod
+    def build(cls, rules: list) -> "GitLabSource | None":
+        projects = {
+            project
+            for rule in rules
+            if rule.source == cls.name
+            for project in rule.projects
+        }
+        if not projects:
+            return None
+        return cls(sorted(projects))
+
     def _headers(self) -> dict[str, str]:
         token = os.environ.get("GITLAB_TOKEN", "")
         if not token:
@@ -161,6 +202,8 @@ class GitLabSource:
                             "source": "gitlab",
                             "project": project,
                             "iid": number,
+                            "sha": str(mr.get("sha") or ""),
+                            "target_branch": str(mr.get("target_branch") or ""),
                             "author": author,
                         },
                     )

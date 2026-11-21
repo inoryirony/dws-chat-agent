@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
@@ -37,6 +38,21 @@ BOARD_RUN_OUTCOME_STATUS = {
     "aborted": "aborted",
 }
 FACT_SOURCES = ("human", "agent", "contact")
+
+
+def _normalize_gitlab_host(value: str) -> str:
+    host = value.strip().lower().rstrip("/")
+    if not host or "://" in host or "/" in host or any(char.isspace() for char in host):
+        raise ValueError("invalid_gitlab_host")
+    return host
+
+
+def _idempotency_window_expired(sent_at: str, now: datetime) -> bool:
+    try:
+        queued_at = datetime.fromisoformat(sent_at)
+        return now - queued_at >= timedelta(hours=24)
+    except (TypeError, ValueError):
+        return True
 
 
 class TaskScope(NamedTuple):
@@ -77,6 +93,21 @@ class IncomingEvent:
     content: str
     created_at: datetime
     origin: str = "dm"
+    watch_authority: str = ""
+    source_revision: str = ""
+    target_branch: str = ""
+
+    @classmethod
+    def from_input_row(cls, row: Mapping[str, Any], *, self_id: str) -> IncomingEvent | None:
+        payload = json.loads(row["input_v1"])
+        if payload["self_id"] != self_id:
+            return None
+        return cls(
+            row["event_id"], row["message_id"], row["conversation_id"],
+            Contact(**payload["contact"]), payload["content"], datetime.fromisoformat(row["received_at"]),
+            payload["origin"], payload.get("watch_authority", ""),
+            payload.get("source_revision", ""), payload.get("target_branch", ""),
+        )
 
 
 @dataclass(frozen=True)
@@ -138,10 +169,10 @@ def human_owns_conversation(
     cooldown_seconds: float,
 ) -> bool:
     """Only a real self-authored message starts cooldown; read state is irrelevant."""
-    if cooldown_seconds <= 0:
-        return False
     if latest_manual is None:
         return False
+    if cooldown_seconds <= 0:
+        return latest_manual >= earliest_incoming
     if latest_manual >= earliest_incoming - timedelta(seconds=2):
         return True
     return (earliest_incoming - latest_manual).total_seconds() < cooldown_seconds
@@ -279,9 +310,19 @@ class SecurityGate:
 
 
 class AuditStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, self_id: str = "") -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self.self_id = self_id
+        # 完整入站正文只供本机服务重放。SQLite 会沿用主文件权限新建 WAL。
+        if os.name == "posix":
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.close(fd)
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    Path(str(path) + suffix).chmod(0o600)
+                except FileNotFoundError:
+                    pass
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
         # 确认/切换 WAL 需要写锁，而且 busy handler 对 journal_mode 不排队：
@@ -336,7 +377,10 @@ class AuditStore:
                 last_error TEXT NOT NULL DEFAULT '',
                 event_ids_json TEXT NOT NULL DEFAULT '[]',
                 source_received_at TEXT NOT NULL DEFAULT '',
-                source TEXT NOT NULL DEFAULT 'agent'
+                source TEXT NOT NULL DEFAULT 'agent',
+                target_kind TEXT NOT NULL DEFAULT 'message',
+                receipt_status TEXT NOT NULL DEFAULT 'confirmed',
+                remote_marker TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS outgoing_conversation_time
                 ON outgoing(conversation_id, sent_at);
@@ -389,6 +433,18 @@ class AuditStore:
             );
             CREATE INDEX IF NOT EXISTS tasks_scope
                 ON tasks(scope_self, scope_contact, scope_conversation, status);
+            CREATE TABLE IF NOT EXISTS task_sources (
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                conversation_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                PRIMARY KEY (task_id, conversation_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS task_sources_message ON task_sources(conversation_id, message_id);
+            CREATE TABLE IF NOT EXISTS schema_upgrades (name TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS watch_cursors (
+                rule_key TEXT PRIMARY KEY,
+                received_through TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS task_changes (
                 run_id TEXT NOT NULL,
                 tool_call_id TEXT NOT NULL,
@@ -424,7 +480,9 @@ class AuditStore:
                 ended_at TEXT,
                 outcome TEXT,
                 origin TEXT,
-                worktree_path TEXT
+                worktree_path TEXT,
+                event_ids_json TEXT NOT NULL DEFAULT '[]',
+                session_dir TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS board_runs_status
                 ON board_runs(status, started_at);
@@ -451,9 +509,6 @@ class AuditStore:
                 waiting_task_id TEXT NOT NULL DEFAULT '',
                 waiting_on TEXT NOT NULL DEFAULT ''
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS wakes_fanout_dedup
-                ON wakes(origin_task_id, waiting_task_id, contact_id)
-                WHERE waiting_task_id != '';
             CREATE TABLE IF NOT EXISTS task_terminal_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_id TEXT NOT NULL,
@@ -471,7 +526,10 @@ class AuditStore:
             """
         )
         migrations = {
-            "events": {"request_preview": "request_preview TEXT NOT NULL DEFAULT ''"},
+            "events": {
+                "request_preview": "request_preview TEXT NOT NULL DEFAULT ''",
+                "input_v1": "input_v1 TEXT",
+            },
             "runs": {"request_preview": "request_preview TEXT NOT NULL DEFAULT ''"},
             "tasks": {
                 "resources": "resources TEXT NOT NULL DEFAULT '[]'",
@@ -491,8 +549,16 @@ class AuditStore:
                 "last_error": "last_error TEXT NOT NULL DEFAULT ''",
                 "event_ids_json": "event_ids_json TEXT NOT NULL DEFAULT '[]'",
                 "source_received_at": "source_received_at TEXT NOT NULL DEFAULT ''",
+                "target_kind": "target_kind TEXT NOT NULL DEFAULT 'message'",
+                "receipt_status": "receipt_status TEXT NOT NULL DEFAULT 'confirmed'",
+                "remote_marker": "remote_marker TEXT NOT NULL DEFAULT ''",
             },
-            "board_runs": {"origin": "origin TEXT", "worktree_path": "worktree_path TEXT"},
+            "board_runs": {
+                "origin": "origin TEXT",
+                "worktree_path": "worktree_path TEXT",
+                "event_ids_json": "event_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "session_dir": "session_dir TEXT NOT NULL DEFAULT ''",
+            },
             "wakes": {
                 "status": "status TEXT NOT NULL DEFAULT 'pending'",
                 "claimed_at": "claimed_at TEXT",
@@ -501,6 +567,8 @@ class AuditStore:
                 "waiting_on": "waiting_on TEXT NOT NULL DEFAULT ''",
             },
         }
+        # Multiple task tools can be the first processes to open an older database.
+        self.connection.execute("BEGIN IMMEDIATE")
         for table, columns in migrations.items():
             names = {
                 row["name"]
@@ -517,28 +585,60 @@ class AuditStore:
             WHERE consumed_at IS NOT NULL AND status = 'pending'
             """
         )
+        if self.connection.execute(
+            "INSERT OR IGNORE INTO schema_upgrades VALUES ('task_source_history_v1')"
+        ).rowcount:
+            self.connection.execute(
+                """INSERT OR IGNORE INTO task_sources
+                   SELECT t.id, t.scope_conversation, e.value FROM tasks t,
+                     json_each(t.evidence_message_ids) e WHERE e.type = 'text' AND e.value != ''
+                   UNION SELECT t.id, t.scope_conversation, f.anchor_message_id
+                     FROM tasks t JOIN facts f ON f.task_id = t.id WHERE f.anchor_message_id != ''
+                   UNION SELECT t.id, t.scope_conversation, e.value FROM tasks t
+                     JOIN task_changes c ON c.task_id = t.id,
+                     json_each(CASE WHEN json_valid(c.response_json) THEN c.response_json END,
+                               '$.task.evidence_message_ids') e WHERE e.type = 'text' AND e.value != ''"""
+            )
         # wakes_due 的旧定义挂在 consumed_at 上；claim 语义改造后统一按
         # status 过滤，旧库上的同名索引用新定义重建。
-        self.connection.execute("DROP INDEX IF EXISTS wakes_due")
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS wakes_due ON wakes(status, due_at)"
-        )
+        if self.connection.execute(
+            "INSERT OR IGNORE INTO schema_upgrades VALUES ('wake_indexes_v2')"
+        ).rowcount:
+            self.connection.execute("DROP INDEX IF EXISTS wakes_due")
+            self.connection.execute("CREATE INDEX wakes_due ON wakes(status, due_at)")
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS wakes_fanout_dedup "
+                "ON wakes(origin_task_id, waiting_task_id, contact_id) WHERE waiting_task_id != ''"
+            )
         self.connection.execute(
             """
-            UPDATE outgoing
-            SET delivery_status = 'retry_wait', next_attempt_at = ''
-            WHERE delivery_status = 'sending'
+            UPDATE outgoing SET receipt_status = CASE
+                WHEN delivery_status = 'sent' THEN 'confirmed'
+                WHEN delivery_status = 'cancelled' THEN 'cancelled'
+                WHEN delivery_status = 'remote_uncertain' THEN 'remote_uncertain'
+                ELSE 'pending'
+            END
+            WHERE receipt_status != CASE
+                WHEN delivery_status = 'sent' THEN 'confirmed'
+                WHEN delivery_status = 'cancelled' THEN 'cancelled'
+                WHEN delivery_status = 'remote_uncertain' THEN 'remote_uncertain'
+                ELSE 'pending'
+            END
             """
         )
         self.connection.commit()
 
     def claim_event(self, event: IncomingEvent) -> bool:
+        with self.connection:
+            return self._claim_event_tx(event)
+
+    def _claim_event_tx(self, event: IncomingEvent) -> bool:
         cursor = self.connection.execute(
             """
             INSERT OR IGNORE INTO events(
                 event_id, message_id, conversation_id, contact_user_id,
-                received_at, content_sha256, content_length, request_preview
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                received_at, content_sha256, content_length, request_preview, input_v1
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.event_id,
@@ -549,10 +649,64 @@ class AuditStore:
                 sha256_text(event.content),
                 len(event.content),
                 sanitize_text(event.content, 500),
+                json.dumps({
+                    "content": event.content, "origin": event.origin,
+                    "contact": asdict(event.contact), "self_id": self.self_id,
+                    "watch_authority": event.watch_authority,
+                    "source_revision": event.source_revision, "target_branch": event.target_branch,
+                }, ensure_ascii=False),
             ),
         )
-        self.connection.commit()
         return cursor.rowcount == 1
+
+    def accept_watch(
+        self, event: IncomingEvent, scope: TaskScope, goal: str, url: str, now: datetime,
+        *, resource_key: str, rule_name: str,
+    ) -> bool:
+        with self.connection:
+            # 旧版以资源 ID 去重，原始 watch 名写在服务生成的固定标题中。
+            legacy = self.connection.execute(
+                "SELECT request_preview FROM events WHERE message_id = ? AND conversation_id = ?",
+                (resource_key, scope.conversation_id),
+            ).fetchone()
+            if legacy and (not legacy[0] or legacy[0].startswith(f"【Watch 命中：{rule_name}】")):
+                return False
+            if not self._claim_event_tx(event):
+                return False
+            self._record_task_tx(
+                scope=scope,
+                record={"goal": goal, "evidence_summary": url, "evidence_message_ids": [event.message_id]},
+                evidence_at=event.created_at, now=now,
+            )
+        return True
+
+    def watch_cursor(self, rule_key: str, default: datetime) -> datetime:
+        row = self.connection.execute(
+            "SELECT received_through FROM watch_cursors WHERE rule_key = ?", (rule_key,)
+        ).fetchone()
+        return datetime.fromisoformat(row[0]) if row else default
+
+    def advance_watch_cursor(self, rule_key: str, through: datetime) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO watch_cursors VALUES (?, ?)
+                   ON CONFLICT(rule_key) DO UPDATE SET received_through = excluded.received_through
+                   WHERE julianday(excluded.received_through) > julianday(watch_cursors.received_through)""",
+                (rule_key, through.isoformat()),
+            )
+
+    def replayable_inputs(self) -> list[IncomingEvent]:
+        rows = self.connection.execute(
+            """SELECT event_id, message_id, conversation_id, received_at, input_v1
+               FROM events WHERE status = 'queued' AND input_v1 IS NOT NULL
+               ORDER BY received_at, rowid"""
+        )
+        events = []
+        for row in rows:
+            event = IncomingEvent.from_input_row(row, self_id=self.self_id)
+            if event is not None:
+                events.append(event)
+        return events
 
     def update_event_status(self, message_ids: Iterable[str], status: str, reason: str = "") -> None:
         self.connection.executemany(
@@ -567,14 +721,98 @@ class AuditStore:
         ).fetchone()
         return bool(row and row["status"] == "queued")
 
-    def pending_event_ids(self, contact_user_id: str) -> set[str]:
+    def pending_event_ids(self, contact_user_id: str, *, legacy_only: bool = False) -> set[str]:
+        legacy = " AND input_v1 IS NULL" if legacy_only else ""
         return {
             row["message_id"]
             for row in self.connection.execute(
-                "SELECT message_id FROM events WHERE contact_user_id = ? AND status = 'queued'",
+                "SELECT message_id FROM events WHERE contact_user_id = ? AND status = 'queued'" + legacy,
                 (contact_user_id,),
             )
         }
+
+    def superseding_conversation_event_ids(
+        self, conversation_id: str, covered_event_ids: Sequence[str], *, include_resolved: bool = False
+    ) -> set[str]:
+        """Find newer inputs to this workflow. Recovery also checks inputs already handled."""
+        covered = tuple(dict.fromkeys(str(item) for item in covered_event_ids if item))
+        if not covered:
+            return set()
+        placeholders = ",".join("?" for _ in covered)
+        source_rows = list(self.connection.execute(
+            f"""SELECT message_id, contact_user_id, received_at, input_v1
+                FROM events WHERE conversation_id = ? AND message_id IN ({placeholders})""",
+            (conversation_id, *covered),
+        ))
+        if len(source_rows) != len(covered):
+            return set()
+
+        def workflow(row: sqlite3.Row) -> tuple[str, str] | None:
+            try:
+                payload = json.loads(row["input_v1"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, dict):
+                return None
+            origin = str(payload.get("origin") or "dm")
+            authority = str(payload.get("watch_authority") or "")
+            if authority:
+                if not (origin.startswith("watch-") or origin == "wake"):
+                    return None
+                return "watch", authority
+            return origin, ""
+
+        source_workflows = {workflow(row) for row in source_rows}
+        contacts = {str(row["contact_user_id"]) for row in source_rows}
+        if None in source_workflows or len(source_workflows) != 1 or len(contacts) != 1:
+            return set()
+        try:
+            latest_source = max(
+                datetime.fromisoformat(str(row["received_at"])) for row in source_rows
+            )
+        except (TypeError, ValueError):
+            return set()
+
+        superseding: set[str] = set()
+        status_filter = "status != 'skipped'" if include_resolved else "status = 'queued'"
+        for row in self.connection.execute(
+            f"""SELECT message_id, contact_user_id, received_at, input_v1
+                FROM events WHERE conversation_id = ? AND {status_filter}""",
+            (conversation_id,),
+        ):
+            if row["message_id"] in covered or str(row["contact_user_id"]) not in contacts:
+                continue
+            try:
+                is_newer = datetime.fromisoformat(str(row["received_at"])) > latest_source
+            except (TypeError, ValueError):
+                continue
+            if is_newer and workflow(row) in source_workflows:
+                superseding.add(str(row["message_id"]))
+        return superseding
+
+    def event_watch_authorities(self, message_ids: Sequence[str]) -> list[str]:
+        """Return distinct persisted watch grants for a delivery's source inputs."""
+        if not message_ids:
+            return []
+        placeholders = ",".join("?" for _ in message_ids)
+        rows = list(self.connection.execute(
+            f"SELECT message_id, input_v1 FROM events WHERE message_id IN ({placeholders})",
+            tuple(message_ids),
+        ))
+        if len(rows) != len(set(message_ids)):
+            return []
+        authorities: set[str] = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["input_v1"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return []
+            authority = str(payload.get("watch_authority") or "")
+            origin = str(payload.get("origin") or "")
+            if not authority or not (origin.startswith("watch-") or origin == "wake"):
+                return []
+            authorities.add(authority)
+        return sorted(authorities)
 
     def record_outgoing(
         self,
@@ -589,6 +827,7 @@ class AuditStore:
         card_biz_id: str | None = None,
         card_flow_status: int | None = None,
         source: str = "agent",
+        target_kind: str = "",
     ) -> None:
         self.connection.execute(
             """
@@ -596,10 +835,11 @@ class AuditStore:
                 send_uuid, message_id, conversation_id, contact_user_id,
                 sent_at, content_sha256, session_id, card_biz_id,
                 card_flow_status, source
+                , target_kind, receipt_status
             ) VALUES (?, ?, ?, ?, ?, ?, ?,
                 COALESCE(?, (SELECT card_biz_id FROM outgoing WHERE send_uuid = ?)),
                 COALESCE(?, (SELECT card_flow_status FROM outgoing WHERE send_uuid = ?)),
-                ?
+                ?, ?, 'confirmed'
             )
             """,
             (
@@ -615,6 +855,7 @@ class AuditStore:
                 card_flow_status,
                 send_uuid,
                 source,
+                target_kind or ("card" if card_biz_id else "message"),
             ),
         )
         self.connection.commit()
@@ -628,19 +869,24 @@ class AuditStore:
         *,
         event_ids: Sequence[str],
         card_biz_id: str = "",
-    ) -> None:
+    ) -> str:
         now = datetime.now(source_event.created_at.tzinfo)
+        remote_marker = (
+            send_uuid
+            if source_event.conversation_id.startswith(("jira:", "gitlab:"))
+            else ""
+        )
         self.connection.execute("BEGIN IMMEDIATE")
-        self.connection.execute(
+        cursor = self.connection.execute(
             """
-            INSERT INTO outgoing(
+            INSERT OR IGNORE INTO outgoing(
                 send_uuid, message_id, conversation_id, contact_user_id,
                 sent_at, content_sha256, session_id, card_biz_id,
                 card_flow_status, payload_text, delivery_status,
                 attempt_count, next_attempt_at, last_error, event_ids_json,
-                source_received_at
+                source_received_at, target_kind, receipt_status, remote_marker
             ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, 'pending',
-                      0, '', '', ?, ?)
+                      0, '', '', ?, ?, ?, 'pending', ?)
             """,
             (
                 send_uuid,
@@ -653,14 +899,369 @@ class AuditStore:
                 content,
                 json.dumps(list(event_ids), ensure_ascii=False),
                 source_event.created_at.isoformat(),
+                (
+                    "jira_comment"
+                    if source_event.conversation_id.startswith("jira:")
+                    else "gitlab_note"
+                    if source_event.conversation_id.startswith("gitlab:")
+                    else "reply"
+                ),
+                remote_marker,
             ),
         )
-        self.connection.executemany(
-            "UPDATE events SET status = 'delivery_pending', reason = '' "
-            "WHERE message_id = ?",
-            [(message_id,) for message_id in event_ids],
+        if cursor.rowcount:
+            self.connection.executemany(
+                "UPDATE events SET status = 'delivery_pending', reason = '' "
+                "WHERE message_id = ?",
+                [(message_id,) for message_id in event_ids],
+            )
+            status = "pending"
+        else:
+            status = str(self.connection.execute(
+                "SELECT delivery_status FROM outgoing WHERE send_uuid = ?",
+                (send_uuid,),
+            ).fetchone()["delivery_status"])
+        self.connection.commit()
+        return status
+
+    def enqueue_notification(
+        self,
+        action_id: str,
+        *,
+        conversation_id: str,
+        contact_user_id: str,
+        content: str,
+        session_id: str,
+        now: datetime,
+    ) -> bool:
+        """Persist one explicit-recipient notification; stable action_id deduplicates replay."""
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO outgoing(
+                send_uuid, message_id, conversation_id, contact_user_id,
+                sent_at, content_sha256, session_id, payload_text,
+                delivery_status, attempt_count, next_attempt_at, last_error,
+                event_ids_json, source_received_at, source, target_kind,
+                receipt_status
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '',
+                      '[]', ?, 'watch', 'watch_notification', 'pending')
+            """,
+            (
+                action_id,
+                conversation_id,
+                contact_user_id,
+                now.isoformat(),
+                sha256_text(canonical_message_text(content)),
+                session_id,
+                content,
+                now.isoformat(),
+            ),
         )
         self.connection.commit()
+        return cursor.rowcount == 1
+
+    def enqueue_attachment(
+        self,
+        action_id: str,
+        source_event: IncomingEvent,
+        file_path: Path,
+        file_sha256: str,
+        session_id: str,
+        *,
+        event_ids: Sequence[str],
+    ) -> bool:
+        """Persist one immutable attachment target without changing body delivery state."""
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO outgoing(
+                send_uuid, message_id, conversation_id, contact_user_id,
+                sent_at, content_sha256, session_id, payload_text,
+                delivery_status, attempt_count, next_attempt_at, last_error,
+                event_ids_json, source_received_at, source, target_kind,
+                receipt_status, remote_marker
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', ?, ?,
+                      'agent', 'attachment', 'pending', '')
+            """,
+            (
+                action_id,
+                source_event.conversation_id,
+                source_event.contact.identity,
+                datetime.now(source_event.created_at.tzinfo).isoformat(),
+                file_sha256,
+                session_id,
+                str(file_path),
+                json.dumps(list(event_ids), ensure_ascii=False),
+                source_event.created_at.isoformat(),
+            ),
+        )
+        self.connection.commit()
+        return cursor.rowcount == 1
+
+    def enqueue_gitlab_merge(
+        self,
+        source_event: IncomingEvent,
+        *,
+        host: str,
+        project: str,
+        iid: int,
+        source_ref: str,
+        target_ref: str,
+        expected_sha: str,
+        assessment: str,
+        watch_authority: str,
+        session_id: str,
+        event_ids: Sequence[str],
+    ) -> tuple[str, str]:
+        """Persist one reviewed MR-head merge intent after fencing its live run."""
+        normalized_host = _normalize_gitlab_host(host)
+        conversation_id = f"gitlab:{project}!{iid}"
+        if (
+            source_event.origin != "watch-gitlab"
+            or source_event.conversation_id != conversation_id
+            or source_event.contact.identity != conversation_id
+            or source_event.watch_authority != watch_authority
+            or source_event.source_revision != expected_sha
+            or source_event.target_branch != target_ref
+            or not project
+            or not isinstance(iid, int)
+            or isinstance(iid, bool)
+            or iid <= 0
+            or not source_ref.strip()
+            or not watch_authority
+            or not assessment.strip()
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_sha)
+            or target_ref not in {"dev", "main"}
+            or list(event_ids) != [source_event.message_id]
+        ):
+            raise ValueError("merge_source_mismatch")
+        action_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                json.dumps(
+                    {
+                        "kind": "gitlab_merge_v1",
+                        "host": normalized_host,
+                        "project": project,
+                        "iid": iid,
+                        "expected_sha": expected_sha,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        envelope = {
+            "host": normalized_host,
+            "project": project,
+            "iid": iid,
+            "source_ref": source_ref.strip(),
+            "target_ref": target_ref,
+            "expected_sha": expected_sha,
+            "assessment": assessment.strip(),
+            "watch_authority": watch_authority,
+            "message_id": source_event.message_id,
+        }
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            lease = self.connection.execute(
+                "SELECT revoked_at FROM task_run_leases WHERE run_id = ?",
+                (session_id,),
+            ).fetchone()
+            run = self.connection.execute(
+                """SELECT contact_id, status, ended_at, event_ids_json
+                   FROM board_runs WHERE session_id = ?""",
+                (session_id,),
+            ).fetchone()
+            persisted = self.connection.execute(
+                "SELECT conversation_id, contact_user_id, input_v1 FROM events WHERE message_id = ?",
+                (source_event.message_id,),
+            ).fetchone()
+            if not lease or lease["revoked_at"] or not run or run["ended_at"]:
+                raise ValueError("merge_run_not_writable")
+            try:
+                run_event_ids = json.loads(run["event_ids_json"] or "[]")
+                payload = json.loads(persisted["input_v1"] or "{}") if persisted else {}
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("merge_source_mismatch") from exc
+            contact_payload = payload.get("contact") if isinstance(payload, Mapping) else None
+            persisted_contact = (
+                str(contact_payload.get("user_id") or contact_payload.get("open_dingtalk_id") or "")
+                if isinstance(contact_payload, Mapping)
+                else ""
+            )
+            if (
+                run["status"] not in {"running", "waiting"}
+                or run["contact_id"] != source_event.contact.identity
+                or run_event_ids != list(event_ids)
+                or not persisted
+                or persisted["conversation_id"] != conversation_id
+                or persisted["contact_user_id"] != source_event.contact.identity
+                or payload.get("self_id") != self.self_id
+                or payload.get("origin") != "watch-gitlab"
+                or payload.get("watch_authority") != watch_authority
+                or payload.get("source_revision") != expected_sha
+                or payload.get("target_branch") != target_ref
+                or persisted_contact != source_event.contact.identity
+            ):
+                raise ValueError("merge_source_mismatch")
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO outgoing(
+                    send_uuid, message_id, conversation_id, contact_user_id,
+                    sent_at, content_sha256, session_id, payload_text,
+                    delivery_status, attempt_count, next_attempt_at, last_error,
+                    event_ids_json, source_received_at, source, target_kind,
+                    receipt_status, remote_marker
+                ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', ?, ?,
+                          'watch', 'gitlab_merge', 'pending', ?)
+                """,
+                (
+                    action_id,
+                    conversation_id,
+                    source_event.contact.identity,
+                    datetime.now(source_event.created_at.tzinfo).isoformat(),
+                    sha256_text(json.dumps(envelope, sort_keys=True, ensure_ascii=False)),
+                    session_id,
+                    json.dumps(envelope, sort_keys=True, ensure_ascii=False),
+                    json.dumps(list(event_ids), ensure_ascii=False),
+                    source_event.created_at.isoformat(),
+                    action_id,
+                ),
+            )
+            if cursor.rowcount:
+                status = "pending"
+            else:
+                existing = self.connection.execute(
+                    "SELECT delivery_status FROM outgoing WHERE send_uuid = ?",
+                    (action_id,),
+                ).fetchone()
+                status = str(existing["delivery_status"])
+            self.connection.commit()
+            return action_id, status
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def gitlab_merge_dispatch_context(
+        self, action_id: str, *, reconcile_only: bool = False
+    ) -> dict[str, Any]:
+        """Revalidate a claimed merge intent and its run fence before remote mutation."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """SELECT payload_text, session_id, event_ids_json, conversation_id,
+                          contact_user_id, delivery_status
+                   FROM outgoing WHERE send_uuid = ? AND target_kind = 'gitlab_merge'""",
+                (action_id,),
+            ).fetchone()
+            if not row or row["delivery_status"] != "sending":
+                raise ValueError("merge_intent_not_owned")
+            envelope = json.loads(row["payload_text"] or "{}")
+            event_ids = json.loads(row["event_ids_json"] or "[]")
+            lease = self.connection.execute(
+                "SELECT revoked_at, revoke_reason FROM task_run_leases WHERE run_id = ?",
+                (row["session_id"],),
+            ).fetchone()
+            run = self.connection.execute(
+                "SELECT contact_id, event_ids_json FROM board_runs WHERE session_id = ?",
+                (row["session_id"],),
+            ).fetchone()
+            if not lease or (not reconcile_only and
+                lease["revoked_at"] and lease["revoke_reason"] != "run_finished"
+            ):
+                raise ValueError("merge_run_revoked")
+            if not run or json.loads(run["event_ids_json"] or "[]") != event_ids:
+                raise ValueError("merge_run_mismatch")
+            if len(event_ids) != 1:
+                raise ValueError("merge_source_mismatch")
+            persisted = self.connection.execute(
+                "SELECT conversation_id, contact_user_id, input_v1 FROM events WHERE message_id = ?",
+                (event_ids[0],),
+            ).fetchone()
+            payload = json.loads(persisted["input_v1"] or "{}") if persisted else {}
+            supplement = self.superseding_conversation_event_ids(
+                str(row["conversation_id"]), event_ids
+            )
+            if (
+                not isinstance(envelope, dict)
+                or not persisted
+                or row["conversation_id"] != persisted["conversation_id"]
+                or row["contact_user_id"] != persisted["contact_user_id"]
+                or run["contact_id"] != persisted["contact_user_id"]
+                or envelope.get("message_id") != event_ids[0]
+                or envelope.get("watch_authority") != payload.get("watch_authority")
+                or envelope.get("expected_sha") != payload.get("source_revision")
+                or envelope.get("target_ref") != payload.get("target_branch")
+                or payload.get("self_id") != self.self_id
+                or payload.get("origin") != "watch-gitlab"
+                or (supplement and not reconcile_only)
+            ):
+                raise ValueError(
+                    "merge_new_input" if supplement and not reconcile_only
+                    else "merge_source_mismatch"
+                )
+            self.connection.commit()
+            return envelope
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def recover_outgoing(self, now: datetime) -> dict[str, int]:
+        """Recover daemon-owned in-flight rows once, without mutating on ordinary DB open."""
+        rows = self.connection.execute(
+            """
+            SELECT send_uuid, conversation_id, delivery_status, sent_at,
+                   card_biz_id
+            FROM outgoing
+            WHERE delivery_status = 'sending'
+               OR (
+                    delivery_status = 'retry_wait'
+                    AND attempt_count = 0
+                    AND next_attempt_at = ''
+                    AND last_error = ''
+               )
+            """
+        ).fetchall()
+        counts = {"retry_wait": 0, "remote_uncertain": 0}
+        self.connection.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            external = str(row["conversation_id"]).startswith(("jira:", "gitlab:"))
+            dws_window_expired = (
+                not external
+                and not row["card_biz_id"]
+                and _idempotency_window_expired(str(row["sent_at"] or ""), now)
+            )
+            uncertain = external or dws_window_expired
+            status = "remote_uncertain" if uncertain else "retry_wait"
+            receipt = "remote_uncertain" if uncertain else "pending"
+            legacy = row["delivery_status"] == "retry_wait"
+            self.connection.execute(
+                """
+                UPDATE outgoing
+                SET delivery_status = ?, receipt_status = ?, next_attempt_at = ?,
+                    last_error = ?
+                WHERE send_uuid = ? AND delivery_status = ?
+                """,
+                (
+                    status,
+                    receipt,
+                    now.isoformat() if external else "",
+                    (
+                        "needs_operator_reconciliation: idempotency_window_expired"
+                        if dws_window_expired
+                        else (
+                            "needs_operator_reconciliation: legacy_inflight"
+                            if legacy
+                            else "daemon_restarted_during_remote_call"
+                        )
+                    ),
+                    row["send_uuid"],
+                    row["delivery_status"],
+                ),
+            )
+            counts[status] += 1
+        self.connection.commit()
+        return counts
 
     def bind_delivery_card(self, send_uuid: str, card_biz_id: str) -> None:
         """把投递行绑定到投递时点创建的卡片；网络重试复用同一张卡。"""
@@ -680,7 +1281,7 @@ class AuditStore:
         row = self.connection.execute(
             """
             SELECT * FROM outgoing
-            WHERE delivery_status IN ('pending', 'retry_wait')
+            WHERE delivery_status IN ('pending', 'retry_wait', 'remote_uncertain')
               AND (next_attempt_at = '' OR next_attempt_at <= ?)
             ORDER BY sent_at ASC
             LIMIT 1
@@ -704,6 +1305,7 @@ class AuditStore:
             """
             UPDATE outgoing
             SET delivery_status = 'retry_wait',
+                receipt_status = 'pending',
                 attempt_count = attempt_count + 1,
                 next_attempt_at = ?,
                 last_error = ?
@@ -717,6 +1319,22 @@ class AuditStore:
         )
         self.connection.commit()
 
+    def mark_delivery_remote_uncertain(
+        self, send_uuid: str, error: str, next_attempt_at: datetime
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE outgoing
+            SET delivery_status = 'remote_uncertain',
+                receipt_status = 'remote_uncertain',
+                attempt_count = attempt_count + 1,
+                next_attempt_at = ?, last_error = ?
+            WHERE send_uuid = ?
+            """,
+            (next_attempt_at.isoformat(), sanitize_text(error, 500), send_uuid),
+        )
+        self.connection.commit()
+
     def mark_delivery_sent(
         self,
         send_uuid: str,
@@ -726,21 +1344,31 @@ class AuditStore:
     ) -> None:
         row = self.connection.execute(
             """
-            SELECT event_ids_json, session_id, card_biz_id, content_sha256
+            SELECT event_ids_json, session_id, card_biz_id, content_sha256,
+                   message_id, target_kind
             FROM outgoing WHERE send_uuid = ?
             """,
             (send_uuid,),
         ).fetchone()
         if row is None:
             return
+        final_card_confirmed = card_flow_status == 3 and row["card_biz_id"]
+        if not (message_id or row["message_id"] or final_card_confirmed):
+            raise ValueError("remote receipt id required before confirming delivery")
         event_ids = json.loads(row["event_ids_json"] or "[]")
+        owns_input_outcome = row["target_kind"] in {
+            "reply",
+            "jira_comment",
+            "gitlab_note",
+        } or (row["target_kind"] == "message" and bool(event_ids))
         self.connection.execute("BEGIN IMMEDIATE")
         self.connection.execute(
             """
             UPDATE outgoing
             SET delivery_status = 'sent', message_id = COALESCE(NULLIF(?, ''), message_id),
                 payload_text = '', next_attempt_at = '', last_error = '',
-                card_flow_status = COALESCE(?, card_flow_status)
+                card_flow_status = COALESCE(?, card_flow_status),
+                receipt_status = 'confirmed'
             WHERE send_uuid = ?
             """,
             (message_id, card_flow_status, send_uuid),
@@ -758,46 +1386,107 @@ class AuditStore:
                     row["card_biz_id"],
                 ),
             )
-        self.connection.executemany(
-            "UPDATE events SET status = 'processed', reason = 'sent' "
-            "WHERE message_id = ?",
-            [(event_id,) for event_id in event_ids],
-        )
-        self.connection.execute(
-            "UPDATE runs SET status = 'sent', reason = '' WHERE session_id = ?",
-            (row["session_id"],),
-        )
+        if owns_input_outcome:
+            self.connection.executemany(
+                "UPDATE events SET status = 'processed', reason = 'sent' "
+                "WHERE message_id = ?",
+                [(event_id,) for event_id in event_ids],
+            )
+            self.connection.execute(
+                "UPDATE runs SET status = 'sent', reason = '' WHERE session_id = ?",
+                (row["session_id"],),
+            )
         self.connection.commit()
 
     def mark_delivery_cancelled(
         self, send_uuid: str, run_status: str, reason: str
     ) -> None:
         row = self.connection.execute(
-            "SELECT event_ids_json, session_id FROM outgoing WHERE send_uuid = ?",
+            """SELECT event_ids_json, session_id, target_kind
+               FROM outgoing WHERE send_uuid = ?""",
             (send_uuid,),
         ).fetchone()
         if row is None:
             return
         event_ids = json.loads(row["event_ids_json"] or "[]")
+        owns_input_outcome = row["target_kind"] in {
+            "reply",
+            "jira_comment",
+            "gitlab_note",
+        } or (row["target_kind"] == "message" and bool(event_ids))
         self.connection.execute("BEGIN IMMEDIATE")
         self.connection.execute(
             """
             UPDATE outgoing
             SET delivery_status = 'cancelled', payload_text = '',
-                next_attempt_at = '', last_error = ?
+                next_attempt_at = '', last_error = ?, receipt_status = 'cancelled'
             WHERE send_uuid = ?
             """,
             (sanitize_text(reason, 500), send_uuid),
         )
-        self.connection.executemany(
-            "UPDATE events SET status = 'skipped', reason = ? WHERE message_id = ?",
-            [(reason, event_id) for event_id in event_ids],
-        )
-        self.connection.execute(
-            "UPDATE runs SET status = ?, reason = ? WHERE session_id = ?",
-            (run_status, reason, row["session_id"]),
-        )
+        if owns_input_outcome:
+            self.connection.executemany(
+                "UPDATE events SET status = 'skipped', reason = ? WHERE message_id = ?",
+                [(reason, event_id) for event_id in event_ids],
+            )
+            self.connection.execute(
+                "UPDATE runs SET status = ?, reason = ? WHERE session_id = ?",
+                (run_status, reason, row["session_id"]),
+            )
         self.connection.commit()
+
+    def delivery_receipts(
+        self, *, session_id: str = "", limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Public, payload-free delivery projection for the dashboard and operators."""
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative")
+        clause = "WHERE session_id = ?" if session_id else ""
+        params: list[Any] = [session_id] if session_id else []
+        order = "ORDER BY rowid"
+        limit_clause = ""
+        if limit is not None:
+            order = """ORDER BY
+                CASE WHEN receipt_status = 'confirmed' THEN 1 ELSE 0 END,
+                CASE WHEN receipt_status != 'confirmed' THEN rowid END,
+                CASE WHEN receipt_status = 'confirmed' THEN rowid END DESC"""
+            limit_clause = "LIMIT ?"
+            params.append(limit)
+        rows = self.connection.execute(
+            f"""
+            SELECT send_uuid, conversation_id, contact_user_id, session_id,
+                   target_kind, delivery_status, receipt_status, message_id,
+                   card_biz_id, attempt_count, last_error, sent_at
+            FROM outgoing {clause}
+            {order}
+            {limit_clause}
+            """,
+            params,
+        ).fetchall()
+        receipts: list[dict[str, Any]] = []
+        for row in rows:
+            conversation_id = str(row["conversation_id"])
+            channel = conversation_id.split(":", 1)[0] if conversation_id.startswith(
+                ("jira:", "gitlab:")
+            ) else "dws"
+            receipts.append(
+                {
+                    "action_id": str(row["send_uuid"]),
+                    "target_kind": str(row["target_kind"]),
+                    "channel": channel,
+                    "destination": str(row["contact_user_id"]),
+                    "recipient": str(row["contact_user_id"]),
+                    "locator": conversation_id,
+                    "session_id": str(row["session_id"]),
+                    "delivery_status": str(row["delivery_status"]),
+                    "receipt_status": str(row["receipt_status"]),
+                    "remote_id": str(row["message_id"] or row["card_biz_id"] or ""),
+                    "attempt_count": int(row["attempt_count"]),
+                    "last_error": str(row["last_error"]),
+                    "queued_at": str(row["sent_at"]),
+                }
+            )
+        return receipts
 
     def remove_outgoing(self, send_uuid: str) -> None:
         self.connection.execute("DELETE FROM outgoing WHERE send_uuid = ?", (send_uuid,))
@@ -1248,6 +1937,7 @@ class AuditStore:
     def apply_task_lookup(
         self,
         *,
+        scope: TaskScope,
         contact_id: str = "",
         status: str = "",
         include_done: bool = False,
@@ -1257,27 +1947,23 @@ class AuditStore:
         run_id: str = "",
         tool_call_id: str = "",
     ) -> dict[str, Any]:
-        """带幂等收据的 task_lookup（黑板读）：同一工具事件重放返回同一份结果。
-
-        读的是整块黑板：默认返回全部联系人的 open/waiting 事项，
-        include_done=True 时含 completed/cancelled（供跨月回访），
-        contact_id 非空时只看该联系人触碰的事项。
-        """
+        """工作会话的读取范围由宿主提供。旧版本的全局查询缓存不能直接重放。"""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             if run_id and tool_call_id:
                 replayed = self._replay_task_response_in_tx(run_id, tool_call_id)
-                if replayed is not None:
+                if replayed is not None and replayed.get("scope") == list(scope):
                     self.connection.commit()
                     return replayed
             tasks = self.board_tasks(
+                scope=scope,
                 contact_id=contact_id,
                 status=status,
                 include_done=include_done,
                 include_archived=include_archived,
                 limit=limit,
             )
-            response = {"ok": True, "tasks": tasks}
+            response = {"ok": True, "tasks": tasks, "scope": list(scope)}
             if run_id and tool_call_id:
                 self._store_task_receipt(run_id, tool_call_id, response, now)
             self.connection.commit()
@@ -1393,6 +2079,7 @@ class AuditStore:
                 ),
             )
             self._insert_facts_tx(task_id, facts, now)
+            self._add_sources_tx(task_id, scope.conversation_id, evidence_message_ids, facts)
             if status in ("completed", "cancelled"):
                 self._record_terminal_event_tx(task_id, goal, status, run_id, now)
             return {
@@ -1422,6 +2109,7 @@ class AuditStore:
                 "error": "task_archived_needs_restore",
                 "task": self._task_row_to_dict(row),
             }
+        self._add_sources_tx(task_id, scope.conversation_id, evidence_message_ids, facts)
         # waiting_on 只在 waiting 状态有意义：显式离开 waiting 且未另提交
         # waiting_on 时一并清空，避免完成/取消/转 open 的事项残留等待说明。
         effective_waiting_on = waiting_on
@@ -1558,6 +2246,63 @@ class AuditStore:
             ),
         )
 
+    def _add_sources_tx(
+        self, task_id: str, conversation_id: str, message_ids: Iterable[str],
+        facts: Sequence[Mapping[str, Any]],
+    ) -> None:
+        anchors = {str(fact.get("anchor_message_id") or "") for fact in facts}
+        anchors.update(message_ids)
+        self.connection.executemany(
+            "INSERT OR IGNORE INTO task_sources VALUES (?, ?, ?)",
+            [(task_id, conversation_id, anchor) for anchor in anchors if anchor],
+        )
+
+    def link_task_source(self, task_id: str, message_id: str, self_id: str) -> bool:
+        """操作者显式把已接收的消息关联到事项。此关联不授予另一会话读写权。"""
+        with self.connection:
+            row = self.connection.execute(
+                """SELECT e.conversation_id FROM events e JOIN tasks t ON t.id = ?
+                   WHERE e.message_id = ? AND t.scope_self = ?
+                   AND (e.input_v1 IS NULL OR json_extract(e.input_v1, '$.self_id') = ?)""",
+                (task_id, message_id, self_id, self_id),
+            ).fetchone()
+            if not row:
+                return False
+            self._add_sources_tx(task_id, row["conversation_id"], [message_id], ())
+        return True
+
+    def task_sources(self, task_id: str) -> list[dict[str, str]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT conversation_id, message_id FROM task_sources WHERE task_id = ? ORDER BY rowid",
+            (task_id,),
+        )]
+
+    def task_watch_authorities(self, task_id: str) -> list[str]:
+        """Return authority from the task's original, same-scope watch source."""
+        return [row[0] for row in self.connection.execute(
+            """WITH creation_source AS (
+                   SELECT s.conversation_id, s.message_id, t.scope_self
+                   FROM task_sources s JOIN tasks t ON t.id = s.task_id
+                   WHERE s.task_id = ? AND s.conversation_id = t.scope_conversation
+                   ORDER BY s.rowid LIMIT 1
+               )
+               SELECT json_extract(e.input_v1, '$.watch_authority')
+               FROM creation_source s JOIN events e
+                 ON e.conversation_id = s.conversation_id AND e.message_id = s.message_id
+               WHERE json_valid(e.input_v1)
+                 AND json_extract(e.input_v1, '$.self_id') = s.scope_self
+                 AND json_extract(e.input_v1, '$.origin') LIKE 'watch-%'
+                 AND json_extract(e.input_v1, '$.watch_authority') != ''""",
+            (task_id,),
+        )]
+
+    def task_run_ids(self, task_id: str) -> list[str]:
+        return [row[0] for row in self.connection.execute(
+            """SELECT run_id FROM tasks WHERE id = ? AND run_id != ''
+               UNION SELECT run_id FROM task_changes WHERE task_id = ? AND run_id != ''""",
+            (task_id, task_id),
+        )]
+
     def _fact_exists_tx(self, task_id: str, fact: Mapping[str, Any]) -> bool:
         """同一 task 下 text+anchor 完全相同的事实视为已存在（只看未归档行）。"""
         text = sanitize_text(fact.get("text"), 2000)
@@ -1623,11 +2368,9 @@ class AuditStore:
             parameters.append(status)
         if not include_archived:
             conditions.append("archived_at = ''")
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
         rows = self.connection.execute(
-            f"""
-            SELECT * FROM tasks WHERE {' AND '.join(conditions)}
-            ORDER BY last_evidence_at DESC LIMIT ?
-            """,
+            f"SELECT * FROM tasks{where} ORDER BY last_evidence_at DESC LIMIT ?",
             (*parameters, max(1, min(int(limit), 50))),
         ).fetchall()
         return [self._task_row_to_dict(row) for row in rows]
@@ -1704,6 +2447,7 @@ class AuditStore:
     def board_tasks(
         self,
         *,
+        scope: TaskScope | None = None,
         contact_id: str = "",
         status: str = "",
         include_done: bool = False,
@@ -1720,6 +2464,9 @@ class AuditStore:
             return []
         conditions = [] if include_archived else ["archived_at = ''"]
         parameters: list[Any] = []
+        if scope is not None:
+            conditions.extend(["scope_self = ?", "scope_contact = ?", "scope_conversation = ?"])
+            parameters.extend(scope)
         if status:
             conditions.append("status = ?")
             parameters.append(status)
@@ -1728,9 +2475,10 @@ class AuditStore:
         if contact_id:
             conditions.append("scope_contact = ?")
             parameters.append(contact_id)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
         rows = self.connection.execute(
             f"""
-            SELECT * FROM tasks WHERE {' AND '.join(conditions)}
+            SELECT * FROM tasks{where}
             ORDER BY last_evidence_at DESC LIMIT ?
             """,
             (*parameters, max(1, min(int(limit), 50))),
@@ -1750,6 +2498,8 @@ class AuditStore:
         headline: str = "",
         now: datetime,
         origin: str = "live",
+        event_ids: Sequence[str] = (),
+        session_dir: Path | str = "",
     ) -> None:
         """登记一次黑板运行；幂等，重复登记保留最早起始时间。
 
@@ -1764,8 +2514,8 @@ class AuditStore:
             """
             INSERT OR IGNORE INTO board_runs(
                 session_id, task_id, contact_id, stage, status, headline,
-                started_at, updated_at, origin
-            ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, updated_at, origin, event_ids_json, session_dir
+            ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -1776,9 +2526,61 @@ class AuditStore:
                 now.isoformat(),
                 now.isoformat(),
                 origin,
+                json.dumps(list(event_ids), ensure_ascii=False),
+                str(session_dir),
             ),
         )
         self.connection.commit()
+
+    def bind_run_inputs(
+        self,
+        session_id: str,
+        event_ids: Sequence[str],
+        *,
+        session_dir: Path | str = "",
+    ) -> None:
+        """补全旧运行的输入与现场路径；已有绑定不被重写。"""
+        if not session_id:
+            return
+        self.connection.execute(
+            """
+            UPDATE board_runs
+            SET event_ids_json = CASE
+                    WHEN event_ids_json = '[]' THEN ? ELSE event_ids_json END,
+                session_dir = CASE
+                    WHEN session_dir = '' THEN ? ELSE session_dir END
+            WHERE session_id = ? AND ended_at IS NULL
+            """,
+            (
+                json.dumps(list(event_ids), ensure_ascii=False),
+                str(session_dir),
+                session_id,
+            ),
+        )
+        self.connection.commit()
+
+    def run_input_rows(self, session_id: str) -> list[dict[str, Any]]:
+        """按运行登记顺序读取输入；不存在或损坏的关联直接忽略。"""
+        run = self.connection.execute(
+            "SELECT event_ids_json FROM board_runs WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not run:
+            return []
+        try:
+            message_ids = json.loads(str(run["event_ids_json"] or "[]"))
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(message_ids, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for message_id in message_ids:
+            row = self.connection.execute(
+                "SELECT * FROM events WHERE message_id = ?", (str(message_id),)
+            ).fetchone()
+            if row:
+                rows.append(dict(row))
+        return rows
 
     def run_origin(self, session_id: str) -> str:
         """读取黑板运行的输入来源；未登记（含服务直写任务）视为 live。"""
@@ -1891,6 +2693,48 @@ class AuditStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def execution_backlog(
+        self, *, owned_session_ids: Iterable[str] = (), limit: int = 10
+    ) -> list[dict[str, str]]:
+        """Oldest execution gaps for operators; intentionally excludes message text."""
+        owned = set(owned_session_ids)
+        items = [
+            {
+                "kind": "queued",
+                "identifier": str(row["message_id"]),
+                "since": str(row["received_at"]),
+            }
+            for row in self.connection.execute(
+                "SELECT message_id, received_at FROM events "
+                "WHERE status = 'queued' ORDER BY received_at"
+            ).fetchall()
+        ]
+        items.extend(
+            {
+                "kind": "startup_manual_review",
+                "identifier": str(row["message_id"]),
+                "since": str(row["received_at"]),
+            }
+            for row in self.connection.execute(
+                "SELECT message_id, received_at FROM events "
+                "WHERE reason LIKE 'startup_%manual_review' ORDER BY received_at"
+            ).fetchall()
+        )
+        items.extend(
+            {
+                "kind": "unowned_run",
+                "identifier": str(row["session_id"]),
+                "since": str(row["started_at"]),
+            }
+            for row in self.connection.execute(
+                "SELECT session_id, started_at FROM board_runs "
+                "WHERE status = 'running' AND ended_at IS NULL ORDER BY started_at"
+            ).fetchall()
+            if str(row["session_id"]) not in owned
+        )
+        items.sort(key=lambda item: (item["since"], item["kind"], item["identifier"]))
+        return items[: max(1, min(int(limit), 50))]
+
     def recent_failed_runs(self, *, since: datetime) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """
@@ -1967,7 +2811,11 @@ class AuditStore:
             INSERT INTO wakes(
                 contact_id, text, origin_task_id, run_session_id,
                 due_at, created_at, waiting_task_id, waiting_on
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE ? = '' OR NOT EXISTS (
+                SELECT 1 FROM wakes WHERE origin_task_id = ? AND waiting_on = ?
+            )
             """,
             (
                 contact_id,
@@ -1978,10 +2826,11 @@ class AuditStore:
                 now.isoformat(),
                 waiting_task_id,
                 waiting_on,
+                waiting_on, origin_task_id, waiting_on,
             ),
         )
         self.connection.commit()
-        return int(cursor.lastrowid or 0)
+        return int(cursor.lastrowid) if cursor.rowcount else 0
 
     def enqueue_fanout_wake_tx(
         self,
@@ -2071,40 +2920,17 @@ class AuditStore:
         self.connection.commit()
         return cursor.rowcount
 
-    def wake_exists(self, origin_task_id: str, waiting_on: str) -> bool:
-        """同任务同一 waiting_on 值是否已有未派发 wake（时刻唤醒去重键）。
-
-        只看 pending/claimed：已派发（done）的 wake 不再挡住新的入队，
-        改约时间（waiting_on 变化）或再次到点都能重新唤醒。
-        """
-        row = self.connection.execute(
-            """
-            SELECT 1 FROM wakes
-            WHERE origin_task_id = ? AND waiting_on = ?
-              AND status IN ('pending', 'claimed')
-            LIMIT 1
-            """,
-            (origin_task_id, waiting_on),
-        ).fetchone()
-        return row is not None
-
-    def wake_dispatch_count(self, origin_task_id: str, waiting_on: str) -> int:
-        """同任务同一 waiting_on 值已派发（含失败）的 wake 总数。
-
-        时刻唤醒的机械封顶依据：模型侧 task_record 闭环不可靠时，
-        同一时刻不允许无限重发（每次重发都是一轮真实模型运行）。
-        """
-        row = self.connection.execute(
-            """
-            SELECT count(*) FROM wakes
-            WHERE origin_task_id = ? AND waiting_on = ?
-            """,
-            (origin_task_id, waiting_on),
-        ).fetchone()
-        return int(row[0]) if row else 0
+    def recover_claimed_wakes(self) -> int:
+        """Startup-only recovery: the singleton owner adopts every prior claim."""
+        cursor = self.connection.execute(
+            "UPDATE wakes SET status = 'pending', claimed_at = '' "
+            "WHERE status = 'claimed'"
+        )
+        self.connection.commit()
+        return cursor.rowcount
 
     def time_waiting_tasks(self) -> list[dict[str, Any]]:
-        """全部 waiting_on=@时刻 的未归档 waiting 事项，不设条数上限。
+        """全部 waiting_on=@时刻 的 waiting 事项（包括已退出上下文的事项），不设条数上限。
 
         到点扫描专用查询：board_tasks 的 50 条截断会让排位靠后的
         等待事项永远轮不到检查。
@@ -2113,7 +2939,6 @@ class AuditStore:
             """
             SELECT * FROM tasks
             WHERE waiting_on LIKE '@%' AND status = 'waiting'
-              AND archived_at = ''
             ORDER BY last_evidence_at DESC
             """
         ).fetchall()
@@ -2145,16 +2970,14 @@ class AuditStore:
                 verb = "任务完成" if str(row["status"]) == "completed" else "任务取消"
                 text = f"{verb}：{row['goal']}，结果见 board"
                 for waiter in self.tasks_waiting_on(f"task:{row['task_id']}"):
-                    for contact_id in waiter["contact_ids"] or [
-                        waiter["contact_id"]
-                    ]:
-                        self.enqueue_fanout_wake_tx(
-                            contact_id,
-                            text,
-                            now=now,
-                            origin_task_id=str(row["task_id"]),
-                            waiting_task_id=str(waiter["id"]),
-                        )
+                    same_audience = self.same_task_audience(str(row["task_id"]), waiter["id"])
+                    self.enqueue_fanout_wake_tx(
+                        waiter["contact_id"],
+                        text if same_audience else "关联事项已有进展，请核对本事项。",
+                        now=now,
+                        origin_task_id=str(row["task_id"]),
+                        waiting_task_id=str(waiter["id"]),
+                    )
             self.connection.execute(
                 "UPDATE task_terminal_events SET handled_at = ? WHERE id = ?",
                 (now.isoformat(), event_id),
@@ -2191,15 +3014,27 @@ class AuditStore:
         self.connection.commit()
 
     def tasks_waiting_on(self, waiting_on: str) -> list[dict[str, Any]]:
-        """查在等某个对象的未归档 waiting 事项（waiting_on:task:<id> 等待方）。"""
+        """查在等某个对象的 waiting 事项（waiting_on:task:<id> 等待方）。"""
         rows = self.connection.execute(
             """
             SELECT * FROM tasks
-            WHERE waiting_on = ? AND status = 'waiting' AND archived_at = ''
+            WHERE waiting_on = ? AND status = 'waiting'
             """,
             (waiting_on,),
         ).fetchall()
         return [self._task_row_to_dict(row) for row in rows]
+
+    def same_task_audience(self, left: str, right: str) -> bool:
+        return self.connection.execute(
+            """SELECT 1 FROM tasks a JOIN tasks b USING(scope_self, scope_contact, scope_conversation)
+               WHERE a.id = ? AND b.id = ?""", (left, right),
+        ).fetchone() is not None
+
+    def wake_task(self, wake: Mapping[str, Any]) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (wake.get("waiting_task_id") or wake.get("origin_task_id"),),
+        ).fetchone()
 
     def task_conversation(self, task_id: str) -> str:
         """按事项 id 取其作用域 conversation（只读；事项不存在返回空串）。
@@ -2246,7 +3081,6 @@ class AuditStore:
             ).fetchone()
             if (
                 row is None
-                or row["archived_at"]
                 or str(row["waiting_on"]) != operator_name
                 or str(row["status"]) != "waiting"
             ):
@@ -2262,33 +3096,19 @@ class AuditStore:
             self.connection.execute(
                 """
                 UPDATE tasks
-                SET status = 'open', waiting_on = '', updated_at = ?,
+                SET status = 'open', waiting_on = '', archived_at = '', archive_reason = '',
+                    updated_at = ?, last_evidence_at = ?,
                     version = version + 1
                 WHERE id = ? AND waiting_on = ? AND version = ?
                 """,
-                (now.isoformat(), task_id, operator_name, int(row["version"])),
+                (now.isoformat(), now.isoformat(), task_id, operator_name, int(row["version"])),
             )
             text = f"操作者已答复：{sanitize_text(answer, 2000)}"
-            contact_ids = json.loads(row["contact_ids"] or "[]")
-            contact_ids = [
-                item for item in contact_ids if isinstance(item, str)
-            ] or [str(row["scope_contact"])]
-            for contact_id in contact_ids:
-                self.connection.execute(
-                    """
-                    INSERT INTO wakes(
-                        contact_id, text, origin_task_id,
-                        due_at, created_at, status
-                    ) VALUES (?, ?, ?, ?, ?, 'pending')
-                    """,
-                    (
-                        contact_id,
-                        text,
-                        task_id,
-                        now.isoformat(),
-                        now.isoformat(),
-                    ),
-                )
+            self.connection.execute(
+                """INSERT INTO wakes(contact_id, text, origin_task_id, due_at, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (row["scope_contact"], text, task_id, now.isoformat(), now.isoformat()),
+            )
             self.connection.commit()
             return {
                 "ok": True,

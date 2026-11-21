@@ -72,7 +72,7 @@ TOOLS = [
             "properties": {
                 "task_id": {"type": "string"},
                 "goal": {"type": "string"},
-                "status": {"type": "string", "enum": ["active", "waiting", "completed", "cancelled"]},
+                "status": {"type": "string", "enum": ["open", "waiting", "completed", "cancelled"]},
                 "ask": {"type": "string"},
                 "waiting_on": {"type": "string"},
                 "evidence_summary": {"type": "string"},
@@ -92,13 +92,13 @@ TOOLS = [
                 "expected_version": {"type": "integer"},
                 "restore": {"type": "boolean"},
             },
-            "required": ["task_id"],
+            "anyOf": [{"required": ["goal"]}, {"required": ["task_id", "expected_version"]}],
             "additionalProperties": False,
         },
     },
     {
         "name": "task_lookup",
-        "description": "查询长期事项（含跨联系人黑板读）。",
+        "description": "查询当前来源会话可见的长期事项。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -112,6 +112,27 @@ TOOLS = [
         },
     },
 ]
+
+GITLAB_MERGE_TOOL = {
+    "name": "gitlab_merge_request",
+    "description": (
+        "请求服务重新核验并合并当前已审查的 GitLab MR；入队不代表合并成功。"
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"assessment": {"type": "string", "minLength": 1, "maxLength": 1000}},
+        "required": ["assessment"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _available_tools() -> list[dict[str, Any]]:
+    try:
+        context = task_tools._context_from_env()
+    except (OSError, ValueError, json.JSONDecodeError):
+        context = {}
+    return [*TOOLS, GITLAB_MERGE_TOOL] if context.get("merge_review") else TOOLS
 
 
 def _respond(request_id: Any, result: Any) -> None:
@@ -203,11 +224,12 @@ def main() -> None:
         elif method == "ping":
             _respond(request_id, {})
         elif method == "tools/list":
-            _respond(request_id, {"tools": TOOLS})
+            _respond(request_id, {"tools": _available_tools()})
         elif method == "tools/call":
             params = request.get("params", {})
             name = str(params.get("name") or "") if isinstance(params, dict) else ""
-            if name not in {"no_reply", "report", "task_record", "task_lookup"}:
+            available_names = {tool["name"] for tool in _available_tools()}
+            if name not in available_names:
                 _error(request_id, f"unknown_tool: {name or '(empty)'}")
                 continue
             try:

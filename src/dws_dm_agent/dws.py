@@ -71,6 +71,13 @@ def _find_dws_error_code(*streams: bytes) -> str:
 
 
 class DwsClient:
+    # Channel 协议面：dws 是默认投递通道（钉钉 DM 全链）。
+    name = "dws"
+    processing_reactions = True
+    supports_freshness = True
+    retry_safe = True
+    supports_reconciliation = False
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         raw = settings.raw.get("dws", {})
@@ -254,13 +261,16 @@ class DwsClient:
     ) -> list[str]:
         arguments = [
             "chat", "message", "send", target_flag, target_value,
-            "--text", content,
+            "--content", content,
             f"--ai-tag={'true' if self.ai_tag else 'false'}",
-            "--uuid", send_uuid, "--yes",
+            "--idempotency-key", send_uuid, "--yes",
         ]
         if dry_run:
             arguments.append("--dry-run")
         return arguments
+
+    async def find_receipt(self, contact: Contact, send_uuid: str) -> str | None:
+        return None
 
     async def send_card(
         self, contact: Contact
@@ -341,8 +351,8 @@ class DwsClient:
         payload = await self._send_json_command(
             [
                 "chat", "message", "send", *target, "--msg-type", "file",
-                "--file-path", str(file_path),
-                f"--ai-tag={'true' if self.ai_tag else 'false'}", "--uuid", send_uuid, "--yes",
+                "--file", str(file_path),
+                f"--ai-tag={'true' if self.ai_tag else 'false'}", "--idempotency-key", send_uuid, "--yes",
             ],
             timeout=180,
         )

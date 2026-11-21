@@ -20,8 +20,8 @@ from ..core import Contact
 class SourceItem:
     """一次外部变化的标准化描述。
 
-    dedup_key 全局稳定（`jira:PROJ-123` / `gitlab:group!1!42`），直接当
-    events 表的 message_id（UNIQUE 幂等靠它）；conversation_id 决定
+    dedup_key 标识来源资源（`jira:PROJ-123` / `gitlab:group/project!42`）。
+    service 用来源和规则目标生成幂等事件 ID。conversation_id 决定
     投递通道（前缀查 Channel 注册表）；contact 是该会话的投递身份
     （外部源用虚拟 Contact，alias 即 issue key / project!mr）。
     """
@@ -39,6 +39,12 @@ class SourceItem:
 @runtime_checkable
 class InboundSource(Protocol):
     name: str
+
+    @classmethod
+    def build(cls, rules: list) -> "InboundSource | None":
+        """把 `rule.source == cls.name` 的规则合并成一个源实例；
+        无规则或凭据缺失返回 None（由实现自己决定取舍）。"""
+        ...
 
     async def poll(self, since: datetime) -> list[SourceItem]:
         """返回 since 之后的新对象；空列表 = 本轮无事。异常由 service

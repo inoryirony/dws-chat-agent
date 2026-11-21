@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -226,4 +227,78 @@ def _pi_final_reply_text(messages: list[Any]) -> str:
     return ""
 
 
-__all__ = ["PiAdapter", "START_HANDSHAKE_TIMEOUT_SECONDS", "sys"]
+def recover_pi_settlement(
+    events_path: Path, report_path: Path | None = None
+) -> tuple[str, str]:
+    """从完整 pi 事件流恢复已认证终态；result.txt 不参与判定。"""
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "", ""
+    candidate = ""
+    report_seen = False
+    silent_seen = False
+    settled_result: tuple[str, str] = ("", "")
+    last_event_type = ""
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return "", ""
+        if not isinstance(event, Mapping):
+            return "", ""
+        event_type = str(event.get("type") or "")
+        if (
+            last_event_type == "agent_settled"
+            and event_type == "response"
+            and event.get("command") == "abort"
+            and event.get("success") is True
+        ):
+            # close() 可在终态落盘后收到退出确认；该回执没有启动下一轮。
+            continue
+        last_event_type = event_type
+        if event_type == "tool_execution_end" and not event.get("isError"):
+            tool_name = str(event.get("toolName") or "").lower()
+            report_seen = report_seen or tool_name == "report" or tool_name.endswith(
+                ("__report", "/report", ":report")
+            )
+            silent_seen = silent_seen or tool_name == "no_reply" or tool_name.endswith(
+                ("__no_reply", "/no_reply", ":no_reply")
+            )
+        elif event_type == "agent_end":
+            messages = event.get("messages")
+            candidate = _pi_final_reply_text(messages) if isinstance(messages, list) else ""
+        elif event_type == "agent_settled":
+            if report_seen:
+                settled_result = ("report", "")
+            elif silent_seen:
+                settled_result = ("silent", "")
+            elif candidate:
+                settled_result = ("final", candidate)
+            else:
+                settled_result = ("", "")
+            candidate = ""
+            report_seen = False
+            silent_seen = False
+    if last_event_type != "agent_settled":
+        return "", ""
+    kind, text = settled_result
+    if kind == "report" and report_path is not None:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "", ""
+        kind = str(report.get("kind") or "")
+        text = str(report.get("text") or "").strip()
+        if kind in {"final", "blocked"} and text:
+            return kind, text
+        return "", ""
+    return (kind, text) if kind in {"final", "silent"} else ("", "")
+
+
+__all__ = [
+    "PiAdapter",
+    "START_HANDSHAKE_TIMEOUT_SECONDS",
+    "recover_pi_settlement",
+    "sys",
+]

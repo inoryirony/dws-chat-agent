@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,12 +29,17 @@ if os.name == "nt":
 else:
     import fcntl
 
-from .runners.runtime import AgentRuntime, AgentSession, WorktreeError
+from .runners.adapters.pi import recover_pi_settlement
+from .runners.runtime import (
+    AgentRuntime,
+    AgentSession,
+    WorktreeError,
+)
 from .runners.task_tools import TASK_MEMORY_LIMITS_TEXT
 from . import stages as stage_registry
-from .channels import channel_for
-from .sources import GitLabSource, JiraSource, SourceItem
-from .watches import parse_watches, rule_for_item
+from .channels import Channel, channel_for
+from .sources import SOURCE_TYPES, SourceItem
+from .watches import WatchRule, parse_watches, rule_for_item
 from .skills_catalog import resolve_skills, skills_prompt_block
 from .prompts import (
     neutralize_structural_tags,
@@ -52,6 +58,7 @@ from .core import (
     SecurityGate,
     canonical_message_text,
     human_owns_conversation,
+    _idempotency_window_expired,
     parse_dws_event,
     parse_local_datetime,
     sanitize_text,
@@ -79,6 +86,11 @@ _IMAGE_MEDIA_ID = re.compile(r"\[图片消息\]\(mediaId=([^)\s]+)\)")
 _MAX_IMAGES = MAX_IMAGES
 _MAX_IMAGE_BYTES = MAX_IMAGE_BYTES
 _STREAM_CARD_BIND_TIMEOUT_SECONDS = 6.0
+_DELIVERY_TIMEOUT_SECONDS = 30.0
+# 历史拉取的外层兜底超时：底层 dws CLI 每次尝试自带 45s 超时，正常
+# 秒回；这里只兜「内部超时处理器仍挂死」的病态情况（见 _history 注释），
+# 覆盖一次完整的内部重试链（3×45s）绰绰有余，又把挂死变成可重试异常。
+_HISTORY_TIMEOUT_SECONDS = 150.0
 # 活跃事项快照注入 prompt 的上限；超出部分用 task_lookup 查询，不悄悄丢失。
 _TASK_SNAPSHOT_LIMIT = 8
 # 事项无实质更新后的归档天数（task_memory.inactive_days 可覆盖）。
@@ -103,11 +115,109 @@ _OPERATOR_INSTRUCTION_DISCLAIMER = (
     "这是操作者本人下达的指令，按最高授权执行。"
 )
 _TIME_WAITING_PATTERN = re.compile(r"^@(.+)$")
-# 时刻唤醒机械封顶：同一任务同一时刻最多派发这么多轮（含失败）。
-_TIME_WAKE_MAX_DISPATCHES = 3
-# claimed wake 超过该时长未收口视为派发进程已死：启动扫尾回置 pending
-# 重放（crash 后的合成输入最多迟 30 分钟，绝不丢）。
-_STALE_CLAIM_AGE = timedelta(minutes=30)
+class AttachmentValidationError(ValueError):
+    """A generated file no longer matches its session-bound delivery record."""
+
+
+@dataclass(frozen=True)
+class _DeliveryAttachment:
+    path: Path
+    sha256: str
+
+
+def _delivery_directory(
+    state_dir: Path, session_id: str, *, create: bool = False
+) -> Path:
+    """Return one session's delivery directory without accepting path syntax."""
+    if (
+        not session_id
+        or session_id in {".", ".."}
+        or Path(session_id).name != session_id
+    ):
+        raise AttachmentValidationError("attachment_session_id_invalid")
+    root = (state_dir / "deliveries").resolve()
+    target = root / session_id
+    if target.resolve(strict=False).parent != root:
+        raise AttachmentValidationError("attachment_path_outside_session")
+    if target.is_symlink():
+        raise AttachmentValidationError("attachment_session_symlink_not_allowed")
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+        target.mkdir(mode=0o700, exist_ok=True)
+    if target.exists() and not target.is_dir():
+        raise AttachmentValidationError("attachment_session_not_directory")
+    return target
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_delivery_attachment(
+    state_dir: Path,
+    session_id: str,
+    file_path: Path,
+    expected_sha256: str,
+) -> Path:
+    delivery_dir = _delivery_directory(state_dir, session_id).resolve()
+    if file_path.is_symlink():
+        raise AttachmentValidationError("attachment_symlink_not_allowed")
+    try:
+        resolved = file_path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise AttachmentValidationError("attachment_file_missing") from exc
+    if resolved.parent != delivery_dir:
+        raise AttachmentValidationError("attachment_path_outside_session")
+    if not resolved.is_file():
+        raise AttachmentValidationError("attachment_not_regular_file")
+    if not secrets.compare_digest(_file_sha256(resolved), expected_sha256):
+        raise AttachmentValidationError("attachment_sha256_changed")
+    return resolved
+
+
+def _delivery_attachment_action_id(
+    source_event: IncomingEvent,
+    file_name: str,
+    file_sha256: str,
+    *,
+    event_ids: Sequence[str],
+) -> str:
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(
+                {
+                    "kind": "attachment_v1",
+                    "conversation": source_event.conversation_id,
+                    "recipient": source_event.contact.identity,
+                    "inputs": sorted(set(event_ids)),
+                    "file": file_name,
+                    "sha256": file_sha256,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+    )
+
+
+def _discover_delivery_attachments(
+    state_dir: Path, session_id: str
+) -> tuple[_DeliveryAttachment, ...]:
+    delivery_dir = _delivery_directory(state_dir, session_id)
+    if not delivery_dir.exists():
+        return ()
+    attachments: list[_DeliveryAttachment] = []
+    for path in sorted(delivery_dir.iterdir()):
+        if path.name.startswith(".") or path.is_symlink() or not path.is_file():
+            continue
+        attachments.append(_DeliveryAttachment(path.resolve(), _file_sha256(path)))
+    return tuple(attachments)
 
 
 
@@ -195,6 +305,28 @@ def _is_synthetic_event(event: IncomingEvent) -> bool:
     集与联系人消息清单；wake 额外无新授权，operator 出自本人=最高授权。
     """
     return event.origin in {"wake", "panel", "operator"}
+
+
+def _final_reply_action_id(
+    source_event: IncomingEvent, event_ids: Sequence[str]
+) -> str:
+    """One logical reply keeps the same id across normal and startup paths."""
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(
+                {
+                    "kind": "final_reply_v1",
+                    "conversation": source_event.conversation_id,
+                    "recipient": source_event.contact.identity,
+                    "inputs": sorted(set(event_ids)),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+    )
 
 
 def _system_wake_block(entries: Sequence[tuple[str, str]]) -> str:
@@ -426,7 +558,7 @@ class AgentService:
             settings.raw, settings.config_path, settings.workspace_root
         )
         self.open_dashboard = open_dashboard
-        self.store = AuditStore(settings.state_dir / "audit.sqlite3")
+        self.store = AuditStore(settings.state_dir / "audit.sqlite3", self_id=settings.self_open_id)
         security = settings.raw.get("security", {})
         self.gate = SecurityGate(
             max_chars=int(security.get("max_message_chars", 12000))
@@ -489,13 +621,11 @@ class AgentService:
         self.settings.worktree_root.mkdir(parents=True, exist_ok=True)
         LOG.info("starting mode=%s contacts=%d", self.mode, len(self.settings.contacts))
         now = datetime.now(self.settings.timezone)
-        aborted_runs = self.store.abort_stale_runs(now)
-        if aborted_runs:
-            LOG.warning("startup aborted stale board runs count=%d", len(aborted_runs))
-            self._reclaim_orphan_worktrees(aborted_runs)
-        replayed = self.store.recover_stale_wakes(
-            now, max_claim_age=_STALE_CLAIM_AGE
-        )
+        self.store.recover_outgoing(now)
+        recovered_runs = self._recover_orphan_runs()
+        if recovered_runs:
+            self._reclaim_orphan_worktrees(recovered_runs)
+        replayed = self.store.recover_claimed_wakes()
         if replayed:
             LOG.warning("startup replayed claimed wakes count=%d", replayed)
         days = self._task_memory_inactive_days()
@@ -583,6 +713,278 @@ class AgentService:
                 stream.write(content)
             os.chmod(path, 0o600)
 
+    def _recover_orphan_runs(self) -> list[dict[str, Any]]:
+        """收口上次进程遗留的运行；只承接可认证终态，绝不重启旧会话。"""
+        runs = [
+            dict(row)
+            for row in self.store.active_runs()
+            if str(row.get("status") or "") == "running"
+        ]
+        if not runs:
+            return []
+        now = datetime.now(self.settings.timezone)
+        reclaimable: list[dict[str, Any]] = []
+        for run in runs:
+            session_id = str(run["session_id"])
+            session_dir = self._orphan_session_dir(run)
+            if session_dir is not None:
+                event_ids = self._legacy_run_event_ids(run, session_dir)
+                if event_ids:
+                    self.store.bind_run_inputs(
+                        session_id, event_ids, session_dir=session_dir
+                    )
+            batch = self._run_input_events(
+                session_id, str(run["contact_id"]), session_dir=session_dir
+            )
+            if not batch:
+                invalid_ids = [
+                    str(row["message_id"])
+                    for row in self.store.run_input_rows(session_id)
+                    if str(row["status"]) == "queued"
+                ]
+                if invalid_ids:
+                    self.store.update_event_status(
+                        invalid_ids, "error", "startup_input_invalid_manual_review"
+                    )
+            outcome, reply = (
+                recover_pi_settlement(
+                    session_dir / "events.jsonl", session_dir / "report.json"
+                )
+                if session_dir is not None
+                else ("", "")
+            )
+            if batch and outcome in {"final", "blocked"}:
+                existing = self.store.connection.execute(
+                    """SELECT delivery_status FROM outgoing WHERE session_id = ?
+                       AND event_ids_json != '[]'
+                       AND target_kind IN ('reply', 'jira_comment', 'gitlab_note', 'message')
+                       LIMIT 1""",
+                    (session_id,),
+                ).fetchone()
+                blocked_reason = self._orphan_recovery_block_reason(run, batch)
+                if existing is None and not blocked_reason:
+                    event_ids = [item.message_id for item in batch]
+                    self.store.enqueue_delivery(
+                        _final_reply_action_id(batch[0], event_ids),
+                        min(batch, key=lambda item: item.created_at),
+                        sanitize_text(
+                            reply,
+                            int(self.settings.raw.get("max_reply_chars", 16000)),
+                        ),
+                        session_id,
+                        event_ids=event_ids,
+                    )
+                    if not batch[0].conversation_id.startswith(("jira:", "gitlab:", "panel:")):
+                        self._enqueue_delivery_attachments(batch, session_id)
+                    delivery_status = "delivery_pending"
+                    self.outbox_wakeup.set()
+                elif existing is not None and str(existing["delivery_status"]) in {
+                    "pending",
+                    "retry_wait",
+                    "sending",
+                    "remote_uncertain",
+                }:
+                    delivery_status = "delivery_pending"
+                elif existing is not None and str(existing["delivery_status"]) == "sent":
+                    delivery_status = "sent"
+                elif existing is not None and str(existing["delivery_status"]) == "cancelled":
+                    delivery_status = "cancelled"
+                else:
+                    delivery_status = "manual_review"
+                    if existing is None:
+                        self._mark_orphan_inputs_for_review(
+                            batch,
+                            blocked_reason or "startup_settled_manual_review",
+                        )
+                result = AgentResult(
+                    session_id,
+                    reply,
+                    0,
+                    self._run_started_at(run, now),
+                    now,
+                    blocked=outcome == "blocked",
+                    error=(blocked_reason if delivery_status == "manual_review" else ""),
+                )
+                self._record_agent_result(batch, result, status=delivery_status)
+                if outcome != "blocked":
+                    reclaimable.append(run)
+                LOG.info("startup adopted settled run session=%s", session_id)
+                continue
+            if batch and outcome == "silent":
+                blocked_reason = self._orphan_recovery_block_reason(run, batch)
+                result = AgentResult(
+                    session_id,
+                    None,
+                    0,
+                    self._run_started_at(run, now),
+                    now,
+                    silent=True,
+                    error=blocked_reason,
+                )
+                if blocked_reason:
+                    self._mark_orphan_inputs_for_review(batch, blocked_reason)
+                    self._record_agent_result(batch, result, status="manual_review")
+                else:
+                    self._record_agent_result(batch, result, status="silent")
+                    self.store.update_event_status(
+                        (item.message_id for item in batch), "processed", "silent"
+                    )
+                reclaimable.append(run)
+                LOG.info("startup adopted silent run session=%s", session_id)
+                continue
+            if batch:
+                self.store.update_event_status(
+                    (item.message_id for item in batch),
+                    "error",
+                    "startup_interrupted_manual_review",
+                )
+                self.store.record_run(
+                    session_id=session_id,
+                    conversation_id=batch[0].conversation_id,
+                    contact=batch[0].contact,
+                    started_at=self._run_started_at(run, now),
+                    finished_at=now,
+                    action="handoff",
+                    status="error",
+                    handled="",
+                    reason="startup_interrupted_manual_review",
+                    codex_exit_code=None,
+                    request_preview=self._request_preview(batch),
+                )
+            self.store.close_run(session_id, "aborted", now=now)
+            reclaimable.append(run)
+            LOG.warning("startup interrupted orphan run session=%s", session_id)
+        return reclaimable
+
+    def _orphan_recovery_block_reason(
+        self, run: Mapping[str, Any], batch: Sequence[IncomingEvent]
+    ) -> str:
+        if self.mode != "live":
+            return "startup_mode_manual_review"
+        if not batch or not all(self._input_authorized(item) for item in batch):
+            return "source_authorization_changed"
+        expected_origin = (
+            "synthetic" if any(_is_synthetic_event(item) for item in batch) else "live"
+        )
+        if str(run.get("origin") or "") != expected_origin or any(
+            item.origin == "panel" for item in batch
+        ):
+            return "startup_source_manual_review"
+        rows = self.store.run_input_rows(str(run["session_id"]))
+        if len(rows) != len(batch) or any(str(row["status"]) != "queued" for row in rows):
+            return "startup_input_state_manual_review"
+        # 旧记录只有摘要，无法证明原始授权与收件范围。已存在的发件回执仍可照常接续。
+        if any(not row.get("input_v1") for row in rows):
+            return "startup_legacy_input_manual_review"
+        earliest = min(item.created_at for item in batch)
+        if self._human_owns_conversation(
+            self.store.latest_manual(batch[0].conversation_id), earliest
+        ):
+            return "manual_takeover"
+        if self.store.superseding_conversation_event_ids(
+            batch[0].conversation_id, [item.message_id for item in batch], include_resolved=True
+        ):
+            return "startup_newer_input_manual_review"
+        return ""
+
+    def _mark_orphan_inputs_for_review(
+        self, batch: Sequence[IncomingEvent], reason: str
+    ) -> None:
+        queued_ids = [
+            str(row["message_id"])
+            for row in self.store.connection.execute(
+                "SELECT message_id FROM events WHERE message_id IN ({}) "
+                "AND status = 'queued'".format(
+                    ",".join("?" for _ in batch)
+                ),
+                tuple(item.message_id for item in batch),
+            ).fetchall()
+        ]
+        if queued_ids:
+            self.store.update_event_status(
+                queued_ids,
+                "skipped" if reason == "manual_takeover" else "error",
+                "manual_takeover" if reason == "manual_takeover" else reason,
+            )
+
+    def _orphan_session_dir(self, run: Mapping[str, Any]) -> Path | None:
+        raw_stored = str(run.get("session_dir") or "")
+        stored = Path(raw_stored)
+        if raw_stored and stored.is_dir():
+            return stored
+        session_id = str(run["session_id"])
+        matches = sorted((self.settings.state_dir / "sessions").glob(f"{session_id}-*"))
+        return matches[0] if len(matches) == 1 and matches[0].is_dir() else None
+
+    @staticmethod
+    def _run_started_at(run: Mapping[str, Any], fallback: datetime) -> datetime:
+        try:
+            return datetime.fromisoformat(str(run["started_at"]))
+        except (KeyError, TypeError, ValueError):
+            return fallback
+
+    def _legacy_run_event_ids(
+        self, run: Mapping[str, Any], session_dir: Path
+    ) -> list[str]:
+        try:
+            current = json.loads(str(run.get("event_ids_json") or "[]"))
+        except json.JSONDecodeError:
+            current = []
+        if isinstance(current, list) and current:
+            return [str(item) for item in current]
+        try:
+            context = json.loads(
+                (session_dir / "task-context.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return []
+        message_times = context.get("message_times")
+        return list(message_times) if isinstance(message_times, Mapping) else []
+
+    def _run_input_events(
+        self,
+        session_id: str,
+        expected_contact_id: str,
+        *,
+        session_dir: Path | None = None,
+    ) -> list[IncomingEvent]:
+        contacts = {contact.identity: contact for contact in self.settings.contacts}
+        legacy_context: Mapping[str, Any] = {}
+        if session_dir is not None:
+            try:
+                parsed_context = json.loads(
+                    (session_dir / "task-context.json").read_text(encoding="utf-8")
+                )
+                if isinstance(parsed_context, Mapping):
+                    legacy_context = parsed_context
+            except (OSError, json.JSONDecodeError):
+                pass
+        events: list[IncomingEvent] = []
+        for row in self.store.run_input_rows(session_id):
+            if row["contact_user_id"] != expected_contact_id:
+                return []
+            try:
+                if row["input_v1"] is not None:
+                    event = IncomingEvent.from_input_row(row, self_id=self.settings.self_open_id)
+                else:
+                    if (
+                        legacy_context.get("self_id") != self.settings.self_open_id
+                        or legacy_context.get("contact_id") != expected_contact_id
+                        or legacy_context.get("conversation_id") != row["conversation_id"]
+                    ):
+                        return []
+                    event = IncomingEvent(
+                        row["event_id"], row["message_id"], row["conversation_id"],
+                        contacts[expected_contact_id], row["request_preview"],
+                        datetime.fromisoformat(row["received_at"]),
+                    )
+            except (KeyError, TypeError, ValueError):
+                return []
+            if event is None or event.contact.identity != expected_contact_id:
+                return []
+            events.append(event)
+        return events
+
     def _reclaim_orphan_worktrees(self, aborted_runs: Sequence[Mapping[str, Any]]) -> None:
         """回收崩溃运行的 worktree：路径在 worktree_root 下且 git 仍登记。
 
@@ -613,10 +1015,40 @@ class AgentService:
                     raw_path,
                 )
                 continue
+            status = subprocess.run(
+                ["git", "-C", str(path), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            worktree_head = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            main_head = subprocess.run(
+                ["git", "-C", str(source_repo), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if (
+                status.returncode != 0
+                or status.stdout.strip()
+                or worktree_head.returncode != 0
+                or main_head.returncode != 0
+                or worktree_head.stdout.strip() != main_head.stdout.strip()
+            ):
+                LOG.warning(
+                    "skip worktree reclaim with local changes or distinct commit path=%s",
+                    raw_path,
+                )
+                continue
             completed = subprocess.run(
                 [
                     "git", "-C", str(source_repo),
-                    "worktree", "remove", "--force", str(path),
+                    "worktree", "remove", str(path),
                 ],
                 capture_output=True,
                 text=True,
@@ -650,13 +1082,36 @@ class AgentService:
         main_git = gitdir.parent.parent
         return main_git if (main_git / "HEAD").exists() else None
 
+    def _input_authorized(self, event: IncomingEvent) -> bool:
+        if event.conversation_id.startswith(("jira:", "gitlab:")):
+            return any(
+                rule.authority_key == event.watch_authority
+                and event.origin in {rule.origin, "wake"}
+                and event.conversation_id.startswith(rule.source + ":")
+                and event.contact.identity == event.conversation_id
+                for rule in parse_watches(self.settings.raw.get("watches"))
+            )
+        if event.conversation_id.startswith("panel:"):
+            return event.origin in {"panel", "wake"} and event.contact.identity == self.settings.self_open_id
+        return event.origin in {"dm", "operator", "wake"} and any(
+            (c.identity, c.open_dingtalk_id) == (event.contact.identity, event.contact.open_dingtalk_id)
+            for c in self.settings.contacts
+        )
+
     async def _recover_pending_events(self) -> None:
+        for event in self.store.replayable_inputs():
+            if self._input_authorized(event):
+                self._enqueue(event)
+            else:
+                self.store.update_event_status([event.message_id], "skipped", "source_authorization_changed")
+
         async def recover(contact: Contact) -> None:
-            pending = self.store.pending_event_ids(contact.identity)
+            # 旧版只存摘要，必须从原会话补收，不让截断预览成为执行输入。
+            pending = self.store.pending_event_ids(contact.identity, legacy_only=True)
             if not pending:
                 return
             try:
-                history = await self.dws.history(contact)
+                history = await self._history(contact)
             except Exception as exc:
                 LOG.warning("queued event recovery failed contact=%s error=%s", contact.alias, exc)
                 return
@@ -697,7 +1152,7 @@ class AgentService:
 
         async def reconcile(contact: Contact) -> None:
             try:
-                history = await self.dws.history(contact)
+                history = await self._history(contact)
             except Exception as exc:
                 LOG.warning(
                     "event history reconciliation failed contact=%s error=%s",
@@ -1060,13 +1515,18 @@ class AgentService:
 
     async def _conversation_worker(self, conversation_id: str) -> None:
         queue = self.queues[conversation_id]
+        carry = None
         while not self.stop_event.is_set():
-            first = await queue.get()
+            first = carry or await queue.get()
+            carry = None
             batch = [first]
             self._set_runtime(batch, "stabilizing")
-            while True:
+            while first.origin == "dm":
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=self.settings.quiet_window)
+                    if event.origin != first.origin:
+                        carry = event
+                        break
                     batch.append(event)
                     self._set_runtime(batch, "stabilizing")
                 except TimeoutError:
@@ -1119,6 +1579,12 @@ class AgentService:
     async def _set_processing_reactions(
         self, batch: Sequence[IncomingEvent], *, active: bool
     ) -> None:
+        if not batch or not getattr(
+            self._channel_for_read(batch[0].conversation_id),
+            "processing_reactions",
+            True,
+        ):
+            return
         dws = getattr(self, "dws", None)
         operation = getattr(
             dws, "add_emoji" if active else "remove_emoji", None
@@ -1174,7 +1640,9 @@ class AgentService:
     ) -> list[IncomingEvent]:
         result: list[IncomingEvent] = []
         for message in history:
-            if message.sender_open_dingtalk_id != contact.open_dingtalk_id:
+            if message.sender_open_dingtalk_id != contact.open_dingtalk_id or (
+                message.conversation_id != conversation_id and conversation_id != f"dm:{contact.identity}"
+            ):
                 continue
             if message.created_at < not_before - timedelta(seconds=2):
                 continue
@@ -1262,7 +1730,7 @@ class AgentService:
         history: list[HistoryMessage] = []
         for _ in range(4):
             try:
-                history = await self.dws.history(contact)
+                history = await self._history(contact, batch[0].conversation_id)
             except Exception as exc:
                 LOG.warning(
                     "history unavailable; continuing without remote context "
@@ -1606,9 +2074,40 @@ class AgentService:
         )
         return contact_count >= contact_limit or global_count >= global_limit
 
+    def _channel_for_read(self, conversation_id: str) -> Channel:
+        """读路径取通道：未注册前缀降级到 dws。
+
+        发送路径（_dispatch_due_delivery）保持 fail loud，避免静默错投；
+        读历史/能力位只影响上下文丰富度，历史遗留的未知前缀不该打挂
+        整条会话 worker，降级告警即可。
+        """
+        try:
+            return channel_for(conversation_id, self.dws)
+        except ValueError:
+            LOG.warning(
+                "channel prefix unregistered; falling back to dws conversation=%s",
+                conversation_id,
+            )
+            return self.dws
+
+    async def _history(
+        self, contact: Contact, conversation_id: str = ""
+    ) -> list[HistoryMessage]:
+        """按会话前缀取历史；无 conversation_id 时落 `dm:` 默认通道。"""
+        if conversation_id.startswith("panel:"):
+            return []
+        channel = self._channel_for_read(conversation_id or f"dm:{contact.identity}")
+        # 底层 dws CLI 自带 45s 超时，但其超时处理器里仍有无界 await
+        # （process.wait()）；2026-11-20 一次历史拉取挂死把单线程
+        # outbox dispatcher 楔死 4.5 小时。这里外层再兜一刀：挂死转化
+        # 成调用方可捕获/可重试的 TimeoutError，而不是永久楔住调用方。
+        return await asyncio.wait_for(
+            channel.history(contact), timeout=_HISTORY_TIMEOUT_SECONDS
+        )
+
     async def _merge_latest(self, batch: list[IncomingEvent]) -> list[IncomingEvent]:
         contact = batch[0].contact
-        history = await self.dws.history(contact)
+        history = await self._history(contact, batch[0].conversation_id)
         self._register_manual_messages(history)
         earliest = min(item.created_at for item in batch)
         discovered = self._history_events(
@@ -1621,7 +2120,7 @@ class AgentService:
     async def _freshness_state(
         self, batch: Sequence[IncomingEvent]
     ) -> tuple[str, list[IncomingEvent]]:
-        history = await self.dws.history(batch[0].contact)
+        history = await self._history(batch[0].contact, batch[0].conversation_id)
         latest_manual = self._register_manual_messages(history)
         earliest = min(item.created_at for item in batch)
         if self._human_owns_conversation(latest_manual, earliest):
@@ -1648,9 +2147,11 @@ class AgentService:
         （begin_response 展示控制是后续独立工作）。创建失败返回空串，
         交付回退纯文本。
         """
-        if not getattr(getattr(self, "dws", None), "streaming_cards", False):
+        if not getattr(
+            self._channel_for_read(batch[0].conversation_id), "streaming_cards", False
+        ):
             return ""
-        if batch[0].origin == "panel":
+        if batch[0].origin == "panel" or batch[0].conversation_id.startswith("panel:"):
             # 面板内部轮没有对外会话，卡片创建只可能失败，直接回退。
             return ""
         content = self.agent_runtime.render_auto_message(
@@ -1708,9 +2209,11 @@ class AgentService:
         后续里程碑整表重发。无里程碑不建卡，模型 delta 永不进正文。
         面板内部轮没有对外会话：progress 只进面板事件流，零 DWS 调用。
         """
-        if batch[0].origin == "panel":
+        if batch[0].origin == "panel" or batch[0].conversation_id.startswith("panel:"):
             return
-        if not getattr(getattr(self, "dws", None), "streaming_cards", False):
+        if not getattr(
+            self._channel_for_read(batch[0].conversation_id), "streaming_cards", False
+        ):
             return
         runtime = getattr(self, "agent_runtime", None)
         if runtime is not None and not getattr(runtime, "progress_enabled", True):
@@ -1834,7 +2337,7 @@ class AgentService:
         # <=0 视为关闭自动归档（事项继续留在活跃快照里）。
         return value
 
-    def _active_tasks_snapshot(self, contact: Contact) -> str:
+    def _active_tasks_snapshot(self, contact: Contact, conversation_id: str) -> str:
         """构建活跃事项快照；加载前先做本地幂等归档。
 
         与面板 board_tasks 同源转换：每条带最近 3 条 facts（含 source），
@@ -1848,7 +2351,8 @@ class AgentService:
             if archived:
                 LOG.info("archived inactive tasks count=%d days=%d", archived, days)
         tasks = self.store.board_tasks(
-            contact_id=contact.identity, limit=_TASK_SNAPSHOT_LIMIT
+            scope=TaskScope(self.settings.self_open_id, contact.identity, conversation_id),
+            limit=_TASK_SNAPSHOT_LIMIT,
         )
         return json.dumps(tasks, ensure_ascii=False, indent=2)
 
@@ -1954,7 +2458,7 @@ class AgentService:
             "current_messages_json": json.dumps(
                 messages, ensure_ascii=False, indent=2
             ),
-            "active_tasks_json": self._active_tasks_snapshot(contact),
+            "active_tasks_json": self._active_tasks_snapshot(contact, batch[0].conversation_id),
             "now": datetime.now(self.settings.timezone).strftime("%Y-%m-%d %H:%M:%S"),
             "skill_humanizer": _skill_path("humanizer_zh"),
             "skill_answer_html": _skill_path("answer_me_with_html"),
@@ -1965,7 +2469,9 @@ class AgentService:
                     self.agent_runtime._stage(stage).profile.options.get("skills"),
                 )
             ),
-            "deliveries_dir": str(self.settings.state_dir / "deliveries"),
+            "deliveries_dir": str(
+                _delivery_directory(self.settings.state_dir, session_id, create=True)
+            ),
             # 截断上限与唤醒示例：数字与日期不在模板里手写（单源）。
             "task_memory_limits": TASK_MEMORY_LIMITS_TEXT,
             "wake_example": datetime.now(self.settings.timezone).strftime(
@@ -2098,6 +2604,11 @@ class AgentService:
         if synthetic_inputs:
             prompt += "\n\n" + _system_wake_block(synthetic_inputs)
         try:
+            run_channel = self._channel_for_read(batch[0].conversation_id)
+            source_prefix = batch[0].conversation_id.partition(":")[0]
+            external_source = (
+                source_prefix if source_prefix in {"jira", "gitlab"} else None
+            )
             stage_profile = self.agent_runtime.resolve_stage(stage, agent_override)
             local_images = (
                 () if front else await self._download_images(batch, session_dir)
@@ -2121,8 +2632,14 @@ class AgentService:
                 self._task_context_for(batch, (), session_id)
                 if stage_profile.profile.protocol == "pi-rpc"
                 or stage_profile.profile.options.get("task_cli")
+                or stage_profile.profile.options.get("service_tools_mcp")
                 else None
             )
+            if external_source == "gitlab" and not front and task_context is not None and len(batch) == 1:
+                review, review_prompt = await self._gitlab_merge_review(batch[0])
+                prompt += review_prompt
+                if review is not None:
+                    task_context["merge_review"] = review
             # open_session 内含 worktree 建立 subprocess（最长 600s）：
             # 放入线程执行，事件循环在慢仓克隆期间仍可调度其他会话。
             # WorktreeError 跨线程原样抛出，失败清理（session_dir 删除）
@@ -2156,6 +2673,8 @@ class AgentService:
                 origin=(
                     "synthetic" if any(item.origin == "wake" for item in batch) else "live"
                 ),
+                event_ids=[item.message_id for item in batch],
+                session_dir=session_dir,
             )
             worktree_path = getattr(
                 getattr(session, "prepared", None), "worktree_path", None
@@ -2205,6 +2724,7 @@ class AgentService:
             now_monotonic = asyncio.get_running_loop().time()
             deadline = now_monotonic + timeout if timeout > 0 else None
             next_history_at = now_monotonic + interval
+            poll_history = getattr(run_channel, "supports_freshness", True)
             known_ids = {item.message_id for item in batch}
             earliest = min(item.created_at for item in batch)
             # 运行内不流式模型 delta：卡片只承载 report(progress) 的里程碑
@@ -2216,7 +2736,6 @@ class AgentService:
                 self.store.touch_run(
                     session_id, now=datetime.now(self.settings.timezone)
                 )
-                await self._sync_progress_card(batch, session_id)
                 remaining = (
                     deadline - asyncio.get_running_loop().time()
                     if deadline is not None
@@ -2242,7 +2761,16 @@ class AgentService:
                     )
                     if remaining is not None:
                         wait_timeout = min(wait_timeout, remaining)
-                    await session.wait_for_update(timeout=wait_timeout)
+                    progress_sync = asyncio.create_task(
+                        self._sync_progress_card(batch, session_id)
+                    )
+                    try:
+                        await session.wait_for_update(timeout=wait_timeout)
+                    finally:
+                        if not progress_sync.done():
+                            progress_sync.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await progress_sync
                 except TimeoutError:
                     pass
                 if session.done:
@@ -2264,8 +2792,14 @@ class AgentService:
                 if now_monotonic < next_history_at:
                     continue
                 next_history_at = now_monotonic + interval
+                if not poll_history:
+                    # 外部来源的上下文已经在起轮前从原通道读取；运行中
+                    # 不轮询，避免把 Jira/GitLab 会话误接到钉钉链路。
+                    continue
                 try:
-                    history = await self.dws.history(batch[0].contact)
+                    history = await self._history(
+                        batch[0].contact, batch[0].conversation_id
+                    )
                 except Exception as exc:
                     LOG.warning(
                         "freshness poll failed session=%s error=%s", session_id, exc
@@ -2434,6 +2968,41 @@ class AgentService:
             else:
                 shutil.rmtree(session_dir, ignore_errors=True)
 
+    async def _gitlab_merge_review(self, event: IncomingEvent) -> tuple[dict[str, Any] | None, str]:
+        """Bind the optional merge tool to a complete diff of one authorized MR head."""
+        if event.origin != "watch-gitlab" or not self._input_authorized(event):
+            return None, ""
+        project, sep, number = event.conversation_id.removeprefix("gitlab:").rpartition("!")
+        rule = next((r for r in parse_watches(self.settings.raw.get("watches"))
+                     if r.authority_key == event.watch_authority), None)
+        if not rule or not rule.merge_targets or project not in rule.projects:
+            return None, ""
+        if (not sep or not re.fullmatch(r"[1-9][0-9]*", number)
+                or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", event.source_revision)
+                or event.target_branch not in rule.merge_targets):
+            return None, "\n\n本次 MR 没有获准的目标分支或完整源提交 SHA，按普通审查处理。"
+        from .channels.gitlab_merge import inspect_merge
+
+        try:
+            inspection = await inspect_merge(project, int(number), event.source_revision, event.target_branch)
+        except (OSError, RuntimeError, ValueError) as exc:
+            LOG.info("merge review unavailable mr=%s error=%s", event.conversation_id, type(exc).__name__)
+            return None, "\n\n本轮合并前检查未通过，按普通审查处理。"
+        diff = neutralize_structural_tags(inspection.diff)
+        discussions = neutralize_structural_tags(inspection.discussion_text)
+        prompt = (
+            f"\n\n请审查 {project}!{number} 的完整差异及讨论，判断改动是否小而集中、是否存在阻塞意见。"
+            f"源提交 {event.source_revision}，目标分支 {event.target_branch}。\n"
+            f"<untrusted_merge_diff>\n{diff}\n</untrusted_merge_diff>\n"
+            f"<untrusted_merge_discussions>\n{discussions}\n</untrusted_merge_discussions>"
+        )
+        if self.mode != "live":
+            return None, prompt
+        return {
+            "message_id": event.message_id, "host": os.environ.get("GITLAB_HOST", "git.youshu.com.cn"),
+            "project": project, "iid": int(number), "source_ref": inspection.source_branch,
+        }, prompt
+
     async def _download_images(
         self, batch: Sequence[IncomingEvent], session_dir: Path
     ) -> tuple[Path, ...]:
@@ -2535,7 +3104,7 @@ class AgentService:
             async with asyncio.timeout(_STREAM_CARD_BIND_TIMEOUT_SECONDS):
                 baseline = {
                     message.message_id
-                    for message in await self.dws.history(contact)
+                    for message in await self._history(contact, conversation_id)
                     if message.conversation_id == conversation_id
                     and message.sender_open_dingtalk_id
                     == self.settings.self_open_id
@@ -2582,7 +3151,7 @@ class AgentService:
             async with asyncio.timeout(_STREAM_CARD_BIND_TIMEOUT_SECONDS):
                 for delay in (0.25, 0.5, 1.0, 2.0):
                     await asyncio.sleep(delay)
-                    history = await self.dws.history(contact)
+                    history = await self._history(contact, conversation_id)
                     new_messages = {
                         message.message_id: message
                         for message in history
@@ -2697,7 +3266,7 @@ class AgentService:
         )
         if not content:
             raise ValueError("refusing to send an empty reply")
-        if batch[0].origin == "panel":
+        if batch[0].origin == "panel" or batch[0].conversation_id.startswith("panel:"):
             # 面板内部轮的回复只进 panel_replies，不进发送队列、不外发。
             self.store.record_panel_reply(
                 session_id or batch[0].message_id,
@@ -2714,36 +3283,145 @@ class AgentService:
             )
             return "shadow"
         outgoing_session = session_id or str(uuid.uuid4())
-        self.store.enqueue_delivery(
-            str(uuid.uuid4()),
+        event_ids = sorted({item.message_id for item in batch})
+        action_id = _final_reply_action_id(batch[0], event_ids)
+        delivery_status = self.store.enqueue_delivery(
+            action_id,
             min(batch, key=lambda item: item.created_at),
             content,
             outgoing_session,
-            event_ids=[item.message_id for item in batch],
+            event_ids=event_ids,
         )
+        if delivery_status != "cancelled":
+            # 附件是独立投递：扫描或入队失败不能把正文一起判失败。
+            self._enqueue_delivery_attachments(batch, outgoing_session)
+        if delivery_status in {"sent", "cancelled"}:
+            return delivery_status
         self.outbox_wakeup.set()
         LOG.info("reply queued contact=%s", batch[0].contact.alias)
         return "delivery_pending"
 
+    def _enqueue_delivery_attachments(
+        self, batch: Sequence[IncomingEvent], session_id: str
+    ) -> int:
+        if not batch or self.mode == "shadow" or batch[0].origin == "panel":
+            return 0
+        source = batch[0].conversation_id.partition(":")[0]
+        if source in {"jira", "gitlab"}:
+            # 当前附件出口只绑定钉钉受众；外部通道没有文件投递契约。
+            return 0
+        try:
+            attachments = _discover_delivery_attachments(
+                self.settings.state_dir, session_id
+            )
+        except AttachmentValidationError as exc:
+            LOG.warning(
+                "attachment discovery rejected session=%s error=%s",
+                session_id,
+                exc,
+            )
+            return 0
+        source_event = min(batch, key=lambda item: item.created_at)
+        event_ids = sorted({item.message_id for item in batch})
+        queued = 0
+        for attachment in attachments:
+            action_id = _delivery_attachment_action_id(
+                source_event,
+                attachment.path.name,
+                attachment.sha256,
+                event_ids=event_ids,
+            )
+            try:
+                queued += int(
+                    self.store.enqueue_attachment(
+                        action_id,
+                        source_event,
+                        attachment.path,
+                        attachment.sha256,
+                        session_id,
+                        event_ids=event_ids,
+                    )
+                )
+            except Exception as exc:
+                # 正文已先独立入队；附件存储故障不能反向阻断正文交付。
+                LOG.warning(
+                    "attachment enqueue failed session=%s file=%s error=%s",
+                    session_id,
+                    attachment.path.name,
+                    sanitize_text(str(exc), 300),
+                )
+        if queued:
+            self.outbox_wakeup.set()
+            LOG.info("attachments queued contact=%s count=%d", source_event.contact.alias, queued)
+        return queued
+
     async def _dispatch_outbox(self) -> None:
         LOG.info("outbox dispatcher ready")
         while not self.stop_event.is_set():
-            if await self._dispatch_due_delivery():
-                continue
+            try:
+                if await self._dispatch_due_delivery():
+                    continue
+            except Exception:
+                # 单条投递的意外异常不允许炸掉 dispatcher：炸掉后所有待发
+                # 回复静默堆积直到重启（2026-11-20 事故形态）。逐行状态
+                # 已由 _dispatch_due_delivery 内部留痕；真遗留在 sending
+                # 的行由启动期 recover_outgoing 收口。这里退避后重扫。
+                LOG.exception("outbox dispatch iteration failed; backing off")
+                await asyncio.sleep(1)
             self.outbox_wakeup.clear()
             try:
                 await asyncio.wait_for(self.outbox_wakeup.wait(), timeout=2)
             except TimeoutError:
                 pass
 
+    def _delivery_authorized(self, row: Mapping[str, Any]) -> bool:
+        """Revalidate queued watch writes; a recovered in-flight row is handled separately."""
+        target_kind = str(row["target_kind"] or "")
+        if target_kind == "watch_notification":
+            return self._watch_rule_allows_notify(str(row["session_id"] or ""))
+        conversation_id = str(row["conversation_id"] or "")
+        if target_kind not in {"jira_comment", "gitlab_note"}:
+            return True
+        event_ids = json.loads(row["event_ids_json"] or "[]")
+        authorities = self.store.event_watch_authorities(event_ids)
+        if len(authorities) != 1:
+            return False
+        source = conversation_id.split(":", 1)[0]
+        return any(
+            rule.source == source and rule.authority_key == authorities[0]
+            for rule in (self._watch_rules or [])
+        )
+
     async def _dispatch_due_delivery(self) -> bool:
         now = datetime.now(self.settings.timezone)
         row = self.store.claim_due_delivery(now)
         if row is None:
             return False
+        if str(row["target_kind"] or "") == "gitlab_merge":
+            await self._dispatch_gitlab_merge(row, now)
+            return True
         send_uuid = str(row["send_uuid"])
         conversation_id = str(row["conversation_id"])
-        channel = channel_for(conversation_id, self.dws)
+        expired_dws_retry = (
+            str(row["delivery_status"]) == "retry_wait"
+            and not conversation_id.startswith(("jira:", "gitlab:"))
+            and _idempotency_window_expired(str(row["sent_at"] or ""), now)
+        )
+        if expired_dws_retry and not row["card_biz_id"]:
+            self.store.mark_delivery_remote_uncertain(
+                send_uuid,
+                "needs_operator_reconciliation: idempotency_window_expired",
+                now + timedelta(seconds=60),
+            )
+            return True
+        try:
+            channel = channel_for(conversation_id, self.dws)
+        except ValueError as exc:
+            # 前缀没注册就确定不了投递出口：不猜也不降级，取消这条投递
+            # 并留痕，避免静默错投到钉钉。
+            LOG.error("delivery cancelled: %s conversation=%s", exc, conversation_id)
+            self.store.mark_delivery_cancelled(send_uuid, "error", str(exc)[:200])
+            return True
         contact = next(
             (
                 item
@@ -2772,14 +3450,74 @@ class AgentService:
                 send_uuid, "error", "delivery_contact_not_configured"
             )
             return True
+        if str(row["delivery_status"]) != "remote_uncertain" and not self._delivery_authorized(row):
+            if str(row["last_error"] or "") == "daemon_restarted_during_remote_call":
+                self.store.mark_delivery_remote_uncertain(
+                    send_uuid,
+                    "needs_operator_reconciliation: watch_authority_revoked_inflight",
+                    now + timedelta(seconds=60),
+                )
+            else:
+                self.store.mark_delivery_cancelled(
+                    send_uuid, "authorization_revoked", "watch_authority_revoked"
+                )
+            return True
         try:
+            if str(row["delivery_status"]) == "remote_uncertain":
+                remote_marker = str(row["remote_marker"] or "")
+                if not getattr(channel, "supports_reconciliation", False):
+                    # 撤销撤不回已在途的写，但也不允许重发：uncertain 行
+                    # 的授权复查与通道对账同做， revoked 也只保持 uncertain。
+                    if not self._delivery_authorized(row):
+                        self.store.mark_delivery_remote_uncertain(
+                            send_uuid,
+                            "needs_operator_reconciliation: watch_authority_revoked_inflight",
+                            now + timedelta(seconds=60),
+                        )
+                        return True
+                    self.store.mark_delivery_remote_uncertain(
+                        send_uuid,
+                        "needs_operator_reconciliation: channel_cannot_reconcile",
+                        now + timedelta(seconds=60),
+                    )
+                    return True
+                if not remote_marker:
+                    self.store.mark_delivery_remote_uncertain(
+                        send_uuid,
+                        "needs_operator_reconciliation: legacy_row_without_marker",
+                        now + timedelta(seconds=60),
+                    )
+                    return True
+                try:
+                    remote_id = await asyncio.wait_for(
+                        channel.find_receipt(contact, remote_marker),
+                        timeout=_DELIVERY_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    self.store.mark_delivery_remote_uncertain(
+                        send_uuid,
+                        f"{type(exc).__name__}: {exc}",
+                        now + timedelta(seconds=60),
+                    )
+                    return True
+                if remote_id:
+                    self.store.mark_delivery_sent(send_uuid, remote_id)
+                    return True
+                # A first-page GET miss cannot prove the remote write did not commit:
+                # pagination and read-after-write delay both make absence inconclusive.
+                self.store.mark_delivery_remote_uncertain(
+                    send_uuid,
+                    "needs_operator_reconciliation: receipt_not_found",
+                    now + timedelta(seconds=60),
+                )
+                return True
             source_received_at = datetime.fromisoformat(row["source_received_at"])
             if getattr(channel, "supports_freshness", True) is False:
                 # 外部通道（jira/gitlab）没有"本人手打接管"信号：新鲜度
                 # 与补充消息检查是 dws 专属，这里直接进发送段。
                 history = []
             else:
-                history = await self.dws.history(contact)
+                history = await self._history(contact, conversation_id)
             latest_manual = self._register_manual_messages(history)
             if self._human_owns_conversation(latest_manual, source_received_at):
                 await self._safe_update_streaming_card(
@@ -2792,6 +3530,14 @@ class AgentService:
                 )
                 return True
             known = set(json.loads(row["event_ids_json"] or "[]"))
+            persisted_supplements = self.store.superseding_conversation_event_ids(
+                conversation_id, sorted(known)
+            )
+            if persisted_supplements:
+                self.store.mark_delivery_cancelled(
+                    send_uuid, "stale_supplement", "new_message_before_delivery"
+                )
+                return True
             supplements = [
                 item
                 for item in self._history_events(
@@ -2815,12 +3561,44 @@ class AgentService:
                         self._enqueue(item)
                 return True
 
+            if str(row["target_kind"]) == "attachment":
+                if channel is not self.dws:
+                    self.store.mark_delivery_cancelled(
+                        send_uuid,
+                        "attachment_invalid",
+                        "attachment_channel_not_supported",
+                    )
+                    return True
+                try:
+                    file_path = _validate_delivery_attachment(
+                        self.settings.state_dir,
+                        str(row["session_id"]),
+                        Path(str(row["payload_text"])),
+                        str(row["content_sha256"]),
+                    )
+                except AttachmentValidationError as exc:
+                    self.store.mark_delivery_cancelled(
+                        send_uuid, "attachment_invalid", str(exc)
+                    )
+                    return True
+                message_id, _ = await asyncio.wait_for(
+                    self.dws.send_file(contact, file_path, send_uuid),
+                    timeout=_DELIVERY_TIMEOUT_SECONDS,
+                )
+                self.store.mark_delivery_sent(send_uuid, message_id)
+                LOG.info(
+                    "attachment sent contact=%s file=%s",
+                    contact.alias,
+                    file_path.name,
+                )
+                return True
+
             content = str(row["payload_text"])
             message_id = ""
             card_flow_status: int | None = None
             card_biz_id = str(row["card_biz_id"] or "")
             if not card_biz_id and channel is self.dws and getattr(
-                self.dws, "streaming_cards", False
+                channel, "streaming_cards", False
             ):
                 # 卡片是投递的一部分：人工接管与补充消息的最终检查都已
                 # 通过，此刻才创建；创建后绑定投递行，网络重试复用同卡。
@@ -2837,16 +3615,28 @@ class AgentService:
                     await self._update_streaming_card(card_biz_id, content, 3)
                     card_flow_status = 3
                 except Exception as exc:
+                    if expired_dws_retry:
+                        self.store.mark_delivery_remote_uncertain(
+                            send_uuid, "needs_operator_reconciliation: idempotency_window_expired",
+                            now + timedelta(seconds=60),
+                        )
+                        return True
                     LOG.warning(
                         "streaming card final update failed; falling back to text "
                         "session=%s error=%s",
                         row["session_id"],
                         sanitize_text(str(exc), 300),
                     )
-                    message_id, _ = await channel.send(contact, content, send_uuid)
+                    message_id, _ = await asyncio.wait_for(
+                        channel.send(contact, content, send_uuid),
+                        timeout=_DELIVERY_TIMEOUT_SECONDS,
+                    )
                     card_flow_status = 5
             else:
-                message_id, _ = await channel.send(contact, content, send_uuid)
+                message_id, _ = await asyncio.wait_for(
+                    channel.send(contact, content, send_uuid),
+                    timeout=_DELIVERY_TIMEOUT_SECONDS,
+                )
             self.store.mark_delivery_sent(
                 send_uuid,
                 message_id,
@@ -2855,17 +3645,136 @@ class AgentService:
             LOG.info("reply sent contact=%s", contact.alias)
         except Exception as exc:
             delay = min(2 ** int(row["attempt_count"]), 60)
-            self.store.mark_delivery_retry(
-                send_uuid,
-                f"{type(exc).__name__}: {exc}",
-                now + timedelta(seconds=delay),
-            )
+            error = f"{type(exc).__name__}: {exc}"
+            if getattr(channel, "retry_safe", True):
+                self.store.mark_delivery_retry(
+                    send_uuid, error, now + timedelta(seconds=delay)
+                )
+            else:
+                self.store.mark_delivery_remote_uncertain(
+                    send_uuid, error, now + timedelta(seconds=delay)
+                )
             LOG.warning(
                 "delivery deferred contact=%s error=%s",
                 contact.alias,
                 sanitize_text(str(exc), 300),
             )
         return True
+
+    async def _dispatch_gitlab_merge(
+        self, row: Mapping[str, Any], now: datetime
+    ) -> None:
+        """Submit a fenced merge once; recovered ambiguity is GET-only."""
+        from .channels.gitlab_merge import MergeRejected, reconcile_merge, submit_merge
+
+        action_id = str(row["send_uuid"])
+        reconcile_only = str(row["delivery_status"]) == "remote_uncertain"
+        try:
+            envelope = self.store.gitlab_merge_dispatch_context(
+                action_id, reconcile_only=reconcile_only
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            if reconcile_only:
+                self.store.mark_delivery_remote_uncertain(
+                    action_id,
+                    f"merge_reconcile_context_invalid:{exc}",
+                    now + timedelta(seconds=60),
+                )
+            else:
+                self.store.mark_delivery_cancelled(
+                    action_id, "merge_rejected", str(exc)
+                )
+            return
+
+        current_host = os.environ.get("GITLAB_HOST", "git.youshu.com.cn").strip().lower().rstrip("/")
+        if envelope.get("host") != current_host:
+            if reconcile_only:
+                self.store.mark_delivery_remote_uncertain(
+                    action_id,
+                    "needs_operator_reconciliation: gitlab_host_changed",
+                    now + timedelta(seconds=60),
+                )
+            else:
+                self.store.mark_delivery_cancelled(
+                    action_id, "merge_rejected", "gitlab_host_changed"
+                )
+            return
+
+        target_branch = str(envelope["target_ref"])
+        if not reconcile_only:
+            authority = str(envelope["watch_authority"])
+            project = str(envelope["project"])
+            target_ref = str(envelope["target_ref"])
+            rule = next(
+                (
+                    item
+                    for item in (self._watch_rules or parse_watches(self.settings.raw.get("watches")))
+                    if item.source == "gitlab"
+                    and item.authority_key == authority
+                    and project in item.projects
+                    and target_ref in item.merge_targets
+                ),
+                None,
+            )
+            if rule is None:
+                self.store.mark_delivery_cancelled(
+                    action_id, "authorization_revoked", "merge_authority_revoked"
+                )
+                return
+
+        operation = reconcile_merge if reconcile_only else submit_merge
+        try:
+            result = await asyncio.wait_for(
+                operation(
+                    str(envelope["project"]),
+                    int(envelope["iid"]),
+                    str(envelope["expected_sha"]),
+                    target_branch,
+                ),
+                timeout=_DELIVERY_TIMEOUT_SECONDS,
+            )
+            if result.status == "uncertain":
+                self.store.mark_delivery_remote_uncertain(
+                    action_id,
+                    result.reason or "gitlab_merge_remote_uncertain",
+                    now + timedelta(seconds=60),
+                )
+                return
+            if (
+                result.status != "confirmed"
+                or result.project != envelope["project"]
+                or result.iid != int(envelope["iid"])
+                or result.sha != envelope["expected_sha"]
+                or result.source_branch != envelope["source_ref"]
+                or result.target_branch != envelope["target_ref"]
+                or result.state != "merged"
+                or not result.remote_id
+            ):
+                raise MergeRejected("GitLab merge receipt did not match persisted intent")
+            receipt_id = (
+                f"gitlab:{current_host}/{envelope['project']}!{envelope['iid']}:"
+                f"merge:{result.remote_id}"
+            )
+            self.store.mark_delivery_sent(action_id, receipt_id)
+        except MergeRejected as exc:
+            if reconcile_only:
+                self.store.mark_delivery_remote_uncertain(
+                    action_id,
+                    f"merge_reconcile_rejected:{sanitize_text(str(exc), 300)}",
+                    now + timedelta(seconds=60),
+                )
+            else:
+                self.store.mark_delivery_cancelled(
+                    action_id, "merge_rejected", sanitize_text(str(exc), 300)
+                )
+        except Exception as exc:
+            # The boundary may have crossed the PUT before it lost the response.
+            # From here on this action can only be reconciled with GET.
+            self.store.mark_delivery_remote_uncertain(
+                action_id,
+                f"{type(exc).__name__}: {exc}",
+                now + timedelta(seconds=60),
+            )
 
     # ------------------------------------------------------------------
     # 唤醒（§18 唤醒 2 条）：任务终态唤醒等待方 + waiting_on=@时刻到点唤醒。
@@ -2876,9 +3785,7 @@ class AgentService:
     async def _consume_watches(self) -> None:
         """Watch 规则轮询：外部源变化 → 建 task + 合成事件开处理轮。
 
-        容错骨架照 _consume_wakes：异常全吞记日志，下一轮重试；去重靠
-        events 表 claim（dedup_key 当 message_id，UNIQUE 幂等），重复
-        命中天然只处理一次。
+        单条规则失败保留其游标。每条规则仅在本轮输入已全部入库后推进游标。
         """
         self._watch_rules = parse_watches(self.settings.raw.get("watches"))
         rules = self._watch_rules
@@ -2893,117 +3800,62 @@ class AgentService:
             60,
             int(self.settings.raw.get("watch_interval_seconds", 300)),
         )
-        # 冷启动回看窗：首轮要能看到"规则上线前就存在"的对象（JQL
-        # 自带时间窗，这里只做源侧粗滤的基准线）；之后 since 随命中
-        # 的 created_at 前移，不重复处理旧对象。
-        lookback = int(self.settings.raw.get("watch_lookback_hours", 24))
-        since = datetime.now(self.settings.timezone) - timedelta(hours=lookback)
+        lookback = timedelta(hours=int(self.settings.raw.get("watch_lookback_hours", 24)))
+        initial = datetime.now(self.settings.timezone) - lookback
         LOG.info("watch dispatcher ready rules=%d interval=%ds", len(rules), interval)
         while not self.stop_event.is_set():
-            try:
-                for rule_name, source in sources:
-                    items = await source.poll(since)
-                    for item in items:
-                        since = max(
-                            since,
-                            item.created_at or datetime.now(self.settings.timezone),
-                        )
-                        await self._handle_watch_hit(rule_name, item)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOG.exception("watch poll failed")
+            for rule, source in sources:
+                try:
+                    since = self.store.watch_cursor(rule.authority_key, initial)
+                    through = since
+                    for item in await source.poll(since):
+                        await self._handle_watch_hit(rule, item)
+                        if item.created_at:
+                            through = max(through, item.created_at)
+                    self.store.advance_watch_cursor(rule.authority_key, through)
+                except Exception:
+                    LOG.exception("watch poll failed rule=%s", rule.name)
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.stop_event.wait(), timeout=interval)
 
-    def _build_watch_sources(
-        self, rules: list
-    ) -> list:
-        """规则 → (规则名, 源实例)；Jira 按 jql 去重成一源，GitLab 按
-        projects 并集。凭据缺失的源跳过并告警（不炸启动，照"可配置
-        缺省"原则），生产补 .env 即生效。"""
-        jira_jqls = {rule.jql for rule in rules if rule.source == "jira"}
-        jira_projects = {
-            project
-            for rule in rules
-            if rule.source == "jira"
-            for project in rule.projects
-        }
-        gitlab_projects = {
-            project
-            for rule in rules
-            if rule.source == "gitlab"
-            for project in rule.projects
-        }
+    def _build_watch_sources(self, rules: list[WatchRule]) -> list:
         built = []
-        if jira_jqls:
-            # JQL 合并：ORDER BY 全局一份（放尾），其余括号 OR 连接——
-            # (x ORDER BY a) OR (y ORDER BY b) 会被 Jira 判 400。
-            clauses = []
-            order = "created DESC"
-            for item in sorted(jira_jqls):
-                parts = item.rsplit("ORDER BY", 1)
-                clauses.append(f"({parts[0].strip().rstrip(',').strip()})")
-                if len(parts) == 2:
-                    order = parts[1].strip()
-            jql = " OR ".join(clauses) + f" ORDER BY {order}"
-            built.append(("jira", JiraSource(jql, sorted(jira_projects))))
-        if gitlab_projects:
-            built.append(("gitlab", GitLabSource(sorted(gitlab_projects))))
-        if not os.environ.get("JIRA_USERNAME"):
-            LOG.warning("watch: JIRA_USERNAME missing; jira source disabled")
-            built = [entry for entry in built if entry[0] != "jira"]
-        if not built:
-            return []
+        for rule in rules:
+            source = SOURCE_TYPES[rule.source].build([rule])
+            if source is not None:
+                built.append((rule, source))
         return built
 
-    async def _handle_watch_hit(self, rule_name: str, item: SourceItem) -> None:
-        """一次 Watch 命中：建 task（面板可见）+ 合成事件入队开轮。
-
-        蓝图铁律 3：命中必须可观测——task 落库 + LOG，不静默起轮。
-        蓝图铁律 1：投递出口由 conversation_id 前缀锁死（jira:/gitlab:
-        → 评论），无对外 DM 授权泄漏面。
-        """
-        rules = self._watch_rules
-        rule = rule_for_item(rules, item) if rules else None
-        instruction = rule.instruction if rule else "处理此事件。"
-        origin = rule.origin if rule else f"watch-{rule_name}"
+    async def _handle_watch_hit(self, rule: WatchRule, item: SourceItem) -> None:
+        """按资源和规则目标去重。不同目标保留同一来源和各自的事项。"""
+        if not rule_for_item([rule], item):
+            return
+        instruction = rule.instruction
+        origin = rule.origin
+        goal_key = sha256_text(json.dumps([rule.name, instruction], ensure_ascii=False))
+        message_id = f"{item.dedup_key}/watch/{goal_key}"
         event = IncomingEvent(
-            event_id=f"watch-{sha256_text(item.dedup_key)[:12]}",
-            message_id=item.dedup_key,
+            event_id=f"watch-{sha256_text(message_id)}",
+            message_id=message_id,
             conversation_id=item.conversation_id,
             contact=item.contact,
             content=(
-                f"【Watch 命中：{rule.name if rule else rule_name}】{item.title}\n"
+                f"【Watch 命中：{rule.name}】{item.title}\n"
                 f"{item.body[:2000]}\n{item.url}\n\n{instruction}"
             ),
             created_at=item.created_at or datetime.now(self.settings.timezone),
             origin=origin,
+            watch_authority=rule.authority_key,
+            source_revision=str((item.meta or {}).get("sha") or ""),
+            target_branch=str((item.meta or {}).get("target_branch") or ""),
         )
-        if not self.store.claim_event(event):
+        scope = TaskScope(self.settings.self_open_id, item.contact.identity, item.conversation_id)
+        if not self.store.accept_watch(
+            event, scope, f"{rule.name}: {item.title}"[:2000], item.url,
+            datetime.now(self.settings.timezone), resource_key=item.dedup_key, rule_name=rule.name,
+        ):
             return
-        scope = TaskScope(
-            self_id=self.settings.self_open_id,
-            contact_id=item.contact.identity,
-            conversation_id=item.conversation_id,
-        )
-        now = datetime.now(self.settings.timezone)
-        self.store.record_task(
-            scope=scope,
-            goal=f"{rule.name if rule else rule_name}: {item.title}"[:2000],
-            status="open",
-            evidence_summary=item.url,
-            evidence_message_ids=[item.dedup_key],
-            resources=[],
-            evidence_at=now,
-            now=now,
-        )
-        LOG.info(
-            "watch hit rule=%s key=%s conversation=%s",
-            rule.name if rule else rule_name,
-            item.dedup_key,
-            item.conversation_id,
-        )
+        LOG.info("watch hit rule=%s key=%s conversation=%s", rule.name, item.dedup_key, item.conversation_id)
         self._enqueue(event)
 
     async def _consume_wakes(self) -> None:
@@ -3027,13 +3879,7 @@ class AgentService:
                 LOG.exception("wake dispatcher iteration failed")
 
     def _scan_time_wakes(self, now: datetime) -> None:
-        """扫 waiting_on=@时刻 的事项：到点（顺延入窗）唤醒主联系人。
-
-        去重键是 (task_id, waiting_on 当前值) 且只看未派发的 wake：
-        改约时间（waiting_on 变化）后到点会再次唤醒，同一时刻的
-        pending/claimed 不会重复入队。专用查询不截断，board_tasks 的
-        50 条上限不再吃掉排位靠后的等待事项。
-        """
+        """按原事项与约定时刻入队一次。归档只影响提示词的工作集。"""
         for task in self.store.time_waiting_tasks():
             match = _TIME_WAITING_PATTERN.fullmatch(task["waiting_on"])
             if not match:
@@ -3044,20 +3890,9 @@ class AgentService:
             effective = _roll_into_wake_window(moment)
             if now < effective:
                 continue
-            if self.store.wake_exists(task["id"], task["waiting_on"]):
-                continue
-            # 机械封顶：worker 侧 task_record 闭环不可靠（模型不调用、或
-            # 运行时没有任务工具），同一时刻最多派发 _TIME_WAKE_MAX_DISPATCHES
-            # 轮真实模型运行，之后只留在面板上等人，绝不 5s 一轮烧钱。
-            if (
-                self.store.wake_dispatch_count(task["id"], task["waiting_on"])
-                >= _TIME_WAKE_MAX_DISPATCHES
-            ):
-                continue
-            contact_ids = task["contact_ids"] or [task["contact_id"]]
             self.store.enqueue_wake(
-                contact_ids[0],
-                f"到点检查：{task['goal']}",
+                task["contact_id"],
+                f"到点检查 [{task['id']}]：{task['goal']}",
                 origin_task_id=task["id"],
                 waiting_on=task["waiting_on"],
                 due_at=now,
@@ -3082,97 +3917,71 @@ class AgentService:
         conversation = self.store.task_conversation(str(event["task_id"]))
         if not conversation.startswith(("jira:", "gitlab:")):
             return
-        if not self._watch_rule_allows_notify(conversation):
+        if not self._watch_rule_allows_notify(str(event["task_id"])):
             return
         verb = "已完成" if str(event["status"]) == "completed" else "已取消"
         target = self._watch_notify_target(str(event["task_id"]))
+        if target is None:
+            LOG.warning(
+                "watch terminal notify skipped: explicit recipient unresolved task=%s",
+                event["task_id"],
+            )
+            return
         text = (
             f"Watch 任务{verb}：{event['goal']}。"
-            f"处理结果已作为评论发回 {conversation.split(':', 1)[1]}。"
+            f"来源：{conversation.split(':', 1)[1]}。"
         )
-        try:
-            send_uuid = f"watch-notify-{event['task_id']}-{event['id']}"
-            delivered = asyncio.get_event_loop().create_task(
-                self.dws.send(target, text, send_uuid)
-            )
-            delivered.add_done_callback(
-                lambda task: LOG.info(
-                    "watch terminal notify task=%s to=%s ok=%s",
-                    event["task_id"],
-                    target.alias,
-                    task.result()[0] is not None if not task.exception() else False,
-                )
-            )
-        except Exception:
-            LOG.exception(
-                "watch terminal notify failed task=%s", event["task_id"]
-            )
+        send_uuid = f"watch-notify-{event['task_id']}-{event['id']}"
+        if self.store.enqueue_notification(
+            send_uuid,
+            conversation_id=f"dm:{target.identity}",
+            contact_user_id=target.identity,
+            content=text,
+            session_id=str(event["task_id"]),
+            now=now,
+        ):
+            self.outbox_wakeup.set()
 
-    def _watch_notify_target(self, task_id: str) -> Contact:
+    def _watch_notify_target(self, task_id: str) -> Contact | None:
         """终态通知收件人：worker 写的「完成后通知：<姓名>」优先。
 
-        姓名按白名单联系人的 display_name / alias 双向模糊匹配（display
-        形如「联系人N-联系人N」，写「联系人N」「联系人N」都能命中）；找不到指定
-        联系人时兜底本人——人不看 issue，完成信号必须送达。
+        只接受白名单联系人 display_name / alias 的唯一精确匹配；缺失、
+        模糊或歧义时不发送，避免把结果静默改投给操作者本人。
         """
         waiting_on = self.store.task_waiting_on(task_id)
         marker = "完成后通知："
-        if waiting_on.startswith(marker):
-            name = waiting_on[len(marker):].strip()
-            for contact in self.settings.contacts:
-                if name and (
-                    name in contact.display_name or contact.alias in name
-                ):
-                    return contact
-        return Contact(
-            alias=self.settings.self_name,
-            display_name=self.settings.self_name,
-            user_id="",
-            open_dingtalk_id=self.settings.self_open_id,
+        if not waiting_on.startswith(marker):
+            return None
+        name = waiting_on[len(marker):].strip()
+        matches = [
+            contact
+            for contact in self.settings.contacts
+            if name and name in {contact.display_name, contact.alias}
+        ]
+        identities = {contact.identity for contact in matches}
+        return matches[0] if len(identities) == 1 else None
+
+    def _watch_rule_allows_notify(self, task_id: str) -> bool:
+        """Only the task's single persisted watch authority may grant a DM."""
+        authorities = self.store.task_watch_authorities(task_id)
+        if len(authorities) != 1:
+            return False
+        return any(
+            rule.authority_key == authorities[0] and rule.notify == "dm"
+            for rule in (self._watch_rules or [])
         )
 
-    def _watch_rule_allows_notify(self, conversation: str) -> bool:
-        """命中任务所属 watch 规则的 notify 开关（缺省 dm 通知本人）。
-
-        规则按 source 对齐 conversation 前缀（jira:/gitlab:），同源全部
-        notify="none" 才静默；有任一默认规则即通知。
-        """
-        source = conversation.split(":", 1)[0]
-        rules = [
-            rule
-            for rule in (self._watch_rules or [])
-            if rule.source == source
-        ]
-        if not rules:
-            return True
-        return any(rule.notify != "none" for rule in rules)
-
-    async def _steer_live_session(self, contact_id: str, text: str) -> bool:
-        """把唤醒文本 steer 进该联系人正在跑的会话；成功返回 True。
-
-        在跑会话比批队列快一个量级：它下一轮 digest 就能看到系统唤醒块。
-        任一会话 steer 失败按无活跃处理，走合成输入兜底。
-        """
-        for run in self.store.active_runs():
-            if str(run["contact_id"]) != contact_id:
-                continue
-            session = self.live_sessions.get(str(run["session_id"]))
-            if session is None or getattr(session, "done", True):
-                continue
-            try:
-                steered = await session.steer(
-                    _system_wake_block([("系统唤醒", text)])
-                )
-            except Exception as exc:
-                LOG.warning(
-                    "wake steer failed session=%s error=%s",
-                    run["session_id"],
-                    sanitize_text(str(exc), 300),
-                )
-                continue
-            if steered:
-                return True
-        return False
+    async def _steer_live_session(self, conversation_id: str, text: str) -> bool:
+        state = self.runtime_states.get(conversation_id, {})
+        session_id = state.get("sessionId")
+        session = self.live_sessions.get(session_id)
+        if session is None or session.done:
+            return False
+        try:
+            return bool(await session.steer(_system_wake_block([("系统唤醒", text)])))
+        except Exception as exc:
+            LOG.warning("wake steer failed session=%s error=%s", session_id, sanitize_text(str(exc), 300))
+            return False
 
     async def _dispatch_wake(self, wake: Mapping[str, Any], now: datetime) -> None:
         """把到点 wake 送达：在跑会话直接 steer，否则合成输入进批队列。
@@ -3186,14 +3995,31 @@ class AgentService:
             return
         text = str(wake["text"])
         contact_id = str(wake["contact_id"])
-        contact = next(
-            (
-                item
-                for item in self.settings.contacts
-                if item.identity == contact_id
-            ),
-            None,
-        )
+        task = self.store.wake_task(wake)
+        task_id = wake.get("waiting_task_id") or wake.get("origin_task_id")
+        conversation_id = f"dm:{contact_id}"
+        if task_id:
+            if not task or task["scope_self"] != self.settings.self_open_id or task["scope_contact"] != contact_id:
+                self.store.finish_wake(wake_id, now=now, error="task_scope_changed")
+                return
+            condition = wake["waiting_on"] or (
+                f"task:{wake['origin_task_id']}" if wake["waiting_task_id"] else ""
+            )
+            if condition and (task["status"] != "waiting" or task["waiting_on"] != condition):
+                self.store.finish_wake(wake_id, now=now, error="wait_replaced")
+                return
+            conversation_id = task["scope_conversation"]
+            if wake["waiting_task_id"] and not self.store.same_task_audience(wake["origin_task_id"], task_id):
+                text = "关联事项已有进展，请核对本事项。"
+        watch_authority = ""
+        if conversation_id.startswith(("jira:", "gitlab:")) and conversation_id == contact_id:
+            authorities = self.store.task_watch_authorities(task_id)
+            watch_authority = authorities[0] if len(authorities) == 1 else ""
+            contact = Contact(conversation_id.split(":", 1)[1], conversation_id, contact_id, "")
+        elif conversation_id.startswith("panel:") and contact_id == self.settings.self_open_id:
+            contact = Contact(self.settings.self_name, self.settings.self_name, "", contact_id)
+        else:
+            contact = next((item for item in self.settings.contacts if item.identity == contact_id), None)
         if contact is None:
             self.store.finish_wake(
                 wake_id, now=now, error=f"contact_not_whitelisted:{contact_id}"
@@ -3203,28 +4029,25 @@ class AgentService:
                 contact_id,
             )
             return
-        if await self._steer_live_session(contact_id, text):
-            self.store.finish_wake(wake_id, now=now)
-            LOG.info(
-                "wake steered to live session contact=%s origin_task=%s",
-                contact.alias,
-                wake.get("origin_task_id") or "-",
-            )
-            return
         event = IncomingEvent(
             event_id=f"wake-{wake_id}",
             message_id=f"wake-{wake_id}",
-            conversation_id=(
-                self.store.latest_conversation_id(contact.identity)
-                or f"dm:{contact.identity}"
-            ),
+            conversation_id=conversation_id,
             contact=contact,
             content=text,
             created_at=now,
             origin="wake",
+            watch_authority=watch_authority,
         )
-        self.store.claim_event(event)
-        self._enqueue(event)
+        if not self._input_authorized(event):
+            self.store.finish_wake(wake_id, now=now, error="source_authorization_changed")
+            return
+        if not watch_authority and await self._steer_live_session(conversation_id, text):
+            self.store.finish_wake(wake_id, now=now)
+            LOG.info("wake steered contact=%s origin_task=%s", contact.alias, task_id or "-")
+            return
+        if self.store.claim_event(event):
+            self._enqueue(event)
         self.store.finish_wake(wake_id, now=now)
         LOG.info(
             "wake dispatched contact=%s origin_task=%s",
@@ -3329,6 +4152,9 @@ class AgentService:
         )
         return bool(resolved.get("ok"))
 
+    async def link_task_source(self, task_id: str, message_id: str) -> bool:
+        return self.store.link_task_source(task_id, message_id, self.settings.self_open_id)
+
     def board_snapshot(self) -> dict[str, Any]:
         """黑板投影快照：在跑会话（含里程碑）、任务、等我裁决、近 24h 完成、
         面板内部轮回复。"""
@@ -3368,13 +4194,19 @@ class AgentService:
             with suppress(ValueError):
                 if datetime.fromisoformat(task["updated_at"]) >= day_ago:
                     recent_done.append(task)
+        tasks = self.store.board_tasks(include_done=True, include_archived=True)
+        for task in tasks:
+            task["sources"] = self.store.task_sources(task["id"])
+            task["run_ids"] = self.store.task_run_ids(task["id"])
         return {
             "runs": runs,
-            "tasks": self.store.board_tasks(include_done=True),
+            "tasks": tasks,
+            "execution_backlog": self.store.execution_backlog(owned_session_ids=self.live_sessions),
+            "deliveries": self.store.delivery_receipts(limit=50),
             "recent_failed": self.store.recent_failed_runs(since=day_ago),
             "waiting_operator": [
                 task
-                for task in self.store.board_tasks(status="waiting")
+                for task in self.store.board_tasks(status="waiting", include_archived=True)
                 if task["waiting_on"] == self.settings.self_name
             ],
             "recent_done": recent_done,

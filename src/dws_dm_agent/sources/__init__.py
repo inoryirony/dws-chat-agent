@@ -2,5 +2,12 @@
 
 from .base import InboundSource, SourceItem
 from .external import GitLabSource, JiraSource
+from .registry import SOURCE_TYPES
 
-__all__ = ["GitLabSource", "InboundSource", "JiraSource", "SourceItem"]
+__all__ = [
+    "GitLabSource",
+    "InboundSource",
+    "JiraSource",
+    "SOURCE_TYPES",
+    "SourceItem",
+]

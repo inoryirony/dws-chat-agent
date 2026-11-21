@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ from dws_dm_agent.service import (
     load_settings,
 )
 from dws_dm_agent.dashboard import AgentConfigStore, DashboardServer
+from dws_dm_agent.watches import WatchRule
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -199,6 +201,28 @@ class EventParsingTests(unittest.TestCase):
 
 
 class RestartRecoveryTests(unittest.TestCase):
+    def test_new_inputs_replay_offline_with_full_text_and_original_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.sqlite3"
+            now = datetime(2026, 11, 19, 12, tzinfo=TZ)
+            events = [
+                IncomingEvent("e1", "m1", "conversation", CONTACT, "回归" * 800, now),
+                IncomingEvent("e2", "wake-42", "conversation", CONTACT, "第四天检查", now, "wake"),
+            ]
+            store = AuditStore(path)
+            for event in events:
+                self.assertTrue(store.claim_event(event))
+            store.close()
+            service = object.__new__(AgentService)
+            service.settings = SimpleNamespace(contacts=(CONTACT,))
+            service.store = AuditStore(path)
+            self.addCleanup(service.store.close)
+            service._history = AsyncMock(side_effect=AssertionError("offline"))
+            service._enqueue = Mock()
+            asyncio.run(service._recover_pending_events())
+            self.assertEqual([call.args[0] for call in service._enqueue.call_args_list], events)
+            service._history.assert_not_awaited()
+
     def test_queued_event_is_rebuilt_from_dingtalk_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = AuditStore(Path(directory) / "audit.sqlite3")
@@ -222,6 +246,8 @@ class RestartRecoveryTests(unittest.TestCase):
                 CONTACT, "暂时不在最近聊天记录里", datetime(2026, 7, 21, 9, 0, tzinfo=TZ),
             )
             store.claim_event(missing)
+            store.connection.execute("UPDATE events SET input_v1 = NULL")
+            store.connection.commit()
 
             asyncio.run(service._recover_pending_events())
 
@@ -229,6 +255,7 @@ class RestartRecoveryTests(unittest.TestCase):
             self.assertEqual(recovered.message_id, event.message_id)
             self.assertEqual(recovered.content, event.content)
             self.assertTrue(store.event_is_pending(missing.message_id))
+            self.assertEqual(service._enqueue.call_count, 1)
             store.close()
 
     def test_recent_unclaimed_history_is_reconciled_after_listener_gap(self) -> None:
@@ -301,7 +328,7 @@ class AuditStoreTests(unittest.TestCase):
         self.store.update_event_status(["message-1"], "processed")
         self.assertFalse(self.store.event_is_pending("message-1"))
 
-    def test_legacy_outgoing_table_adds_delivery_columns_and_recovers_sending(self) -> None:
+    def test_legacy_outgoing_table_adds_delivery_receipt_columns(self) -> None:
         self.store.close()
         self.store.path.unlink()
         connection = sqlite3.connect(self.store.path)
@@ -337,9 +364,148 @@ class AuditStoreTests(unittest.TestCase):
                 "last_error",
                 "event_ids_json",
                 "source_received_at",
+                "target_kind",
+                "receipt_status",
+                "remote_marker",
             }
             <= columns
         )
+
+    def test_store_open_does_not_recover_live_sending(self) -> None:
+        event = IncomingEvent(
+            "event-live",
+            "message-live",
+            "conversation-live",
+            CONTACT,
+            "查一下",
+            datetime(2026, 7, 20, 10, 0, tzinfo=TZ),
+        )
+        self.store.claim_event(event)
+        self.store.enqueue_delivery(
+            "send-live", event, "最终正文", "session-live", event_ids=[event.message_id]
+        )
+        self.assertEqual(
+            self.store.claim_due_delivery(datetime.now(TZ))["send_uuid"], "send-live"
+        )
+        path = self.store.path
+        self.store.close()
+
+        self.store = AuditStore(path)
+
+        row = self.store.connection.execute(
+            "SELECT delivery_status FROM outgoing WHERE send_uuid = 'send-live'"
+        ).fetchone()
+        self.assertEqual(row["delivery_status"], "sending")
+
+    def test_store_reopen_does_not_rewrite_consistent_receipts(self) -> None:
+        event = IncomingEvent(
+            "event-receipt", "message-receipt", "dm:user-1", CONTACT,
+            "查一下", datetime(2026, 7, 20, 10, 0, tzinfo=TZ),
+        )
+        self.store.claim_event(event)
+        self.store.enqueue_delivery(
+            "send-receipt", event, "最终正文", "session-receipt",
+            event_ids=[event.message_id],
+        )
+        self.store.connection.executescript(
+            """CREATE TABLE receipt_update_audit (send_uuid TEXT);
+               CREATE TRIGGER audit_receipt_update AFTER UPDATE ON outgoing
+               BEGIN INSERT INTO receipt_update_audit VALUES (NEW.send_uuid); END;"""
+        )
+        path = self.store.path
+        self.store.close()
+
+        self.store = AuditStore(path)
+
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM receipt_update_audit"
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_daemon_recovery_separates_retry_safe_and_remote_uncertain(self) -> None:
+        now = datetime(2026, 7, 20, 10, 0, tzinfo=TZ)
+        dws_event = IncomingEvent(
+            "event-dws", "message-dws", "dm:alice", CONTACT, "查一下", now
+        )
+        jira_contact = Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", "")
+        jira_event = IncomingEvent(
+            "event-jira",
+            "message-jira",
+            "jira:ZKAI-505",
+            jira_contact,
+            "处理 issue",
+            now,
+        )
+        for action_id, event in (("send-dws", dws_event), ("send-jira", jira_event)):
+            self.store.claim_event(event)
+            self.store.enqueue_delivery(
+                action_id, event, "结果", f"session-{action_id}", event_ids=[event.message_id]
+            )
+            self.assertEqual(
+                self.store.claim_due_delivery(datetime.now(TZ))["send_uuid"], action_id
+            )
+
+        recovered = self.store.recover_outgoing(datetime.now(TZ))
+
+        self.assertEqual(recovered, {"retry_wait": 1, "remote_uncertain": 1})
+        rows = self.store.connection.execute(
+            "SELECT send_uuid, delivery_status, receipt_status FROM outgoing ORDER BY send_uuid"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("send-dws", "retry_wait", "pending"),
+                ("send-jira", "remote_uncertain", "remote_uncertain"),
+            ],
+        )
+
+    def test_delivery_cannot_be_confirmed_without_remote_receipt(self) -> None:
+        event = IncomingEvent(
+            "event-proof", "message-proof", "dm:alice", CONTACT, "查一下",
+            datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+        )
+        self.store.claim_event(event)
+        self.store.enqueue_delivery(
+            "send-proof", event, "结果", "session-proof",
+            event_ids=[event.message_id],
+        )
+
+        with self.assertRaisesRegex(ValueError, "remote receipt"):
+            self.store.mark_delivery_sent("send-proof")
+
+        receipt = self.store.delivery_receipts()[0]
+        self.assertEqual(receipt["delivery_status"], "pending")
+        self.assertEqual(receipt["receipt_status"], "pending")
+
+    def test_daemon_recovery_recognizes_legacy_external_inflight_rows(self) -> None:
+        now = datetime(2026, 11, 19, 10, 0, tzinfo=TZ)
+        event = IncomingEvent(
+            "event-jira",
+            "message-jira",
+            "jira:ZKAI-505",
+            Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", ""),
+            "处理 issue",
+            now,
+        )
+        self.store.claim_event(event)
+        self.store.enqueue_delivery(
+            "legacy-comment", event, "结果", "session-1", event_ids=[event.message_id]
+        )
+        self.store.connection.execute(
+            """UPDATE outgoing SET delivery_status = 'retry_wait', remote_marker = ''
+               WHERE send_uuid = ?""",
+            ("legacy-comment",),
+        )
+        self.store.connection.commit()
+
+        recovered = self.store.recover_outgoing(now)
+
+        row = self.store.connection.execute(
+            "SELECT delivery_status, receipt_status FROM outgoing WHERE send_uuid = ?",
+            ("legacy-comment",),
+        ).fetchone()
+        self.assertEqual(recovered, {"retry_wait": 0, "remote_uncertain": 1})
+        self.assertEqual(tuple(row), ("remote_uncertain", "remote_uncertain"))
 
     def test_pending_delivery_survives_reopen_and_keeps_send_uuid(self) -> None:
         event = IncomingEvent(
@@ -377,6 +543,64 @@ class AuditStoreTests(unittest.TestCase):
                 "SELECT status FROM events WHERE message_id = 'message-1'"
             ).fetchone()["status"],
             "delivery_pending",
+        )
+
+    def test_delivery_receipts_expose_each_target_without_payload(self) -> None:
+        now = datetime(2026, 7, 20, 10, 0, tzinfo=TZ)
+        event = IncomingEvent(
+            "event-1", "message-1", "jira:ZKAI-505", CONTACT, "查一下", now
+        )
+        self.store.claim_event(event)
+        self.store.enqueue_delivery(
+            "comment-action", event, "评论正文", "session-1", event_ids=[event.message_id]
+        )
+        self.store.enqueue_notification(
+            "notify-action",
+            conversation_id="dm:user-1",
+            contact_user_id="user-1",
+            content="通知正文",
+            session_id="watch-task-1",
+            now=now,
+        )
+
+        receipts = self.store.delivery_receipts()
+
+        self.assertEqual(
+            [(item["action_id"], item["target_kind"], item["channel"]) for item in receipts],
+            [
+                ("comment-action", "jira_comment", "jira"),
+                ("notify-action", "watch_notification", "dws"),
+            ],
+        )
+        self.assertNotIn("payload_text", receipts[0])
+        self.assertEqual(receipts[0]["recipient"], CONTACT.identity)
+        self.assertEqual(receipts[0]["locator"], "jira:ZKAI-505")
+
+    def test_delivery_receipt_limit_prioritizes_unconfirmed_then_latest_confirmed(self) -> None:
+        now = datetime(2026, 7, 20, 10, 0, tzinfo=TZ)
+        for index in range(1, 5):
+            event = IncomingEvent(
+                f"event-{index}", f"message-{index}", "dm:user-1", CONTACT,
+                "查一下", now + timedelta(seconds=index),
+            )
+            self.store.claim_event(event)
+            self.store.enqueue_delivery(
+                f"action-{index}", event, "结果", f"session-{index}",
+                event_ids=[event.message_id],
+            )
+        self.store.mark_delivery_sent("action-1", "remote-1")
+        self.store.mark_delivery_sent("action-3", "remote-3")
+        self.store.mark_delivery_remote_uncertain(
+            "action-4", "timeout", now + timedelta(minutes=1)
+        )
+
+        self.assertEqual(
+            [item["action_id"] for item in self.store.delivery_receipts()],
+            ["action-1", "action-2", "action-3", "action-4"],
+        )
+        self.assertEqual(
+            [item["action_id"] for item in self.store.delivery_receipts(limit=3)],
+            ["action-2", "action-4", "action-3"],
         )
 
     def test_agent_outgoing_is_not_manual(self) -> None:
@@ -800,8 +1024,9 @@ class DwsSendTests(unittest.TestCase):
         self.assertIn("--open-dingtalk-id", arguments)
         self.assertIn("open-contact", arguments)
         self.assertNotIn("--user", arguments)
-        # 同 uuid 幂等重试
-        self.assertIn("send-uuid-1", arguments)
+        for call in client._json_command.await_args_list:
+            args = call.args[0]
+            self.assertEqual(args[args.index("--idempotency-key") + 1], "send-uuid-1")
 
     def test_send_does_not_fallback_on_network_error(self) -> None:
         client = object.__new__(DwsClient)
@@ -887,7 +1112,7 @@ class DwsSendTests(unittest.TestCase):
         )
 
         arguments = client._json_command.await_args.args[0]
-        content = arguments[arguments.index("--text") + 1]
+        content = arguments[arguments.index("--content") + 1]
         self.assertEqual(
             content,
             "缓存命中 USD 0.027753；配置仍是 $HOME，脚本参数是 $1",
@@ -1310,6 +1535,7 @@ class PlainAgentFlowTests(unittest.TestCase):
         service.store = SimpleNamespace(enqueue_delivery=Mock())
         service.outbox_wakeup = asyncio.Event()
         service._set_runtime = Mock()
+        service._enqueue_delivery_attachments = Mock(return_value=0)
         event = IncomingEvent(
             "event-1",
             "message-1",
@@ -1333,6 +1559,62 @@ class PlainAgentFlowTests(unittest.TestCase):
         service.dws.update_card.assert_not_awaited()
         service.dws.send.assert_not_awaited()
         service.dws.history.assert_not_awaited()
+
+    def test_same_inputs_reuse_final_action_without_reviving_terminal_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.settings = SimpleNamespace(
+                raw={"max_reply_chars": 16000},
+                timezone=TZ,
+                state_dir=Path(directory),
+            )
+            service.mode = "live"
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.outbox_wakeup = asyncio.Event()
+            service._set_runtime = Mock()
+            first = IncomingEvent(
+                "event-1", "message-1", "dm:user-1", CONTACT, "查一下",
+                datetime(2026, 7, 20, 10, 0, tzinfo=TZ),
+            )
+            later = IncomingEvent(
+                "event-2", "message-2", "dm:user-1", CONTACT, "再补充一点",
+                datetime(2026, 7, 20, 10, 1, tzinfo=TZ),
+            )
+            service.store.claim_event(first)
+            service.store.claim_event(later)
+
+            first_outcome = asyncio.run(service._send_after_freshness_check(
+                [first], "第一次结果", session_id="session-1"
+            ))
+            second_outcome = asyncio.run(service._send_after_freshness_check(
+                [first], "重跑结果", session_id="session-2"
+            ))
+            action = service.store.connection.execute(
+                "SELECT send_uuid, payload_text FROM outgoing"
+            ).fetchone()
+            self.assertEqual(action["payload_text"], "第一次结果")
+            service.store.mark_delivery_cancelled(
+                action["send_uuid"], "cancelled", "operator_cancelled"
+            )
+            cancelled_outcome = asyncio.run(service._send_after_freshness_check(
+                [first], "再重跑结果", session_id="session-3"
+            ))
+            later_outcome = asyncio.run(service._send_after_freshness_check(
+                [first, later], "补充后的结果", session_id="session-4"
+            ))
+            rows = service.store.connection.execute(
+                "SELECT delivery_status, payload_text FROM outgoing ORDER BY rowid"
+            ).fetchall()
+
+            self.assertEqual(first_outcome, "delivery_pending")
+            self.assertEqual(second_outcome, "delivery_pending")
+            self.assertEqual(cancelled_outcome, "cancelled")
+            self.assertEqual(later_outcome, "delivery_pending")
+            self.assertEqual(
+                [tuple(row) for row in rows],
+                [("cancelled", ""), ("pending", "补充后的结果")],
+            )
+            service.store.close()
 
     def test_delivery_history_failure_retries_then_sends_same_uuid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1396,6 +1678,460 @@ class PlainAgentFlowTests(unittest.TestCase):
                 ).fetchone()["status"],
                 "processed",
             )
+            service.store.close()
+
+    def test_remote_uncertain_is_reconciled_before_external_post(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ, contacts=[], raw={}, cooldown=600
+            )
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._history_events = Mock(return_value=[])
+            service._watch_rules = []
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira",
+                streaming_cards=False,
+                supports_freshness=False,
+                retry_safe=False,
+                supports_reconciliation=True,
+                find_receipt=AsyncMock(return_value=None),
+                send=AsyncMock(return_value=("new-comment", {})),
+            )
+            event = IncomingEvent(
+                "event-1",
+                "message-1",
+                "jira:ZKAI-505",
+                Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", ""),
+                "处理 issue",
+                datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+            )
+            service.store.claim_event(event)
+            service.store.enqueue_delivery(
+                "comment-action", event, "确认修复", "session-1", event_ids=[event.message_id]
+            )
+            service.store.claim_due_delivery(datetime.now(TZ))
+            service.store.recover_outgoing(datetime.now(TZ))
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external):
+                asyncio.run(service._dispatch_due_delivery())
+
+            external.find_receipt.assert_awaited_once()
+            external.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "remote_uncertain")
+            self.assertEqual(receipt["receipt_status"], "remote_uncertain")
+            service.store.close()
+
+    def test_unverifiable_external_delivery_never_blindly_posts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(timezone=TZ, contacts=[], raw={})
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._history_events = Mock(return_value=[])
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira",
+                streaming_cards=False,
+                supports_freshness=False,
+                retry_safe=False,
+                supports_reconciliation=True,
+                find_receipt=AsyncMock(side_effect=RuntimeError("read unavailable")),
+                send=AsyncMock(),
+            )
+            event = IncomingEvent(
+                "event-1",
+                "message-1",
+                "jira:ZKAI-505",
+                Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", ""),
+                "处理 issue",
+                datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+            )
+            service.store.claim_event(event)
+            service.store.enqueue_delivery(
+                "comment-action", event, "确认修复", "session-1", event_ids=[event.message_id]
+            )
+            service.store.claim_due_delivery(datetime.now(TZ))
+            service.store.recover_outgoing(datetime.now(TZ))
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external):
+                asyncio.run(service._dispatch_due_delivery())
+
+            external.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "remote_uncertain")
+            self.assertEqual(receipt["receipt_status"], "remote_uncertain")
+            service.store.close()
+
+    def test_legacy_unmarked_external_inflight_stays_operator_uncertain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(timezone=TZ, contacts=[], raw={})
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._history_events = Mock(return_value=[])
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira", streaming_cards=False, supports_freshness=False,
+                retry_safe=False, supports_reconciliation=True,
+                find_receipt=AsyncMock(return_value=None), send=AsyncMock(),
+            )
+            removed_rule = WatchRule(
+                name="removed", source="jira", instruction="处理 issue"
+            )
+            event = IncomingEvent(
+                "event-1", "message-1", "jira:ZKAI-505",
+                Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", ""),
+                "处理 issue", datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+                "watch-jira", removed_rule.authority_key,
+            )
+            service.store.claim_event(event)
+            service.store.enqueue_delivery(
+                "legacy-comment", event, "确认修复", "session-1",
+                event_ids=[event.message_id],
+            )
+            service.store.connection.execute(
+                """UPDATE outgoing SET delivery_status = 'retry_wait',
+                   remote_marker = '', attempt_count = 0, next_attempt_at = '',
+                   last_error = '' WHERE send_uuid = 'legacy-comment'"""
+            )
+            service.store.connection.commit()
+            service.store.recover_outgoing(datetime.now(TZ))
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external):
+                asyncio.run(service._dispatch_due_delivery())
+
+            external.find_receipt.assert_not_awaited()
+            external.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "remote_uncertain")
+            self.assertEqual(receipt["receipt_status"], "remote_uncertain")
+            self.assertIn("operator", receipt["last_error"])
+            service.store.close()
+
+    def test_reconciled_external_receipt_confirms_without_post(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(timezone=TZ, contacts=[], raw={})
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._history_events = Mock(return_value=[])
+            service._watch_rules = []
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira", streaming_cards=False, supports_freshness=False,
+                retry_safe=False, supports_reconciliation=True,
+                find_receipt=AsyncMock(return_value="comment-505"),
+                send=AsyncMock(),
+            )
+            removed_rule = WatchRule(
+                name="removed", source="jira", instruction="处理 issue"
+            )
+            event = IncomingEvent(
+                "event-1", "message-1", "jira:ZKAI-505",
+                Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", ""),
+                "处理 issue", datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+                "watch-jira", removed_rule.authority_key,
+            )
+            service.store.claim_event(event)
+            service.store.enqueue_delivery(
+                "comment-action", event, "确认修复", "session-1",
+                event_ids=[event.message_id],
+            )
+            service.store.claim_due_delivery(datetime.now(TZ))
+            service.store.recover_outgoing(datetime.now(TZ))
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external):
+                asyncio.run(service._dispatch_due_delivery())
+
+            external.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "sent")
+            self.assertEqual(receipt["receipt_status"], "confirmed")
+            self.assertEqual(receipt["remote_id"], "comment-505")
+            service.store.close()
+
+    def test_external_post_timeout_becomes_remote_uncertain(self) -> None:
+        async def never_returns(*_args):
+            await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ, contacts=[], raw={}, cooldown=600
+            )
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._history_events = Mock(return_value=[])
+            rule = WatchRule(name="active", source="jira", instruction="处理 issue")
+            service._watch_rules = [rule]
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira", streaming_cards=False, supports_freshness=False,
+                retry_safe=False, supports_reconciliation=True,
+                find_receipt=AsyncMock(), send=never_returns,
+            )
+            event = IncomingEvent(
+                "event-1", "message-1", "jira:ZKAI-505",
+                Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", ""),
+                "处理 issue", datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+                "watch-jira", rule.authority_key,
+            )
+            service.store.claim_event(event)
+            service.store.enqueue_delivery(
+                "comment-action", event, "确认修复", "session-1",
+                event_ids=[event.message_id],
+            )
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external), patch(
+                "dws_dm_agent.service._DELIVERY_TIMEOUT_SECONDS", 0.01
+            ):
+                asyncio.run(service._dispatch_due_delivery())
+
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "remote_uncertain")
+            self.assertEqual(receipt["receipt_status"], "remote_uncertain")
+            self.assertIn("TimeoutError", receipt["last_error"])
+            service.store.close()
+
+    def test_revoked_watch_authority_cancels_queued_external_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(timezone=TZ, contacts=[], raw={})
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._watch_rules = []
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira", streaming_cards=False, supports_freshness=False,
+                retry_safe=False, supports_reconciliation=True,
+                find_receipt=AsyncMock(), send=AsyncMock(),
+            )
+            old_rule = WatchRule(
+                name="removed", source="jira", instruction="处理 issue"
+            )
+            event = IncomingEvent(
+                "event-1", "message-1", "jira:ZKAI-505",
+                Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", ""),
+                "处理 issue", datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+                "watch-jira", old_rule.authority_key,
+            )
+            service.store.claim_event(event)
+            service.store.enqueue_delivery(
+                "comment-action", event, "确认修复", "session-1",
+                event_ids=[event.message_id],
+            )
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external):
+                asyncio.run(service._dispatch_due_delivery())
+
+            external.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "cancelled")
+            self.assertIn("authority", receipt["last_error"])
+            service.store.close()
+
+    def test_persisted_supplement_cancels_pending_external_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ, contacts=[], raw={}, cooldown=600
+            )
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            rule = WatchRule(name="active", source="jira", instruction="处理 issue")
+            service._watch_rules = [rule]
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira", streaming_cards=False, supports_freshness=False,
+                retry_safe=False, supports_reconciliation=True,
+                find_receipt=AsyncMock(), send=AsyncMock(),
+            )
+            contact = Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", "")
+            original = IncomingEvent(
+                "event-1", "message-1", "jira:ZKAI-505", contact, "处理 issue",
+                datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+                "watch-jira", rule.authority_key,
+            )
+            supplement = IncomingEvent(
+                "event-2", "message-2", "jira:ZKAI-505", contact, "补充条件",
+                datetime(2026, 11, 19, 10, 1, tzinfo=TZ),
+                "watch-jira", rule.authority_key,
+            )
+            service.store.claim_event(original)
+            service.store.enqueue_delivery(
+                "comment-action", original, "旧结论", "session-1",
+                event_ids=[original.message_id],
+            )
+            service.store.claim_event(supplement)
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external):
+                asyncio.run(service._dispatch_due_delivery())
+
+            external.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "cancelled")
+            self.assertIn("new_message", receipt["last_error"])
+            service.store.close()
+
+    def test_old_or_different_watch_workflow_does_not_cancel_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ, contacts=[], raw={}, cooldown=600
+            )
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            rule = WatchRule(name="active", source="jira", instruction="处理 issue")
+            other = WatchRule(name="other", source="jira", instruction="另一项承诺")
+            service._watch_rules = [rule, other]
+            service.dws = SimpleNamespace()
+            external = SimpleNamespace(
+                name="jira", streaming_cards=False, supports_freshness=False,
+                retry_safe=False, supports_reconciliation=True,
+                find_receipt=AsyncMock(), send=AsyncMock(return_value=("comment-1", {})),
+            )
+            contact = Contact("ZKAI-505", "jira:ZKAI-505", "jira:ZKAI-505", "")
+            original = IncomingEvent(
+                "event-1", "message-1", "jira:ZKAI-505", contact, "处理 issue",
+                datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+                "watch-jira", rule.authority_key,
+            )
+            old = IncomingEvent(
+                "event-old", "message-old", "jira:ZKAI-505", contact, "旧输入",
+                datetime(2026, 11, 19, 9, 0, tzinfo=TZ),
+                "watch-jira", rule.authority_key,
+            )
+            independent = IncomingEvent(
+                "event-other", "message-other", "jira:ZKAI-505", contact, "另一项",
+                datetime(2026, 11, 19, 10, 1, tzinfo=TZ),
+                "watch-jira", other.authority_key,
+            )
+            service.store.claim_event(original)
+            service.store.enqueue_delivery(
+                "comment-action", original, "有效结论", "session-1",
+                event_ids=[original.message_id],
+            )
+            service.store.claim_event(old)
+            service.store.claim_event(independent)
+
+            with patch("dws_dm_agent.service.channel_for", return_value=external):
+                asyncio.run(service._dispatch_due_delivery())
+
+            external.send.assert_awaited_once()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "sent")
+            service.store.close()
+
+    def test_watch_notification_ignores_unrelated_queued_dm_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ, contacts=[CONTACT], raw={}, cooldown=600,
+                self_open_id="self-open-id",
+            )
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._watch_rule_allows_notify = Mock(return_value=True)
+            service.dws = SimpleNamespace(
+                streaming_cards=False, supports_freshness=True,
+                retry_safe=True, supports_reconciliation=False,
+                history=AsyncMock(return_value=[]),
+                send=AsyncMock(return_value=("dm-receipt", {})),
+            )
+            service.store.enqueue_notification(
+                "watch-notify-task-event",
+                conversation_id=f"dm:{CONTACT.identity}",
+                contact_user_id=CONTACT.identity,
+                content="事项完成",
+                session_id="task-1",
+                now=datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+            )
+            service.store.claim_event(IncomingEvent(
+                "event-unrelated", "message-unrelated", f"dm:{CONTACT.identity}",
+                CONTACT, "另一个问题", datetime(2026, 11, 19, 10, 1, tzinfo=TZ),
+            ))
+
+            asyncio.run(service._dispatch_due_delivery())
+
+            service.dws.send.assert_awaited_once()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "sent")
+            service.store.close()
+
+    def test_revoked_watch_notification_is_cancelled_before_dm_send(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ, contacts=[CONTACT], raw={}, cooldown=600,
+            )
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._watch_rule_allows_notify = Mock(return_value=False)
+            service.dws = SimpleNamespace(
+                streaming_cards=False, supports_freshness=True,
+                retry_safe=True, supports_reconciliation=False,
+                history=AsyncMock(return_value=[]), send=AsyncMock(),
+            )
+            service.store.enqueue_notification(
+                "watch-notify-task-event", conversation_id=f"dm:{CONTACT.identity}",
+                contact_user_id=CONTACT.identity, content="完成", session_id="task-1",
+                now=datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+            )
+
+            with patch("dws_dm_agent.service.channel_for", return_value=service.dws):
+                asyncio.run(service._dispatch_due_delivery())
+
+            service.dws.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "cancelled")
+            self.assertIn("authority", receipt["last_error"])
+            service.store.close()
+
+    def test_revoked_inflight_watch_notification_stays_uncertain_without_resend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AgentService.__new__(AgentService)
+            service.mode = "live"
+            service.settings = SimpleNamespace(
+                timezone=TZ, contacts=[CONTACT], raw={}, cooldown=600,
+            )
+            service.store = AuditStore(Path(directory) / "audit.sqlite3")
+            service.streaming_card_send_uuids = {}
+            service._watch_rule_allows_notify = Mock(return_value=False)
+            service.dws = SimpleNamespace(
+                streaming_cards=False, supports_freshness=True,
+                retry_safe=True, supports_reconciliation=False,
+                history=AsyncMock(return_value=[]), send=AsyncMock(),
+            )
+            service.store.enqueue_notification(
+                "watch-notify-task-event", conversation_id=f"dm:{CONTACT.identity}",
+                contact_user_id=CONTACT.identity, content="完成", session_id="task-1",
+                now=datetime(2026, 11, 19, 10, 0, tzinfo=TZ),
+            )
+            service.store.claim_due_delivery(datetime.now(TZ))
+            service.store.recover_outgoing(datetime.now(TZ))
+
+            with patch("dws_dm_agent.service.channel_for", return_value=service.dws):
+                asyncio.run(service._dispatch_due_delivery())
+
+            service.dws.send.assert_not_awaited()
+            receipt = service.store.delivery_receipts()[0]
+            self.assertEqual(receipt["delivery_status"], "remote_uncertain")
+            self.assertEqual(receipt["receipt_status"], "remote_uncertain")
+            self.assertIn("authority", receipt["last_error"])
             service.store.close()
 
     def test_manual_takeover_cancels_pending_delivery(self) -> None:
@@ -1638,10 +2374,11 @@ class MultimodalImageTests(unittest.TestCase):
 
 
 class HumanTakeoverTests(unittest.TestCase):
-    def test_zero_cooldown_disables_manual_takeover(self) -> None:
+    def test_zero_cooldown_still_cancels_the_current_turn_only(self) -> None:
         incoming = datetime(2026, 7, 20, 10, 0, tzinfo=TZ)
         manual = datetime(2026, 7, 20, 10, 2, tzinfo=TZ)
-        self.assertFalse(human_owns_conversation(manual, incoming, 0))
+        self.assertTrue(human_owns_conversation(manual, incoming, 0))
+        self.assertFalse(human_owns_conversation(incoming - timedelta(seconds=1), incoming, 0))
 
     def test_manual_reply_keeps_control_for_ten_minutes(self) -> None:
         manual = datetime(2026, 7, 20, 10, 0, tzinfo=TZ)
@@ -3523,6 +4260,40 @@ class StreamingCardDeferralTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(status["status"], "processed")
             service.store.close()
+
+    def test_existing_card_and_fallback_text_require_their_own_receipt(self) -> None:
+        cases = [
+            (False, False, "retry_wait", 1),
+            (True, False, "remote_uncertain", 0),
+            (True, True, "sent", 0),
+        ]
+        for expired, card_updated, expected, text_calls in cases:
+            with self.subTest(expired=expired, card_updated=card_updated), ExitStack() as cleanup:
+                root = Path(cleanup.enter_context(tempfile.TemporaryDirectory()))
+                service = self._service(root)
+                cleanup.callback(service.store.close)
+                event = self._event()
+                service.store.claim_event(event)
+                service.store.enqueue_delivery(
+                    "card-result", event, "最终正文", "session",
+                    event_ids=[event.message_id], card_biz_id="existing-card",
+                )
+                if expired:
+                    service.store.connection.execute(
+                        "UPDATE outgoing SET delivery_status='retry_wait', attempt_count=1, sent_at=?",
+                        ((datetime.now(TZ) - timedelta(hours=25)).isoformat(),),
+                    )
+                    service.store.connection.commit()
+                if not card_updated:
+                    service.dws.update_card.side_effect = RuntimeError("update failed")
+                service.dws.send = AsyncMock(return_value=(None, {}))
+
+                asyncio.run(service._dispatch_due_delivery())
+
+                receipt, = service.store.delivery_receipts()
+                self.assertEqual(receipt["delivery_status"], expected)
+                self.assertEqual(service.dws.send.await_count, text_calls)
+                service.dws.update_card.assert_awaited_once_with("existing-card", "最终正文", 3)
 
     def test_reply_supplement_silent_sends_no_card_and_leaves_none_processing(self) -> None:
         # 行为链：回复决定 -> 派发时发现补充消息取消投递 -> 重跑后 silent。

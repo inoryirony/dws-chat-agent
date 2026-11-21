@@ -32,7 +32,7 @@ from typing import Any, Mapping
 # 不依赖安装方式或调用方 cwd（escalate_mcp.py 不导入本包，无此问题）。
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dws_dm_agent.core import AuditStore, TaskScope, sanitize_text
+from dws_dm_agent.core import AuditStore, IncomingEvent, TaskScope, sanitize_text
 
 _MAX_MESSAGE_IDS = 12
 _MAX_RESOURCES = 12
@@ -185,7 +185,7 @@ def _clean_facts(value: Any) -> list[dict[str, str]] | None:
 def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
     """执行一次 task_record/task_lookup/report 请求；所有边界校验都在这里完成。"""
     tool = str(request.get("tool") or "")
-    if tool not in {"task_record", "task_lookup", "report"}:
+    if tool not in {"task_record", "task_lookup", "report", "gitlab_merge_request"}:
         return {"ok": False, "error": f"unknown_tool: {tool or '(empty)'}"}
     scope = TaskScope(
         self_id=str(context.get("self_id") or ""),
@@ -205,9 +205,32 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
     if tool == "report":
         return _execute_report(args, db_path, run_id)
 
-    store = AuditStore(Path(db_path))
+    store = AuditStore(Path(db_path), self_id=scope.self_id)
     try:
         now = datetime.now().astimezone()
+        if tool == "gitlab_merge_request":
+            review = context.get("merge_review")
+            assessment = _clean_str(args.get("assessment"), 1000)
+            if (not isinstance(review, Mapping) or not assessment or set(args) != {"assessment"}
+                    or not all(review.get(key) for key in ("message_id", "host", "project", "iid", "source_ref"))):
+                return {"ok": False, "error": "reviewed_gitlab_merge_required"}
+            rows = store.run_input_rows(run_id)
+            if len(rows) != 1 or not rows[0]["input_v1"]:
+                return {"ok": False, "error": "merge_source_missing"}
+            event = IncomingEvent.from_input_row(rows[0], self_id=scope.self_id)
+            if (event is None or event.origin != "watch-gitlab" or event.message_id != review["message_id"]
+                    or event.conversation_id != scope.conversation_id or event.contact.identity != scope.contact_id):
+                return {"ok": False, "error": "merge_source_mismatch"}
+            try:
+                action_id, status = store.enqueue_gitlab_merge(
+                    event, host=review["host"], project=review["project"], iid=review["iid"],
+                    source_ref=review["source_ref"], target_ref=event.target_branch, expected_sha=event.source_revision,
+                    assessment=assessment, watch_authority=event.watch_authority, session_id=run_id,
+                    event_ids=[event.message_id],
+                )
+            except ValueError as exc:
+                return {"ok": False, "error": sanitize_text(str(exc), 200)}
+            return {"ok": True, "action_id": action_id, "delivery_status": status}
         evidence_ids: list[str] = []
         evidence_at = now
         if tool == "task_record":
@@ -251,8 +274,8 @@ def execute_request(request: Mapping[str, Any], context: Mapping[str, Any]) -> d
                     default=max(message_times.values()),
                 )
         if tool == "task_lookup":
-            # 黑板读：跨联系人查整块黑板；include_done 含 completed/cancelled。
             response = store.apply_task_lookup(
+                scope=scope,
                 contact_id=_clean_str(args.get("contact"), 200),
                 status=_clean_str(args.get("status"), 32),
                 include_done=bool(args.get("include_done", False)),

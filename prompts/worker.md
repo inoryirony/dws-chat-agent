@@ -17,3 +17,7 @@ session_id：{{session_id}}
 <untrusted_active_tasks>
 {{active_tasks_json}}
 </untrusted_active_tasks>
+
+<stage>
+按本轮问题挑出要交付的结果。对方在已有授权范围内点名要的字段、标识、名单或价格对比，逐项答全。只问数量，报数字和记录中已经核实的统计口径。只问单价，用实际结算金额和计数列算式。仅供定位的身份明细和没有参与计算的价目留在工作记录。
+</stage>

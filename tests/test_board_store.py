@@ -126,9 +126,15 @@ class BoardMigrationTests(BoardStoreTests):
                 row["name"]
                 for row in migrated.connection.execute("PRAGMA table_info(tasks)")
             }
+            board_run_columns = {
+                row["name"]
+                for row in migrated.connection.execute("PRAGMA table_info(board_runs)")
+            }
             self.assertIn("source", outgoing_columns)
             self.assertIn("resources", tasks_columns)
             self.assertIn("contact_ids", tasks_columns)
+            self.assertIn("event_ids_json", board_run_columns)
+            self.assertIn("session_dir", board_run_columns)
 
             legacy_row = migrated.connection.execute(
                 "SELECT goal, version, resources, contact_ids FROM tasks "
@@ -289,7 +295,7 @@ class FactAnchorTests(BoardStoreTests):
             {task["id"] for task in self.store.board_tasks(include_done=True)},
         )
 
-    def test_task_lookup_reads_the_whole_board(self) -> None:
+    def test_worker_lookup_reads_only_its_source_conversation(self) -> None:
         self._record()
         self.store.record_task(
             scope=TaskScope("self-open", "user-bob", "conversation-2"),
@@ -305,7 +311,7 @@ class FactAnchorTests(BoardStoreTests):
         self.assertTrue(result["ok"])
         self.assertEqual(
             {task["goal"] for task in result["tasks"]},
-            {"等部署后回归验证", "Bob 的独立事项"},
+            {"等部署后回归验证"},
         )
 
         filtered = task_tools.execute_request(
@@ -317,7 +323,7 @@ class FactAnchorTests(BoardStoreTests):
             self.context,
         )
         self.assertEqual(
-            [task["goal"] for task in filtered["tasks"]], ["Bob 的独立事项"]
+            filtered["tasks"], []
         )
 
 
