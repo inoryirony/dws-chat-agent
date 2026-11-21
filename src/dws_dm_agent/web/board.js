@@ -92,6 +92,20 @@
     aliasesLoaded: false,
     timer: 0,
 
+    // Steer 草稿按 session_id 存 localStorage：2s 轮询的 reconcile 会把
+    // 暂时离开 running/waiting 集的运行行整个重建，刷新页面更直接重排
+    // DOM——正在打的介入指令都会凭空消失。草稿在行重建/页面刷新后
+    // 回填，送出成功才清掉。
+    steerDrafts() {
+      try { return JSON.parse(localStorage.getItem("dwsSteerDrafts") || "{}"); }
+      catch { return {}; }
+    },
+    saveSteerDraft(key, text) {
+      const drafts = Board.steerDrafts();
+      if (text) drafts[key] = text; else delete drafts[key];
+      try { localStorage.setItem("dwsSteerDrafts", JSON.stringify(drafts)); } catch {}
+    },
+
     headers() {
       const token = Board.token();
       return token ? { "X-Operator-Token": token } : {};
@@ -183,6 +197,14 @@
       const orphanRows = node("div", "dws-run-rows");
       runs.append(rHead, runRows, orphanRows);
 
+      const backlog = node("section", "dws-panel");
+      backlog.append(node("h2", "", "等待处理"), node("div", "dws-facts"));
+      backlog.hidden = true;
+      Board.backlogRows = backlog.lastChild;
+      const deliveries = node("details", "dws-done-strip");
+      deliveries.append(node("summary"), node("div", "dws-facts"));
+      Board.deliveryRows = deliveries.lastChild;
+
       const tasks = node("section", "dws-panel");
       const tHead = node("div", "dws-panel-head");
       const tTitle = node("div", "dws-panel-title");
@@ -213,7 +235,7 @@
       doneStrip.append(doneSummary, doneCards);
       tasks.append(tHead, cols, doneStrip);
 
-      root.append(alert, verdicts, runs, tasks);
+      root.append(alert, verdicts, backlog, runs, deliveries, tasks);
 
       root.append(Board.drawer(), Board.newSession());
 
@@ -302,7 +324,29 @@
       people.id = "dwsDrawerPeople";
       const facts = node("div", "dws-facts");
       facts.id = "dwsDrawerFacts";
-      aside.append(head, people, facts);
+      const link = node("form", "dws-modal-actions");
+      const source = node("input", "dws-answer");
+      source.placeholder = "已接收的来源消息 ID";
+      source.setAttribute("aria-label", source.placeholder);
+      source.required = true;
+      const submit = node("button", "dws-btn", "关联来源");
+      submit.type = "submit";
+      link.append(source, submit);
+      link.addEventListener("submit", async event => {
+        event.preventDefault();
+        const taskId = aside.dataset.taskId;
+        submit.disabled = true;
+        try {
+          await Board.post("/api/task/link-source", { task_id: taskId, message_id: source.value.trim() });
+          await Board.refresh();
+          if (!aside.hidden && aside.dataset.taskId === taskId) Board.openDrawer(taskId);
+        } catch (error) {
+          Board.toast(error.message, true);
+        } finally {
+          submit.disabled = false;
+        }
+      });
+      aside.append(head, people, facts, link);
       const wrap = document.createDocumentFragment();
       wrap.append(backdrop, aside);
       return wrap;
@@ -345,6 +389,29 @@
       Board.renderVerdicts(data);
       Board.renderRunning(data);
       Board.renderTasks(data);
+      const gaps = list(data.execution_backlog);
+      const gapLabels = { queued: "排队中", startup_manual_review: "恢复后待核实", unowned_run: "执行者已离开" };
+      Board.backlogRows.parentNode.hidden = !gaps.length;
+      reconcile(Board.backlogRows, gaps, item => item.kind + "/" + item.identifier,
+        () => node("div", "dws-fact"),
+        (element, item) => { element.textContent = [gapLabels[item.kind] || item.kind, clock(item.since), item.identifier].join(" · "); });
+      const deliveryStates = {
+        pending: "待投递", sending: "投递中", retry_wait: "待重试",
+        remote_uncertain: "待核实远端回执", sent: "已确认", cancelled: "已取消",
+      };
+      const targets = { jira_comment: "Jira 评论", gitlab_note: "GitLab 评论", gitlab_merge: "GitLab 合并", watch_notification: "终态通知",
+        attachment: "附件", reply: "回复", message: "消息", card: "卡片" };
+      const receipts = list(data.deliveries);
+      const oldest = receipts.find(row => !["sent", "cancelled"].includes(row.delivery_status));
+      Board.deliveryRows.previousSibling.textContent = oldest
+        ? "投递回执 · 最早待确认 " + clock(oldest.queued_at) : "投递回执";
+      reconcile(Board.deliveryRows, receipts, row => row.action_id,
+        () => node("div", "dws-fact"),
+        (item, row) => {
+          const state = deliveryStates[row.delivery_status] || row.delivery_status;
+          item.textContent = [targets[row.target_kind] || row.channel, row.recipient || row.destination,
+            state, row.remote_id, row.last_error].filter(Boolean).join(" · ");
+        });
     },
 
     /* 裁决卡要说清三件事：在等什么、要你决定什么、已知事实是什么。
@@ -632,6 +699,17 @@
           steerSend.dataset.dwsSendSteer = "1";
           steerSend.append(icon("send"));
           steerBox.append(steerInput, steerSend);
+          // 重建时回填未送出的草稿；有草稿说明用户正开着介入框，
+          // 连展开状态一起还原（不可 steer 的协议除外，update 会再收掉）。
+          const sessionKey = String(run.session_id);
+          const draft = Board.steerDrafts()[sessionKey] || "";
+          if (draft) {
+            steerInput.value = draft;
+            if (run.steerable !== false) steerBox.hidden = false;
+          }
+          steerInput.addEventListener("input", () => {
+            Board.saveSteerDraft(sessionKey, steerInput.value);
+          });
           main.append(line, meta, rail, toggle, stepList, steerBox);
           const chat = node("button", "dws-icon-btn");
           chat.type = "button";
@@ -781,6 +859,9 @@
     openDrawer(taskId) {
       const task = list(Board.state?.tasks).find(item => String(item.id) === String(taskId));
       if (!task) return;
+      const drawer = document.getElementById("dwsDrawer");
+      drawer.dataset.taskId = taskId;
+      drawer.querySelector("form").reset();
       document.getElementById("dwsDrawerGoal").textContent = task.goal || "";
       const people = document.getElementById("dwsDrawerPeople");
       clear(people);
@@ -788,6 +869,7 @@
         .forEach(id => people.append(Board.avatar(id)));
       const facts = document.getElementById("dwsDrawerFacts");
       clear(facts);
+      if (task.evidence_summary) facts.append(node("div", "dws-fact", "事项依据 · " + task.evidence_summary));
       const entries = list(task.facts ?? task.recent_facts);
       entries.forEach(fact => {
         const row = node("div", "dws-fact");
@@ -797,6 +879,10 @@
         facts.append(row);
       });
       if (!entries.length) facts.append(node("div", "dws-progress-empty", "还没有留下事实"));
+      list(task.sources).forEach(source => {
+        facts.append(node("div", "dws-fact", `来源 · ${source.conversation_id} · ${source.message_id}`));
+      });
+      list(task.run_ids).forEach(id => facts.append(node("div", "dws-fact", `执行 · ${id}`)));
       document.getElementById("dwsDrawerBackdrop").hidden = false;
       document.getElementById("dwsDrawer").hidden = false;
     },
@@ -862,6 +948,7 @@
           const box = button.closest(".dws-steer");
           box.hidden = true;
           box.querySelector("input").value = "";
+          Board.saveSteerDraft(button.dataset.dwsSession, "");
           Board.refresh();
         })
         .catch(error => { Board.toast(error.message, true); button.disabled = false; });

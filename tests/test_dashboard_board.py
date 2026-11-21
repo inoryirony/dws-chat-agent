@@ -101,6 +101,10 @@ class FakeService:
         self.calls.append(("answer_task", task_id, answer))
         return True
 
+    async def link_task_source(self, task_id, message_id):
+        self.calls.append(("link_task_source", task_id, message_id))
+        return message_id == "received"
+
 
 class BoardEndpointTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -186,6 +190,22 @@ class BoardEndpointTests(unittest.TestCase):
         self.assertEqual(
             service.calls, [("open_operator_session", "整理周报", "alice")]
         )
+
+    def test_link_requires_operator_and_an_existing_source(self) -> None:
+        service = FakeService()
+        base = self.start_server(service)
+        path = "/api/task/link-source"
+        body = {"task_id": "T", "message_id": "received"}
+        with self.assertRaises(HTTPError) as denied:
+            self.post_json(base, path, body)
+        self.assertEqual(denied.exception.code, 403)
+        self.assertEqual(service.calls, [])
+        token = self.server_ref.operator_token
+        self.assertEqual(self.post_json(base, path, body, token=token), {"ok": True})
+        self.assertEqual(service.calls, [("link_task_source", "T", "received")])
+        with self.assertRaises(HTTPError) as missing:
+            self.post_json(base, path, {**body, "message_id": "missing"}, token=token)
+        self.assertEqual(missing.exception.code, 404)
 
     def test_open_session_without_alias_passes_none(self) -> None:
         service = FakeService()
@@ -543,6 +563,8 @@ class RealServiceBoardIntegrationTests(unittest.IsolatedAsyncioTestCase):
             {
                 "runs",
                 "tasks",
+                "execution_backlog",
+                "deliveries",
                 "recent_failed",
                 "waiting_operator",
                 "recent_done",
@@ -659,6 +681,21 @@ class OrphanWorktreeReclaimTests(unittest.TestCase):
 
             orphan = root / "wt" / "repo-orphan"
             git("worktree", "add", "--detach", str(orphan), "HEAD")
+            dirty = root / "wt" / "repo-dirty"
+            git("worktree", "add", "--detach", str(dirty), "HEAD")
+            (dirty / "local.txt").write_text("未提交现场", encoding="utf-8")
+            committed = root / "wt" / "repo-committed"
+            git("worktree", "add", "--detach", str(committed), "HEAD")
+            (committed / "result.txt").write_text("独有提交", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(committed), "add", "result.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(committed), "commit", "-m", "keep evidence"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             outside = root / "outside-wt"
             git("worktree", "add", "--detach", str(outside), "HEAD")
             plain = root / "wt" / "repo-not-a-worktree"
@@ -671,6 +708,8 @@ class OrphanWorktreeReclaimTests(unittest.TestCase):
             self.addCleanup(service.store.close)
             for session_id, path in (
                 ("run-orphan", orphan),
+                ("run-dirty", dirty),
+                ("run-committed", committed),
                 ("run-outside", outside),
                 ("run-plain", plain),
             ):
@@ -691,6 +730,8 @@ class OrphanWorktreeReclaimTests(unittest.TestCase):
             # 根外与未登记的目录原样保留：回收只动确定的孤儿。
             self.assertTrue(outside.exists())
             self.assertTrue(plain.exists())
+            self.assertTrue(dirty.exists())
+            self.assertTrue(committed.exists())
 
 
 if __name__ == "__main__":

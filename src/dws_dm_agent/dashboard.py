@@ -837,6 +837,9 @@ class DashboardServer:
                 if path == "/api/task/answer":
                     self._handle_answer()
                     return
+                if path == "/api/task/link-source":
+                    self._handle_link_source()
+                    return
                 self.send_error(404)
 
             def _origin_allowed(self) -> bool:
@@ -988,6 +991,17 @@ class DashboardServer:
                     )
                     if self._resolve_maybe_coroutine(answered) is False:
                         raise _BoardTargetMissing("该事项已不在等待")
+                    return {"ok": True}
+
+                self._board_write(invoke)
+
+            def _handle_link_source(self) -> None:
+                def invoke(service: Any, body: Mapping[str, Any]) -> dict[str, Any]:
+                    linked = service.link_task_source(
+                        _board_text(body.get("task_id")), _board_text(body.get("message_id"))
+                    )
+                    if not self._resolve_maybe_coroutine(linked):
+                        raise _BoardTargetMissing("找不到该事项或来源消息")
                     return {"ok": True}
 
                 self._board_write(invoke)
