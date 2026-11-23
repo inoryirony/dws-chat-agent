@@ -4053,6 +4053,9 @@ class AgentService:
                 now = datetime.now(self.settings.timezone)
                 self._scan_time_wakes(now)
                 self._drain_terminal_events(now)
+                # 派发中途异常会把 wake 卡在 claimed（外层只记日志不重投），
+                # 每 5s 扫一次过期认领回置 pending，30 分钟内自愈。
+                self.store.recover_stale_wakes(now)
                 for wake in self.store.due_wakes(now):
                     await self._dispatch_wake(wake, now)
             except asyncio.CancelledError:
@@ -4168,9 +4171,9 @@ class AgentService:
     async def _dispatch_wake(self, wake: Mapping[str, Any], now: datetime) -> None:
         """把到点 wake 送达：在跑会话直接 steer，否则合成输入进批队列。
 
-        生命周期 pending -> claimed -> done：claim 之后崩溃的 wake 由
-        启动扫尾回置 pending 重放；派发失败也置 done 并记 error，绝不
-        无限重试同一条。
+        生命周期 pending -> claimed -> done：claim 之后崩溃/异常滞留的
+        claimed wake 由启动扫尾与 30 分钟过期扫描回置 pending 重放；派发
+        失败也置 done 并记 error，绝不无限重试同一条。
         """
         wake_id = int(wake["id"])
         if not self.store.claim_wake(wake_id, now=now):

@@ -194,8 +194,7 @@
       const rCount = node("span", "dws-count");
       rHead.append(rTitle, rCount);
       const runRows = node("div", "dws-run-rows");
-      const orphanRows = node("div", "dws-run-rows");
-      runs.append(rHead, runRows, orphanRows);
+      runs.append(rHead, runRows);
 
       const backlog = node("section", "dws-panel");
       backlog.append(node("h2", "", "等待处理"), node("div", "dws-facts"));
@@ -291,7 +290,6 @@
       Board.doneStrip = { root: doneStrip, count: doneCount, cards: doneCards };
       Board.colBoxes = colBoxes;
       Board.runRows = runRows;
-      Board.orphanRows = orphanRows;
       Board.verdicts = verdicts;
       Board.verdictRows = document.getElementById("dwsVerdictRows");
       Board.runningCount = rCount;
@@ -784,18 +782,6 @@
         });
 
       if (!runs.length) Board.runRows.append(emptyRun);
-
-      const known = new Set(runs.map(run => run.session_id));
-      const orphans = list(data.orphan_runs).filter(item => !known.has(item.session_id));
-      reconcile(Board.orphanRows, orphans, item => String(item.session_id),
-        () => node("article", "dws-run"),
-        (row, item) => {
-          clear(row);
-          row.append(Board.avatar(item.contact_id));
-          const main = node("div", "dws-run-main");
-          main.append(node("div", "dws-run-headline", "会话进程还在，黑板登记已收口"));
-          row.append(main);
-        });
     },
 
     renderTasks(data) {
