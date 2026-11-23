@@ -530,7 +530,7 @@ class WatchNotifyTargetTests(unittest.TestCase):
             store.record_task(
                 scope=TaskScope("self-1", "jira:ZKAI-2", "jira:ZKAI-2"),
                 goal="规则: 另一个", status="completed",
-                waiting_on="完成后通知：联系人N",
+                waiting_on="完成后通知：联系人N-联系人",
                 evidence_summary="", evidence_message_ids=[], resources=[],
                 evidence_at=now, now=now,
             )
