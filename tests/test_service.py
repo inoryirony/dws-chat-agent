@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1522,6 +1522,67 @@ class PlainAgentFlowTests(unittest.TestCase):
                 ("card-biz", unittest.mock.ANY),
             )
             reopened.close()
+
+    def test_streaming_card_bind_window_expiry_never_leaves_a_live_card(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.sqlite3"
+
+            async def hanging_history(contact):
+                await asyncio.sleep(30)
+                return []
+
+            def service_with(history) -> AgentService:
+                service = AgentService.__new__(AgentService)
+                service.mode = "live"
+                service.settings = SimpleNamespace(timezone=TZ, self_open_id="self-open-id")
+                service.store = AuditStore(path)
+                service.dws = SimpleNamespace(
+                    send_card=AsyncMock(return_value=("card-biz", None, {})),
+                    update_card=AsyncMock(),
+                    history=AsyncMock(side_effect=history),
+                )
+                return service
+
+            # 基线就挂死：不发卡，直接回退纯文本。
+            # 窗口压到 0.5s：给高负载下的调度抖动留余量，又远小于挂起的 30s。
+            with patch("dws_dm_agent.service._STREAM_CARD_BIND_TIMEOUT_SECONDS", 0.5):
+                blocked = service_with(hanging_history)
+                self.assertEqual(
+                    asyncio.run(
+                        blocked._start_streaming_card(
+                            CONTACT, "conversation-1", "正在处理", "ack-session"
+                        )
+                    ),
+                    "",
+                )
+                blocked.dws.send_card.assert_not_awaited()
+                blocked.store.close()
+
+                # 基线正常、发卡后的轮询挂死：卡片必须收口成终止态。
+                polls = 0
+
+                async def baseline_then_hang(contact):
+                    nonlocal polls
+                    polls += 1
+                    if polls > 1:
+                        await asyncio.sleep(30)
+                    return []
+
+                polling = service_with(baseline_then_hang)
+                self.assertEqual(
+                    asyncio.run(
+                        polling._start_streaming_card(
+                            CONTACT, "conversation-1", "正在处理", "ack-session"
+                        )
+                    ),
+                    "",
+                )
+                self.assertEqual(
+                    polling.dws.update_card.await_args_list[-1].args,
+                    ("card-biz", "卡片识别失败，请等待普通文本回复。", 5),
+                )
+                self.assertIsNone(polling.store.active_streaming_card("conversation-1"))
+                polling.store.close()
 
     def test_final_body_is_queued_without_calling_dws(self) -> None:
         service = AgentService.__new__(AgentService)
@@ -5096,6 +5157,189 @@ class RecentContextBudgetTests(unittest.TestCase):
             service.store.close()
 
             self.assertEqual(len(recent), 3)
+
+
+class StaleRunReaperTests(unittest.TestCase):
+    """心跳冻结看门狗：双条件（黑板心跳超时 + agent 事件流沉默）才回收。"""
+
+    def _prepare(
+        self,
+        directory: Path,
+        *,
+        heartbeat_age: float,
+        events_age: float,
+    ) -> tuple[AgentService, AuditStore, str, str]:
+        store = AuditStore(directory / "audit.sqlite3")
+        session_id = "dm-test-reaper-1"
+        conversation_id = "conversation-reaper-1"
+        session_dir = directory / "session-1"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        events_path = session_dir / "events.jsonl"
+        events_path.write_text('{"type": "message_update"}\n', encoding="utf-8")
+        backdated = datetime.now(TZ) - timedelta(seconds=events_age)
+        os.utime(events_path, (backdated.timestamp(), backdated.timestamp()))
+        received_at = (datetime.now(TZ) - timedelta(seconds=heartbeat_age)).isoformat()
+        store.connection.execute(
+            """
+            INSERT INTO events(
+                event_id, message_id, conversation_id, contact_user_id,
+                received_at, content_sha256, content_length, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')
+            """,
+            (
+                "event-reaper-1",
+                "message-reaper-1",
+                conversation_id,
+                "contact-1",
+                received_at,
+                "0" * 64,
+                10,
+            ),
+        )
+        store.connection.commit()
+        store.register_run(
+            session_id,
+            contact_id="contact-1",
+            stage="worker",
+            now=datetime.now(TZ) - timedelta(seconds=heartbeat_age),
+            event_ids=["message-reaper-1"],
+            session_dir=session_dir,
+        )
+        store.connection.execute(
+            "INSERT OR IGNORE INTO task_run_leases(run_id, created_at) VALUES (?, ?)",
+            (session_id, datetime.now(TZ).isoformat()),
+        )
+        store.connection.commit()
+        service = AgentService.__new__(AgentService)
+        service.mode = "live"
+        service.settings = SimpleNamespace(timezone=TZ, raw={})
+        service.store = store
+        service.queues = {}
+        service.workers = {}
+        service.reclaimed_tasks = set()
+        return service, store, session_id, conversation_id
+
+    def test_reclaims_when_heartbeat_and_events_both_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, store, session_id, conversation_id = self._prepare(
+                Path(directory), heartbeat_age=7200.0, events_age=7200.0
+            )
+
+            async def main() -> None:
+                async def wedged() -> None:
+                    await asyncio.sleep(60)
+
+                worker = asyncio.create_task(wedged())
+                service.workers[conversation_id] = worker
+                self.assertEqual(await service._reap_stale_pass(datetime.now(TZ)), 1)
+                self.assertNotIn(conversation_id, service.workers)
+                self.assertIn(worker, service.reclaimed_tasks)
+                with suppress(asyncio.CancelledError):
+                    await worker
+                self.assertTrue(worker.cancelled())
+                row = store.connection.execute(
+                    "SELECT status, outcome FROM board_runs WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "aborted")
+                self.assertEqual(
+                    row["outcome"], "watchdog_reclaimed_stale_heartbeat"
+                )
+                event = store.connection.execute(
+                    "SELECT status, reason FROM events WHERE message_id = ?",
+                    ("message-reaper-1",),
+                ).fetchone()
+                self.assertEqual(event["status"], "error")
+                self.assertEqual(
+                    event["reason"], "watchdog_reclaimed_stale_heartbeat"
+                )
+                lease = store.connection.execute(
+                    "SELECT revoked_at, revoke_reason FROM task_run_leases WHERE run_id = ?",
+                    (session_id,),
+                ).fetchone()
+                self.assertNotEqual(lease["revoked_at"], "")
+                self.assertEqual(
+                    lease["revoke_reason"], "watchdog_reclaimed_stale_heartbeat"
+                )
+
+            asyncio.run(main())
+            store.close()
+
+    def test_leaves_run_alone_when_heartbeat_is_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, store, session_id, conversation_id = self._prepare(
+                Path(directory), heartbeat_age=30.0, events_age=7200.0
+            )
+
+            async def main() -> None:
+                async def healthy() -> None:
+                    await asyncio.sleep(60)
+
+                worker = asyncio.create_task(healthy())
+                service.workers[conversation_id] = worker
+                self.assertEqual(await service._reap_stale_pass(datetime.now(TZ)), 0)
+                self.assertIn(conversation_id, service.workers)
+                row = store.connection.execute(
+                    "SELECT status FROM board_runs WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "running")
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+
+            asyncio.run(main())
+            store.close()
+
+    def test_leaves_run_alone_while_agent_events_still_flow(self) -> None:
+        # 黑板心跳冻结但事件流还在写：只可能是别处故障，看门狗不动手。
+        with tempfile.TemporaryDirectory() as directory:
+            service, store, session_id, conversation_id = self._prepare(
+                Path(directory), heartbeat_age=7200.0, events_age=30.0
+            )
+
+            async def main() -> None:
+                async def wedged() -> None:
+                    await asyncio.sleep(60)
+
+                worker = asyncio.create_task(wedged())
+                service.workers[conversation_id] = worker
+                self.assertEqual(await service._reap_stale_pass(datetime.now(TZ)), 0)
+                self.assertIn(conversation_id, service.workers)
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+
+            asyncio.run(main())
+            store.close()
+
+    def test_reclaims_when_events_file_missing(self) -> None:
+        # 事件流文件不存在 = agent 现场已消失，同样佐证挂死。
+        with tempfile.TemporaryDirectory() as directory:
+            service, store, session_id, conversation_id = self._prepare(
+                Path(directory), heartbeat_age=7200.0, events_age=7200.0
+            )
+            (Path(directory) / "session-1" / "events.jsonl").unlink()
+
+            async def main() -> None:
+                async def wedged() -> None:
+                    await asyncio.sleep(60)
+
+                worker = asyncio.create_task(wedged())
+                service.workers[conversation_id] = worker
+                self.assertEqual(await service._reap_stale_pass(datetime.now(TZ)), 1)
+                self.assertNotIn(conversation_id, service.workers)
+                row = store.connection.execute(
+                    "SELECT status FROM board_runs WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "aborted")
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+
+            asyncio.run(main())
+            store.close()
 
 
 if __name__ == "__main__":

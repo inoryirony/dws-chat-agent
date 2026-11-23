@@ -58,6 +58,10 @@ Agent 输出刻意不使用结构化格式。front Agent 要么直接写出最�
 
 Provider 的重试通知不算终态。具体来说，Codex 的 `willRetry=true` 流错误会被忽略，直到 `turn/completed` 给出最终状态——这样 TLS 或响应流中断恢复之后，已完成的回答不会被丢掉。
 
+### 卡死运行自动回收
+
+monitor 协程一旦挂死，黑板心跳（`board_runs.updated_at`）就会停止刷新，而会话仍被当作「正在处理」，后续消息全部排队。看门狗任务 `run-reaper` 每分钟扫描一次在跑运行，仅当「黑板心跳超过 `run_reap_stale_seconds`（默认 1800 秒）未刷新」且「该运行的 agent 事件流沉默了同样久」两个条件同时成立时才回收：取消并摘除挂死的 worker、把黑板行标为 `aborted`（`watchdog_reclaimed_stale_heartbeat`）、把原批输入消息显式标为 `error`（不静默悬置）、吊销运行租约、收口处理中卡片，并在队列有积压时重拉 worker。正常的长工具调用只会让其中之一沉默；宿主睡眠或时钟大幅跳变后的第一轮扫描会自动跳过（墙钟与单调钟双护栏），防止墙钟失真误伤。回收运行的 worktree 清理仍依赖下次启动扫尾。
+
 ## 仓库结构
 
 ```text

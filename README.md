@@ -58,6 +58,10 @@ Agent output is deliberately unstructured. A front agent either writes the final
 
 Provider retry notifications are not terminal results. In particular, a Codex `willRetry=true` stream error is ignored until `turn/completed` supplies the final status, so a recovered TLS or response-stream interruption does not discard a completed answer.
 
+### Automatic reclamation of stuck runs
+
+If a monitor coroutine wedges, the board heartbeat (`board_runs.updated_at`) stops advancing while the conversation keeps being treated as busy, so every later message queues forever. A reaper task (`run-reaper`) scans active runs every minute and reclaims a run only when both conditions hold: the board heartbeat has been stale for longer than `run_reap_stale_seconds` (default 1800) **and** the run's agent event stream has been equally silent. It then cancels and removes the wedged worker, marks the board run `aborted` (`watchdog_reclaimed_stale_heartbeat`), marks the run's original input messages as `error` so they never hang silently, revokes the run lease, closes any in-flight processing card, and restarts the conversation worker when the queue still holds messages. A long tool call only silences one of the two signals; the first scan after host sleep or a large clock jump is skipped (wall-clock and monotonic guardrails), so wall-clock distortion cannot reclaim healthy runs. Worktree cleanup for reclaimed runs still relies on the next startup sweep.
+
 ## Repository layout
 
 ```text

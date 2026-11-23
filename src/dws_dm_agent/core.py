@@ -2685,6 +2685,21 @@ class AuditStore:
         self.connection.commit()
         return [dict(row) for row in stale]
 
+    def reap_stale_run(self, session_id: str, *, outcome: str, now: datetime) -> bool:
+        """看门狗收口心跳冻结的运行；仅在仍处于未收口状态时生效。"""
+        cursor = self.connection.execute(
+            """
+            UPDATE board_runs
+            SET status = 'aborted', outcome = ?, ended_at = ?, updated_at = ?
+            WHERE session_id = ?
+              AND status IN ('running', 'waiting')
+              AND ended_at IS NULL
+            """,
+            (outcome, now.isoformat(), now.isoformat(), session_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
     def active_runs(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """

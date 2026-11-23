@@ -85,12 +85,26 @@ _IMAGE_MEDIA_ID = re.compile(r"\[图片消息\]\(mediaId=([^)\s]+)\)")
 # 事件流读取上限等下游限制必须与 core 常量联动，不允许各自硬编码。
 _MAX_IMAGES = MAX_IMAGES
 _MAX_IMAGE_BYTES = MAX_IMAGE_BYTES
-_STREAM_CARD_BIND_TIMEOUT_SECONDS = 6.0
+# 流式卡片 message_id 回绑窗口：send-card 不返回 message_id，只能靠「发前
+# 取基线 + 发后最多 4 轮历史差分」找回卡片。每轮历史查询是一个 dws 子进程，
+# 实测（2026-11-23，约 8300 次）单次 p50 约 3s、p99 约 9s，4 轮连同 sleep
+# p50 约 16s、p99 约 39s；窗口一旦到期卡片就被标成「卡片识别失败」并退回
+# 纯文本。原 6s 下基线每小时约一成超时、4 轮轮询一次都跑不完，只有新卡片
+# 恰好在前两轮可见时才绑得上。40s 在最慢的时段也能让约 97% 的轮询链跑完。
+_STREAM_CARD_BIND_TIMEOUT_SECONDS = 40.0
 _DELIVERY_TIMEOUT_SECONDS = 30.0
 # 历史拉取的外层兜底超时：底层 dws CLI 每次尝试自带 45s 超时，正常
 # 秒回；这里只兜「内部超时处理器仍挂死」的病态情况（见 _history 注释），
 # 覆盖一次完整的内部重试链（3×45s）绰绰有余，又把挂死变成可重试异常。
 _HISTORY_TIMEOUT_SECONDS = 150.0
+# 心跳冻结看门狗：monitor 协程一旦挂死，touch_run 不再刷新（2026-11-20 联系人A
+# 会话静默冻结 67 小时、后续消息排队 3 天无人应答）。回收要求「黑板心跳超时」
+# 与「agent 事件流同样沉默」同时成立——正常的长工具调用只会让其中之一沉默；
+# 唤醒/时钟跳变后的第一轮扫描跳过（墙钟与单调钟双护栏），防止误杀健康运行。
+# 回收 = 取消并摘除挂死 worker（槽位随 async with 正常释放）+ 黑板行标 aborted
+# + 原批输入标 error + 吊销运行租约 + 收口处理中卡片 + 有排队消息就重拉。
+_RUN_REAP_STALE_SECONDS_DEFAULT = 1800.0
+_RUN_REAP_INTERVAL_SECONDS_DEFAULT = 60.0
 # 活跃事项快照注入 prompt 的上限；超出部分用 task_lookup 查询，不悄悄丢失。
 _TASK_SNAPSHOT_LIMIT = 8
 # 事项无实质更新后的归档天数（task_memory.inactive_days 可覆盖）。
@@ -572,6 +586,13 @@ class AgentService:
         self.outbox_dispatcher: asyncio.Task[None] | None = None
         self.wake_dispatcher: asyncio.Task[None] | None = None
         self.outbox_wakeup = asyncio.Event()
+        self.watch_dispatcher: asyncio.Task[None] | None = None
+        self.run_reaper: asyncio.Task[None] | None = None
+        # 被看门狗回收的挂死 worker：不纳入停机 gather（挂死任务可能永不
+        # 结束，await 它会拖住退出）；进程退出时由操作系统收割。
+        self.reclaimed_tasks: set[asyncio.Task[None]] = set()
+        self._reap_last_wall: datetime | None = None
+        self._reap_last_mono: float | None = None
         self.listener_processes: set[asyncio.subprocess.Process] = set()
         self.stop_event = asyncio.Event()
         self.capacity = int(settings.raw.get("max_parallel_conversations", 2))
@@ -671,6 +692,9 @@ class AgentService:
         self.watch_dispatcher = asyncio.create_task(
             self._consume_watches(), name="watch-dispatcher"
         )
+        self.run_reaper = asyncio.create_task(
+            self._reap_stale_runs(), name="run-reaper"
+        )
         await self.stop_event.wait()
         LOG.info("stopping listeners gracefully")
         for task in self.listeners:
@@ -682,6 +706,7 @@ class AgentService:
         self.wake_dispatcher.cancel()
         self.runtime_heartbeat.cancel()
         self.watch_dispatcher.cancel()
+        self.run_reaper.cancel()
         await asyncio.gather(
             *self.listeners,
             *self.workers.values(),
@@ -690,11 +715,168 @@ class AgentService:
             self.wake_dispatcher,
             self.runtime_heartbeat,
             self.watch_dispatcher,
+            self.run_reaper,
             return_exceptions=True,
         )
+        if self.reclaimed_tasks:
+            # 已回收任务可能永不结束：补送一次取消并限时等待，不拖住退出。
+            for task in self.reclaimed_tasks:
+                task.cancel()
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*self.reclaimed_tasks, return_exceptions=True),
+                    timeout=5,
+                )
 
     def request_stop(self) -> None:
         self.stop_event.set()
+
+    async def _reap_stale_runs(self) -> None:
+        interval = float(
+            self.settings.raw.get(
+                "run_reap_interval_seconds", _RUN_REAP_INTERVAL_SECONDS_DEFAULT
+            )
+        )
+        LOG.info("stale-run reaper ready interval=%.0fs", interval)
+        while not self.stop_event.is_set():
+            now = datetime.now(self.settings.timezone)
+            loop_time = asyncio.get_running_loop().time()
+            wall_gap = (
+                (now - self._reap_last_wall).total_seconds()
+                if self._reap_last_wall is not None
+                else 0.0
+            )
+            mono_gap = (
+                loop_time - self._reap_last_mono
+                if self._reap_last_mono is not None
+                else 0.0
+            )
+            self._reap_last_wall = now
+            self._reap_last_mono = loop_time
+            if wall_gap > interval * 3 or mono_gap > interval * 3:
+                # 宿主睡眠或时钟大幅跳变后，墙钟双条件（心跳/mtime 年龄）在本
+                # tick 不可信；跳过一轮，等恢复正常 tick 后再评估。
+                LOG.warning(
+                    "stale-run reaper skipped pass: clock discontinuity "
+                    "wall_gap=%.0fs mono_gap=%.0fs",
+                    wall_gap,
+                    mono_gap,
+                )
+            else:
+                try:
+                    await self._reap_stale_pass(now)
+                except Exception:
+                    LOG.exception("stale-run reap pass failed; backing off")
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+            break
+
+    async def _reap_stale_pass(self, now: datetime) -> int:
+        """回收心跳冻结的在跑运行，返回回收数。
+
+        双条件防误伤：黑板心跳超时（正常 monitor 每 ≤~155s 触碰一次）且
+        agent 事件流同样沉默。缺 session_dir 现场的一律不动；回收动作 =
+        取消并摘除 worker + 黑板行标 aborted + 原批输入标 error + 吊销
+        运行租约 + 收口处理中卡片 + 有排队消息就重拉 worker。
+        """
+        stale_seconds = float(
+            self.settings.raw.get(
+                "run_reap_stale_seconds", _RUN_REAP_STALE_SECONDS_DEFAULT
+            )
+        )
+        reaped = 0
+        for row in self.store.active_runs():
+            session_id = str(row["session_id"])
+            updated_raw = str(row["updated_at"] or "")
+            if not updated_raw:
+                continue
+            try:
+                updated = datetime.fromisoformat(updated_raw)
+            except ValueError:
+                continue
+            heartbeat_age = (now - updated).total_seconds()
+            if heartbeat_age < stale_seconds:
+                continue
+            session_dir_raw = str(row["session_dir"] or "")
+            if not session_dir_raw:
+                continue
+            try:
+                events_age = (
+                    now.timestamp()
+                    - (Path(session_dir_raw) / "events.jsonl").stat().st_mtime
+                )
+            except FileNotFoundError:
+                # 事件流不存在：agent 现场已消失，同样佐证挂死。
+                events_age = stale_seconds
+            except OSError:
+                # 权限/瞬时 IO 故障无法佐证任何事：跳过该行，宁可不动。
+                LOG.warning(
+                    "stale-run reap skipped session=%s events stat failed",
+                    session_id,
+                )
+                continue
+            if events_age < stale_seconds:
+                continue
+            # board_runs 没有 conversation_id 列：从运行登记的输入事件反查。
+            inputs = self.store.run_input_rows(session_id)
+            conversation_id = str(inputs[0]["conversation_id"]) if inputs else ""
+            stale_inputs = [
+                str(item["message_id"])
+                for item in inputs
+                if str(item.get("status") or "") == "queued"
+            ]
+            worker_state = "absent"
+            worker = None
+            if conversation_id:
+                worker = self.workers.get(conversation_id)
+                if worker is not None:
+                    worker_state = "cancelled" if not worker.done() else "already_done"
+                    if not worker.done():
+                        worker.cancel()
+                        self.reclaimed_tasks.add(worker)
+                    self.workers.pop(conversation_id, None)
+            self.store.reap_stale_run(
+                session_id,
+                outcome="watchdog_reclaimed_stale_heartbeat",
+                now=now,
+            )
+            if stale_inputs:
+                # 原批已被 queue.get() 消费、不在队列里，重拉消化不到；显式
+                # 标 error，避免重启前静默无反馈（恢复语义与启动扫尾一致）。
+                self.store.update_event_status(
+                    stale_inputs, "error", "watchdog_reclaimed_stale_heartbeat"
+                )
+            self.store.revoke_task_run(
+                session_id, "watchdog_reclaimed_stale_heartbeat", now
+            )
+            if conversation_id:
+                with suppress(Exception):
+                    await self._close_active_streaming_card(
+                        conversation_id, "处理失败，请稍后重试或转人工处理。"
+                    )
+            LOG.warning(
+                "stale run reclaimed session=%s conversation=%s "
+                "heartbeat_age=%.0fs events_age=%.0fs worker=%s",
+                session_id,
+                sha256_text(conversation_id)[:10] if conversation_id else "-",
+                heartbeat_age,
+                events_age,
+                worker_state,
+            )
+            reaped += 1
+            if conversation_id:
+                queue = self.queues.get(conversation_id)
+                if queue is not None and not queue.empty():
+                    # 已知微小竞态：旧 worker 回卷的 finally 会 _clear_runtime，
+                    # 可能短暂清掉新 worker 刚写的 runtime 状态，下轮自愈；
+                    # worktree 清理仍依赖下次启动扫尾（跟进项）。
+                    self.workers[conversation_id] = asyncio.create_task(
+                        self._conversation_worker(conversation_id),
+                        name=f"conversation:{sha256_text(conversation_id)[:8]}",
+                    )
+        return reaped
 
     def _write_panel_access_files(self) -> None:
         """面板凭据落盘：token 与带 token 的完整 URL，均 0600。
