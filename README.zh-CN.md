@@ -62,6 +62,16 @@ Provider 的重试通知不算终态。具体来说，Codex 的 `willRetry=true`
 
 monitor 协程一旦挂死，黑板心跳（`board_runs.updated_at`）就会停止刷新，而会话仍被当作「正在处理」，后续消息全部排队。看门狗任务 `run-reaper` 每分钟扫描一次在跑运行，仅当「黑板心跳超过 `run_reap_stale_seconds`（默认 1800 秒）未刷新」且「该运行的 agent 事件流沉默了同样久」两个条件同时成立时才回收：取消并摘除挂死的 worker、把黑板行标为 `aborted`（`watchdog_reclaimed_stale_heartbeat`）、把原批输入消息显式标为 `error`（不静默悬置）、吊销运行租约、收口处理中卡片，并在队列有积压时重拉 worker。正常的长工具调用只会让其中之一沉默；宿主睡眠或时钟大幅跳变后的第一轮扫描会自动跳过（墙钟与单调钟双护栏），防止墙钟失真误伤。回收运行的 worktree 清理仍依赖下次启动扫尾。
 
+### PII lint（pre-commit）
+
+个人数据不得入库：真名、钉钉 user/open ID、个人路径、手机号样式数字。`scripts/check_pii.py` 在提交时把关：通用模式规则 + 本地真名名单（`scripts/pii-names.local.txt`，已 gitignore，永不入库），并断言 gitignore 保护的文件（`config.json`、`.env`、`state/`、`.zcode/`）没有被 git 跟踪——ignore 规则对已跟踪文件无效，这条断言才是根因防护。每个 clone 装一次 hook：
+
+```sh
+scripts/manage.sh install-hooks
+```
+
+形似真数据的假 fixture 可在行尾加 `pii-allow` 标记逐行豁免。
+
 ## 仓库结构
 
 ```text
@@ -306,8 +316,8 @@ DSH 没有原生 steer。DSH 运行期间收到补充消息时，当前进程会
 
 ```json
 "skills": {
-  "humanizer_zh": "/Users/me/skills/humanizer-zh",
-  "answer_me_with_html": "/Users/me/skills/answer-me-with-html"
+  "humanizer_zh": "/absolute/path/to/skills/humanizer-zh",
+  "answer_me_with_html": "/absolute/path/to/skills/answer-me-with-html"
 }
 ```
 

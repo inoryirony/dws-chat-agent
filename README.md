@@ -62,6 +62,16 @@ Provider retry notifications are not terminal results. In particular, a Codex `w
 
 If a monitor coroutine wedges, the board heartbeat (`board_runs.updated_at`) stops advancing while the conversation keeps being treated as busy, so every later message queues forever. A reaper task (`run-reaper`) scans active runs every minute and reclaims a run only when both conditions hold: the board heartbeat has been stale for longer than `run_reap_stale_seconds` (default 1800) **and** the run's agent event stream has been equally silent. It then cancels and removes the wedged worker, marks the board run `aborted` (`watchdog_reclaimed_stale_heartbeat`), marks the run's original input messages as `error` so they never hang silently, revokes the run lease, closes any in-flight processing card, and restarts the conversation worker when the queue still holds messages. A long tool call only silences one of the two signals; the first scan after host sleep or a large clock jump is skipped (wall-clock and monotonic guardrails), so wall-clock distortion cannot reclaim healthy runs. Worktree cleanup for reclaimed runs still relies on the next startup sweep.
 
+### PII lint (pre-commit)
+
+Personal data must never enter the repository: real names, DingTalk user/open IDs, personal paths, phone-shaped numbers. `scripts/check_pii.py` enforces this at commit time with generic patterns plus a local name list (`scripts/pii-names.local.txt`, gitignored — never commit it). It also asserts that gitignore-protected files (`config.json`, `.env`, `state/`, `.zcode/`) are not tracked, because ignore rules do not apply to already-tracked files. Enable the hook once per clone:
+
+```sh
+scripts/manage.sh install-hooks
+```
+
+Fake fixtures that legitimately resemble real data can opt out per line with a `pii-allow` marker.
+
 ## Repository layout
 
 ```text
@@ -304,8 +314,8 @@ A top-level `skills` pool maps names to absolute paths:
 
 ```json
 "skills": {
-  "humanizer_zh": "/Users/me/skills/humanizer-zh",
-  "answer_me_with_html": "/Users/me/skills/answer-me-with-html"
+  "humanizer_zh": "/absolute/path/to/skills/humanizer-zh",
+  "answer_me_with_html": "/absolute/path/to/skills/answer-me-with-html"
 }
 ```
 

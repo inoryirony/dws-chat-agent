@@ -85,6 +85,12 @@ case "$command_name" in
   doctor)
     exec "$PYTHON_BIN" "$APP_DIR/dm_agent.py" --env-file "$APP_DIR/.env" doctor
     ;;
+  install-hooks)
+    mkdir -p "$APP_DIR/.git/hooks"
+    ln -sf "$APP_DIR/scripts/hooks/pre-commit" "$APP_DIR/.git/hooks/pre-commit"
+    print "installed: .git/hooks/pre-commit -> scripts/hooks/pre-commit"
+    ;;
+
   uninstall)
     if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
       launchctl bootout "$DOMAIN/$LABEL"

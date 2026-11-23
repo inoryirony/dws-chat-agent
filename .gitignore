@@ -230,3 +230,5 @@ state/
 .DS_Store
 verify-evidence/
 .zcode/
+# 本地 PII lint 真名名单：含真名，永不入库（scripts/check_pii.py 读取）
+scripts/pii-names.local.txt

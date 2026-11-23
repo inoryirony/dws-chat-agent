@@ -1,0 +1,5 @@
+#!/bin/sh
+# pre-commit：隐私数据 lint（模式 + 本地真名名单 + 禁跟踪断言）。
+# 安装：scripts/manage.sh install-hooks
+root="$(git rev-parse --show-toplevel)" || exit 1
+exec "$root/scripts/check_pii.py" --staged
